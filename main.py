@@ -53,6 +53,7 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 welcome_config = {"enabled": True, "channel_id": WELCOME_CHANNEL_ID, "message": ""}
+invite_config = {"channel_id": "", "components": []}
 ticket_config = {
     "category_id": TICKET_CATEGORY_ID,
     "support_role_ids": SUPPORT_ROLE_IDS,
@@ -150,6 +151,15 @@ async def on_ready():
 @bot.event
 async def on_member_join(member):
     await refresh_status()
+    components = invite_config.get("components") or []
+    if components:
+        ch_id = invite_config.get("channel_id") or welcome_config.get("channel_id") or ""
+        if ch_id:
+            channel = member.guild.get_channel(int(ch_id))
+            if channel:
+                rendered = _render_invite_components(components, member)
+                await send_v2_message(channel, rendered)
+        return
     if not welcome_config.get("enabled", True):
         return
     ch_id = welcome_config.get("channel_id") or ""
@@ -164,6 +174,38 @@ async def on_member_join(member):
 @bot.event
 async def on_member_remove(member):
     await refresh_status()
+
+
+def _sub_placeholders(text, member):
+    if not isinstance(text, str):
+        return text
+    count = str(member.guild.member_count)
+    return (
+        text.replace("{user}", member.mention)
+        .replace("{username}", member.display_name)
+        .replace("{server}", SERVER_NAME)
+        .replace("{member_count}", count)
+        .replace("{members}", count)
+        .replace("{count}", count)
+        .replace("{emoji}", f"<:e:{WELCOME_EMOJI_ID}>")
+    )
+
+
+_INVITE_TEXT_KEYS = {"text", "content", "label", "placeholder", "title", "description"}
+
+
+def _render_invite_components(components, member):
+    def walk(node):
+        if isinstance(node, dict):
+            return {
+                k: _sub_placeholders(v, member) if k in _INVITE_TEXT_KEYS and isinstance(v, str) else walk(v)
+                for k, v in node.items()
+            }
+        if isinstance(node, list):
+            return [walk(x) for x in node]
+        return node
+
+    return walk(components)
 
 
 async def send_welcome(channel, member):
@@ -663,6 +705,13 @@ async def apply_config(feature, cfg):
         if cfg.get("log_channel_id"):
             credits_config["log_channel_id"] = str(cfg["log_channel_id"])
         print(f"[Config] credits — managers {credits_config['manager_role_ids']}")
+    elif feature == "invite":
+        if cfg.get("channel_id"):
+            invite_config["channel_id"] = str(cfg["channel_id"])
+        comps = cfg.get("components")
+        if isinstance(comps, list):
+            invite_config["components"] = comps
+        print(f"[Config] invite — channel {invite_config['channel_id']} components {len(invite_config['components'])}")
 
 
 async def fetch_config(feature):
@@ -698,7 +747,7 @@ async def mark_config_applied(feature):
 
 
 async def load_all_configs():
-    for feature in ("welcome", "tickets", "credits"):
+    for feature in ("welcome", "invite", "tickets", "credits"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
