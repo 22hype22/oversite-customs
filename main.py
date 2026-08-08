@@ -191,16 +191,32 @@ async def on_member_remove(member):
 def _sub_placeholders(text, member):
     if not isinstance(text, str):
         return text
-    count = str(member.guild.member_count)
-    return (
-        text.replace("{user}", member.mention)
-        .replace("{username}", member.display_name)
-        .replace("{server}", SERVER_NAME)
-        .replace("{member_count}", count)
-        .replace("{members}", count)
-        .replace("{count}", count)
-        .replace("{emoji}", f"<:e:{WELCOME_EMOJI_ID}>")
-    )
+    g = member.guild
+    count = str(g.member_count or 0)
+    bot_count = str(sum(1 for m in g.members if m.bot))
+    human_count = str(sum(1 for m in g.members if not m.bot)) if g.members else count
+    boosts = str(g.premium_subscription_count or 0)
+    boost_level = str(getattr(g, "premium_tier", 0) or 0)
+    channel_count = str(len(g.channels))
+    role_count = str(len(g.roles))
+    repl = {
+        "{user}": member.mention,
+        "{username}": member.display_name,
+        "{server}": g.name,
+        "{member_count}": count, "{members}": count, "{count}": count,
+        "{player count}": count, "{player_count}": count,
+        "{human_count}": human_count, "{humans}": human_count,
+        "{bot_count}": bot_count, "{bot count}": bot_count, "{bots}": bot_count,
+        "{boosts}": boosts, "{boost_count}": boosts,
+        "{total server boosts}": boosts, "{server_boosts}": boosts,
+        "{boost_level}": boost_level, "{boost_tier}": boost_level,
+        "{channel_count}": channel_count, "{channels}": channel_count,
+        "{role_count}": role_count, "{roles}": role_count,
+        "{emoji}": f"<:e:{WELCOME_EMOJI_ID}>",
+    }
+    for token, value in repl.items():
+        text = text.replace(token, value)
+    return text
 
 
 _INVITE_TEXT_KEYS = {"text", "content", "label", "placeholder", "title", "description", "name", "value"}
