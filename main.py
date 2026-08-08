@@ -646,6 +646,9 @@ def build_button(btn, guild):
     channel_id = btn.get("channel_id", "")
     url = btn.get("url", "")
     style_name = str(btn.get("style", "primary")).lower()
+    if btn.get("disabled"):
+        cid = f"display_{btn.get('id') or label[:20]}"
+        return {"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": cid[:100], "disabled": True}
     if category:
         return {"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_cat:{category[:80]}"}
     if channel_id:
