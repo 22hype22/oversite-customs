@@ -53,7 +53,7 @@ intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 welcome_config = {"enabled": True, "channel_id": WELCOME_CHANNEL_ID, "message": ""}
-invite_config = {"channel_id": "", "components": []}
+invite_config = {"channel_id": "", "components": [], "embeds": [], "messages": []}
 ticket_config = {
     "category_id": TICKET_CATEGORY_ID,
     "support_role_ids": SUPPORT_ROLE_IDS,
@@ -152,13 +152,25 @@ async def on_ready():
 async def on_member_join(member):
     await refresh_status()
     components = invite_config.get("components") or []
-    if components:
+    embeds_data = invite_config.get("embeds") or []
+    if components or embeds_data:
         ch_id = invite_config.get("channel_id") or welcome_config.get("channel_id") or ""
         if ch_id:
             channel = member.guild.get_channel(int(ch_id))
             if channel:
-                rendered = _render_invite_components(components, member)
-                await send_v2_message(channel, rendered)
+                if components:
+                    rendered = _render_invite_components(components, member)
+                    await send_v2_message(channel, rendered)
+                else:
+                    rendered = _render_invite_components(embeds_data, member)
+                    embeds = [build_embed(e) for e in rendered][:10]
+                    try:
+                        if embeds:
+                            await channel.send(embeds=embeds)
+                        for m in (invite_config.get("messages") or []):
+                            await channel.send(_sub_placeholders(m, member))
+                    except Exception as e:
+                        print(f"[Invite] send failed: {e}")
         return
     if not welcome_config.get("enabled", True):
         return
@@ -191,7 +203,7 @@ def _sub_placeholders(text, member):
     )
 
 
-_INVITE_TEXT_KEYS = {"text", "content", "label", "placeholder", "title", "description"}
+_INVITE_TEXT_KEYS = {"text", "content", "label", "placeholder", "title", "description", "name", "value"}
 
 
 def _render_invite_components(components, member):
@@ -709,9 +721,12 @@ async def apply_config(feature, cfg):
         if cfg.get("channel_id"):
             invite_config["channel_id"] = str(cfg["channel_id"])
         comps = cfg.get("components")
-        if isinstance(comps, list):
-            invite_config["components"] = comps
-        print(f"[Config] invite — channel {invite_config['channel_id']} components {len(invite_config['components'])}")
+        invite_config["components"] = comps if isinstance(comps, list) else []
+        embeds = cfg.get("embeds")
+        invite_config["embeds"] = embeds if isinstance(embeds, list) else []
+        msgs = cfg.get("messages")
+        invite_config["messages"] = msgs if isinstance(msgs, list) else []
+        print(f"[Config] invite — channel {invite_config['channel_id']} components {len(invite_config['components'])} embeds {len(invite_config['embeds'])}")
 
 
 async def fetch_config(feature):
