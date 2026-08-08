@@ -80,7 +80,12 @@ def info_embed(title, description=None):
 
 
 def _fn_headers():
-    return {"x-worker-token": WORKER_TOKEN, "Content-Type": "application/json", "apikey": SUPABASE_KEY}
+    return {
+        "x-worker-token": WORKER_TOKEN,
+        "Content-Type": "application/json",
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+    }
 
 
 _poll_session = None
