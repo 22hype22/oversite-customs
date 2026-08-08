@@ -619,7 +619,10 @@ async def send_v2_message(channel, components_v2, content=None):
                     value = f"url:{url}"[:100]
                 else:
                     value = label[:100]
-                o = {"label": label[:100], "value": value[:100]}
+                opt_label, opt_emoji = _extract_button_emoji(label)
+                o = {"label": (opt_label or label)[:100], "value": value[:100]}
+                if opt_emoji:
+                    o["emoji"] = opt_emoji
                 if opt.get("description"):
                     o["description"] = opt["description"][:100]
                 options.append(o)
@@ -647,23 +650,46 @@ async def send_v2_message(channel, components_v2, content=None):
         return False
 
 
+_BUTTON_EMOJI_RE = re.compile(r"<(a?):([a-zA-Z0-9_]+):(\d+)>")
+
+
+def _extract_button_emoji(label):
+    match = _BUTTON_EMOJI_RE.search(label)
+    if not match:
+        return label, None
+    emoji = {"id": match.group(3), "name": match.group(2), "animated": bool(match.group(1))}
+    clean = (label[: match.start()] + label[match.end():]).strip()
+    return clean, emoji
+
+
 def build_button(btn, guild):
     label = btn.get("label", "Button")
     category = btn.get("category", "")
     channel_id = btn.get("channel_id", "")
     url = btn.get("url", "")
     style_name = str(btn.get("style", "primary")).lower()
+    label, emoji = _extract_button_emoji(label)
+
+    def _btn(data):
+        if emoji:
+            data["emoji"] = emoji
+        if label:
+            data["label"] = label[:80]
+        elif "label" in data:
+            del data["label"]
+        return data
+
     if btn.get("disabled"):
-        cid = f"display_{btn.get('id') or label[:20]}"
-        return {"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": cid[:100], "disabled": True}
+        cid = f"display_{btn.get('id') or label[:20] or 'x'}"
+        return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": cid[:100], "disabled": True})
     if category:
-        return {"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_cat:{category[:80]}"}
+        return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_cat:{category[:80]}"})
     if channel_id:
         gid = getattr(guild, "id", 0)
-        return {"type": 2, "label": label[:80], "style": 5, "url": f"https://discord.com/channels/{gid}/{channel_id}"}
+        return _btn({"type": 2, "label": label[:80], "style": 5, "url": f"https://discord.com/channels/{gid}/{channel_id}"})
     if url:
-        return {"type": 2, "label": label[:80], "style": 5, "url": url}
-    return {"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"btn_{label[:20]}"}
+        return _btn({"type": 2, "label": label[:80], "style": 5, "url": url})
+    return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"btn_{label[:20] or 'x'}"})
 
 
 def build_embed(data):
