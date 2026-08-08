@@ -113,6 +113,7 @@ async def runtime_rpc(name, payload):
 @bot.event
 async def on_ready():
     print(f"{SERVER_NAME} bot online as {bot.user}")
+    print(f"[Boot] bot {BOT_ORDER_ID} using worker token prefix {WORKER_TOKEN[:12] if WORKER_TOKEN else 'MISSING'} (len {len(WORKER_TOKEN) if WORKER_TOKEN else 0})")
 
     if BOT_ORDER_ID and WORKER_TOKEN:
         for loop in (send_heartbeat, poll_configs, poll_shutdown, record_metrics_loop):
