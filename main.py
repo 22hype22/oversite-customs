@@ -84,6 +84,7 @@ def _fn_headers():
 
 
 _poll_session = None
+_auth_warned = False
 
 
 async def get_poll_session():
@@ -853,7 +854,11 @@ async def poll_configs():
             if r.status != 200:
                 if r.status not in (401, 403):
                     return
-                print(f"[Poll] claim-command auth failed — HTTP {r.status} (check WORKER_TOKEN / BOT_ORDER_ID)")
+                global _auth_warned
+                if not _auth_warned:
+                    _auth_warned = True
+                    body = (await r.text())[:200]
+                    print(f"[Poll] claim-command auth failed — HTTP {r.status} body={body}")
                 return
             data = await r.json()
         cmd = data.get("command") if isinstance(data, dict) else None
