@@ -783,6 +783,7 @@ async def fetch_config(feature):
                 if isinstance(cfg, dict) and "config" in cfg:
                     cfg = cfg["config"]
                 return cfg
+            print(f"[Config] fetch {feature} — HTTP {r.status}")
     except Exception as e:
         print(f"[Config] fetch {feature} failed: {e}")
     return None
@@ -801,10 +802,16 @@ async def mark_config_applied(feature):
 
 
 async def load_all_configs():
+    if not (BOT_ORDER_ID and WORKER_TOKEN):
+        print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
+        return
+    print(f"[Config] loading for bot {BOT_ORDER_ID}")
     for feature in ("welcome", "invite", "tickets", "credits"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
+        else:
+            print(f"[Config] {feature} — none saved")
 
 
 async def complete_command(command_id, status="done", error=None):
@@ -843,6 +850,9 @@ async def poll_configs():
             json={"bot_id": BOT_ORDER_ID},
         ) as r:
             if r.status != 200:
+                if r.status not in (401, 403):
+                    return
+                print(f"[Poll] claim-command auth failed — HTTP {r.status} (check WORKER_TOKEN / BOT_ORDER_ID)")
                 return
             data = await r.json()
         cmd = data.get("command") if isinstance(data, dict) else None
@@ -1091,7 +1101,7 @@ async def claim_shutdown_command():
             if data and isinstance(data, list):
                 return data[0]
     except Exception as e:
-        print(f"[Shutdown] claim error: {e}")
+        print(f"[Shutdown] claim error: {e!r}")
     return None
 
 
