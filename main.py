@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import json
 import signal
 import asyncio
@@ -188,6 +189,25 @@ async def on_member_remove(member):
     await refresh_status()
 
 
+_EMOJI_SHORTCODE_RE = re.compile(r":([a-zA-Z][a-zA-Z0-9_]*)(?:~\d+)?:")
+
+
+def _resolve_emoji_shortcodes(text, guild):
+    if ":" not in text or not guild:
+        return text
+    lookup = {e.name.lower(): e for e in guild.emojis}
+    if not lookup:
+        return text
+
+    def repl(match):
+        emoji = lookup.get(match.group(1).lower())
+        if emoji is None:
+            return match.group(0)
+        return f"<{'a' if emoji.animated else ''}:{emoji.name}:{emoji.id}>"
+
+    return _EMOJI_SHORTCODE_RE.sub(repl, text)
+
+
 def _sub_placeholders(text, member):
     if not isinstance(text, str):
         return text
@@ -216,7 +236,7 @@ def _sub_placeholders(text, member):
     }
     for token, value in repl.items():
         text = text.replace(token, value)
-    return text
+    return _resolve_emoji_shortcodes(text, member.guild)
 
 
 _INVITE_TEXT_KEYS = {"text", "content", "label", "placeholder", "title", "description", "name", "value"}
