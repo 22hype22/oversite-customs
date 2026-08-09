@@ -146,6 +146,10 @@ async def on_ready():
         await apply_bot_identity()
     except Exception as e:
         print(f"[Startup] identity failed: {e}")
+    try:
+        await apply_about_me()
+    except Exception as e:
+        print(f"[Startup] about-me failed: {e}")
     if not sync_identity.is_running():
         sync_identity.start()
 
@@ -435,6 +439,8 @@ async def refresh_status():
 @tasks.loop(minutes=10)
 async def update_status():
     await refresh_status()
+    # Pick up dashboard About Me edits promptly (only PATCHes when it changed).
+    await apply_about_me()
 
 
 @update_status.before_loop
@@ -1530,9 +1536,53 @@ async def apply_bot_identity():
         print(f"[Identity] error: {e}")
 
 
+_last_bio = None
+
+
+async def apply_about_me():
+    """Push the dashboard's About Me to Discord as the application description
+    via PATCH /applications/@me (authorised with the bot's own token). Discord
+    supports this now, so there's no manual portal step. Only re-sends when the
+    text actually changes."""
+    global _last_bio
+    if not (SUPABASE_URL and BOT_ORDER_ID and TOKEN):
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                f"{SUPABASE_URL}/rest/v1/bot_orders?id=eq.{BOT_ORDER_ID}&select=bot_bio",
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=10,
+            )
+            data = r.json()
+        if not data or not isinstance(data, list):
+            return
+        bio = data[0].get("bot_bio")
+    except Exception as e:
+        print(f"[AboutMe] fetch failed: {e}")
+        return
+    if bio is None or bio == _last_bio:
+        return
+    _last_bio = bio
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.patch(
+                "https://discord.com/api/v10/applications/@me",
+                headers={"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"},
+                json={"description": str(bio or "")[:400]},
+                timeout=10,
+            )
+        if resp.status_code in (200, 201):
+            print("[AboutMe] application description updated")
+        else:
+            print(f"[AboutMe] update failed: HTTP {resp.status_code} {resp.text[:140]}")
+    except Exception as e:
+        print(f"[AboutMe] update error: {e}")
+
+
 @tasks.loop(hours=2)
 async def sync_identity():
     await apply_bot_identity()
+    await apply_about_me()
 
 
 @sync_identity.before_loop
