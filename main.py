@@ -1613,7 +1613,6 @@ async def apply_about_me():
         return
     if bio is None or bio == _last_bio:
         return
-    _last_bio = bio
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.patch(
@@ -1623,9 +1622,12 @@ async def apply_about_me():
                 timeout=10,
             )
         if resp.status_code in (200, 201):
+            # Only mark as applied AFTER Discord accepts it, so a failed attempt
+            # retries on the next loop instead of being marked done.
+            _last_bio = bio
             print("[AboutMe] application description updated")
         else:
-            print(f"[AboutMe] update failed: HTTP {resp.status_code} {resp.text[:140]}")
+            print(f"[AboutMe] update failed: HTTP {resp.status_code} {resp.text[:200]}")
     except Exception as e:
         print(f"[AboutMe] update error: {e}")
 
