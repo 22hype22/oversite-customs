@@ -565,6 +565,29 @@ async def record_ticket(guild_id, channel_id, opener_id, category, status):
     })
 
 
+_V2_LAST_ERROR = {"msg": ""}
+
+
+def _strip_galleries(items):
+    """Return a copy of a V2 item tree with all media galleries removed.
+
+    Expired / signed attachment URLs (media.discordapp.net/... ?ex=&is=&hm=)
+    are the usual reason Discord rejects a Components V2 message, so dropping
+    galleries lets the rest of the design still post."""
+    out = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        t = it.get("type", "")
+        if t in ("gallery", "media_gallery", "media"):
+            continue
+        it = dict(it)
+        if isinstance(it.get("children"), list):
+            it["children"] = _strip_galleries(it["children"])
+        out.append(it)
+    return out
+
+
 async def send_v2_message(channel, components_v2, content=None):
     def build(comp):
         ctype = comp.get("type", "")
@@ -659,7 +682,13 @@ async def send_v2_message(channel, components_v2, content=None):
     try:
         await bot.http.request(route, json=payload)
         return True
+    except discord.HTTPException as e:
+        body = getattr(e, "text", "") or ""
+        _V2_LAST_ERROR["msg"] = f"HTTP {getattr(e, 'status', '?')}: {body[:400]}"
+        print(f"[V2] send failed: HTTP {getattr(e, 'status', '?')} {body[:600]}")
+        return False
     except Exception as e:
+        _V2_LAST_ERROR["msg"] = str(e)[:400]
         print(f"[V2] send failed: {e}")
         return False
 
@@ -830,6 +859,17 @@ async def apply_config(feature, cfg):
         await post_verify_panel()
 
 
+async def _log_verify(text):
+    """Post a diagnostic line to the verify log channel, if one is set."""
+    ch = await resolve_channel(roblox_config.get("log_channel_id"))
+    if not ch:
+        return
+    try:
+        await ch.send(text[:1900])
+    except Exception:
+        pass
+
+
 async def post_verify_panel():
     """(Re)post the Verify panel with the Roblox verify button.
 
@@ -845,20 +885,49 @@ async def post_verify_panel():
     btn_style = roblox_config.get("button_style") or "primary"
     verify_row = {"type": "buttonRow", "buttons": [{"label": btn_label, "style": btn_style, "__verify": True}]}
     comps = roblox_config.get("components") or []
-    if comps:
-        panel = [dict(c) for c in comps]
+
+    def _with_button(source):
         # Tuck the Verify button inside the single container if there is one, so
         # we don't nest containers; otherwise add it as a sibling row.
+        panel = [dict(c) for c in source]
         if len(panel) == 1 and panel[0].get("type") == "container":
             panel[0] = dict(panel[0])
             panel[0]["children"] = list(panel[0].get("children") or []) + [verify_row]
         else:
             panel.append(verify_row)
+        return panel
+
+    if comps:
+        _V2_LAST_ERROR["msg"] = ""
+        # Attempt 1: the panel exactly as designed in the dashboard.
         try:
-            if await send_v2_message(ch, panel):
+            if await send_v2_message(ch, _with_button(comps)):
+                print("[Verify] custom panel posted")
                 return
         except Exception as e:
-            print(f"[Verify] custom panel failed, using default: {e}")
+            print(f"[Verify] custom panel error: {e}")
+
+        # Attempt 2: retry with media galleries removed — a rejected image URL
+        # is the most common reason a Components V2 message fails to send.
+        stripped = _strip_galleries(comps)
+        if stripped != comps:
+            try:
+                if await send_v2_message(ch, _with_button(stripped)):
+                    print("[Verify] custom panel posted (images dropped — an image URL was rejected)")
+                    await _log_verify(f"⚠️ Verify panel posted without its image(s): Discord rejected the image URL. {_V2_LAST_ERROR['msg']}")
+                    return
+            except Exception as e:
+                print(f"[Verify] stripped panel error: {e}")
+
+        # Both attempts failed — surface the real reason instead of silently
+        # posting an unrelated default that looks like 'a random thing'.
+        print(f"[Verify] custom panel failed twice, using default. reason={_V2_LAST_ERROR['msg']}")
+        await _log_verify(f"⚠️ Your custom Verify panel could not be posted, so the default was used. Reason: {_V2_LAST_ERROR['msg'] or 'unknown'}")
+    else:
+        # No components saved at all — tell the owner so they know the default
+        # is showing because nothing was designed/saved, not because it broke.
+        print("[Verify] no custom components saved — posting default panel")
+        await _log_verify("ℹ️ No custom Verify panel was saved, so the default is being used. Design one in the dashboard and press Save changes.")
 
     embed = discord.Embed(
         title="Verify with Roblox",
