@@ -860,7 +860,9 @@ async def apply_config(feature, cfg):
         roblox_config["button_label"] = str(cfg.get("verify_button_label") or "Verify")
         roblox_config["button_style"] = str(cfg.get("verify_button_style") or "primary")
         print(f"[Config] roblox-verify — channel {roblox_config['channel_id']} role {roblox_config['verified_role_id']} nick {roblox_config['set_nickname']} components {len(roblox_config['components'])}")
-        await post_verify_panel()
+        # Note: saving config no longer auto-posts the panel. The owner posts it
+        # on demand with the "Post panel" button (a post_message command with
+        # verify_panel=true). This avoids a surprise repost on every boot/save.
 
 
 async def _log_verify(text):
@@ -1169,9 +1171,15 @@ async def poll_configs():
         print(f"[Poll] {action} ({command_id})")
 
         if action in ("post_message", "send_channel_message"):
-            channel = await resolve_channel(payload.get("channel_id"))
-            if channel:
-                await handle_post(channel, payload)
+            if payload.get("verify_panel"):
+                # Owner pressed "Post panel" for Roblox verification.
+                if payload.get("channel_id"):
+                    roblox_config["channel_id"] = str(payload["channel_id"])
+                await post_verify_panel()
+            else:
+                channel = await resolve_channel(payload.get("channel_id"))
+                if channel:
+                    await handle_post(channel, payload)
             await complete_command(command_id)
 
         elif action == "edit_ticket_panel":
