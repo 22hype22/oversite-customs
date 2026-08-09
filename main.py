@@ -74,6 +74,8 @@ roblox_config = {
     "client_id": "",
     "client_secret": "",
     "components": [],
+    "button_label": "Verify",
+    "button_style": "primary",
 }
 
 
@@ -822,6 +824,8 @@ async def apply_config(feature, cfg):
         roblox_config["client_secret"] = str(cfg.get("roblox_client_secret") or "")
         comps = cfg.get("components")
         roblox_config["components"] = comps if isinstance(comps, list) else []
+        roblox_config["button_label"] = str(cfg.get("verify_button_label") or "Verify")
+        roblox_config["button_style"] = str(cfg.get("verify_button_style") or "primary")
         print(f"[Config] roblox-verify — channel {roblox_config['channel_id']} role {roblox_config['verified_role_id']} nick {roblox_config['set_nickname']} components {len(roblox_config['components'])}")
         await post_verify_panel()
 
@@ -837,7 +841,9 @@ async def post_verify_panel():
     if not ch:
         return
 
-    verify_row = {"type": "buttonRow", "buttons": [{"label": "✅ Verify", "style": "primary", "__verify": True}]}
+    btn_label = roblox_config.get("button_label") or "Verify"
+    btn_style = roblox_config.get("button_style") or "primary"
+    verify_row = {"type": "buttonRow", "buttons": [{"label": btn_label, "style": btn_style, "__verify": True}]}
     comps = roblox_config.get("components") or []
     if comps:
         panel = [dict(c) for c in comps]
@@ -859,8 +865,18 @@ async def post_verify_panel():
         description="Click **Verify** to link your Roblox account. Once you're done, your nickname is set to your Roblox name and you get access to the server.",
         color=0x2B2D31,
     )
+    _style_map = {
+        "primary": discord.ButtonStyle.primary,
+        "success": discord.ButtonStyle.success,
+        "secondary": discord.ButtonStyle.secondary,
+        "danger": discord.ButtonStyle.danger,
+    }
     view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(label="Verify", style=discord.ButtonStyle.primary, custom_id="roblox_verify", emoji="✅"))
+    view.add_item(discord.ui.Button(
+        label=(btn_label or "Verify")[:80],
+        style=_style_map.get(btn_style, discord.ButtonStyle.primary),
+        custom_id="roblox_verify",
+    ))
     try:
         await ch.send(embed=embed, view=view)
     except Exception as e:
