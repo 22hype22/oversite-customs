@@ -134,7 +134,7 @@ async def on_ready():
     print(f"[Boot] bot {BOT_ORDER_ID} using worker token prefix {WORKER_TOKEN[:12] if WORKER_TOKEN else 'MISSING'} (len {len(WORKER_TOKEN) if WORKER_TOKEN else 0})")
 
     if BOT_ORDER_ID and WORKER_TOKEN:
-        for loop in (send_heartbeat, poll_configs, poll_shutdown, record_metrics_loop):
+        for loop in (send_heartbeat, poll_configs, poll_shutdown, record_metrics_loop, poll_roblox_apply):
             try:
                 if not loop.is_running():
                     loop.start()
@@ -1301,6 +1301,57 @@ async def complete_command(command_id, status="done", error=None):
         print(f"[Command] complete failed: {e}")
 
 
+_processing_roblox = set()
+
+
+@tasks.loop(seconds=8)
+async def poll_roblox_apply():
+    """Claim pending roblox_apply commands straight from the DB via REST and
+    process them (nickname + role). This bypasses the shared claim-command
+    allowlist, so verification works regardless of the bot-api function's
+    action whitelist."""
+    if not (SUPABASE_URL and SUPABASE_KEY and BOT_ORDER_ID):
+        return
+    try:
+        url = (
+            f"{SUPABASE_URL}/rest/v1/bot_commands?bot_id=eq.{BOT_ORDER_ID}"
+            f"&action=eq.roblox_apply&status=eq.pending&order=created_at.asc&select=id,payload&limit=10"
+        )
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                url,
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+                timeout=10,
+            )
+        if r.status_code != 200:
+            return
+        rows = r.json()
+    except Exception as e:
+        print(f"[Verify] roblox_apply poll failed: {e}")
+        return
+    if not isinstance(rows, list):
+        return
+    for row in rows:
+        cid = row.get("id")
+        if not cid or cid in _processing_roblox:
+            continue
+        _processing_roblox.add(cid)
+        try:
+            print(f"[Verify] processing roblox_apply {cid}")
+            await apply_roblox_verification(row.get("payload") or {})
+        except Exception as e:
+            print(f"[Verify] roblox_apply {cid} failed: {e}")
+        finally:
+            # Mark done either way so we don't loop on a bad row forever.
+            await complete_command(cid)
+            _processing_roblox.discard(cid)
+
+
+@poll_roblox_apply.before_loop
+async def before_poll_roblox_apply():
+    await bot.wait_until_ready()
+
+
 async def save_ticket_panel(guild_id, channel_id, message_id, channel_name):
     try:
         async with httpx.AsyncClient() as client:
@@ -1606,7 +1657,7 @@ async def _shutdown():
         await bot.change_presence(status=discord.Status.invisible)
     except Exception:
         pass
-    for loop in (send_heartbeat, poll_configs, record_metrics_loop):
+    for loop in (send_heartbeat, poll_configs, record_metrics_loop, poll_roblox_apply):
         try:
             loop.cancel()
         except Exception:
