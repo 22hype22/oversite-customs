@@ -73,6 +73,7 @@ roblox_config = {
     "log_channel_id": "",
     "client_id": "",
     "client_secret": "",
+    "components": [],
 }
 
 
@@ -690,6 +691,8 @@ def build_button(btn, guild):
             del data["label"]
         return data
 
+    if btn.get("__verify"):
+        return _btn({"type": 2, "label": (label[:80] or "Verify"), "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": "roblox_verify"})
     if btn.get("disabled"):
         cid = f"display_{btn.get('id') or label[:20] or 'x'}"
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": cid[:100], "disabled": True})
@@ -817,15 +820,40 @@ async def apply_config(feature, cfg):
         roblox_config["log_channel_id"] = str(cfg.get("log_channel_id") or "")
         roblox_config["client_id"] = str(cfg.get("roblox_client_id") or "")
         roblox_config["client_secret"] = str(cfg.get("roblox_client_secret") or "")
-        print(f"[Config] roblox-verify — channel {roblox_config['channel_id']} role {roblox_config['verified_role_id']} nick {roblox_config['set_nickname']}")
+        comps = cfg.get("components")
+        roblox_config["components"] = comps if isinstance(comps, list) else []
+        print(f"[Config] roblox-verify — channel {roblox_config['channel_id']} role {roblox_config['verified_role_id']} nick {roblox_config['set_nickname']} components {len(roblox_config['components'])}")
         await post_verify_panel()
 
 
 async def post_verify_panel():
-    """(Re)post the Verify panel with the Roblox verify button."""
+    """(Re)post the Verify panel with the Roblox verify button.
+
+    If the owner designed a custom panel in the dashboard (components), render
+    that and attach the Verify button underneath. Otherwise post a default
+    embed + button.
+    """
     ch = await resolve_channel(roblox_config.get("channel_id"))
     if not ch:
         return
+
+    verify_row = {"type": "buttonRow", "buttons": [{"label": "✅ Verify", "style": "primary", "__verify": True}]}
+    comps = roblox_config.get("components") or []
+    if comps:
+        panel = [dict(c) for c in comps]
+        # Tuck the Verify button inside the single container if there is one, so
+        # we don't nest containers; otherwise add it as a sibling row.
+        if len(panel) == 1 and panel[0].get("type") == "container":
+            panel[0] = dict(panel[0])
+            panel[0]["children"] = list(panel[0].get("children") or []) + [verify_row]
+        else:
+            panel.append(verify_row)
+        try:
+            if await send_v2_message(ch, panel):
+                return
+        except Exception as e:
+            print(f"[Verify] custom panel failed, using default: {e}")
+
     embed = discord.Embed(
         title="Verify with Roblox",
         description="Click **Verify** to link your Roblox account. Once you're done, your nickname is set to your Roblox name and you get access to the server.",
