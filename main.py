@@ -967,25 +967,59 @@ async def apply_roblox_verification(payload):
     if not member:
         return
     roblox_username = (payload.get("roblox_username") or "").strip()
+    notes = []
+
+    # Nickname
     if roblox_config.get("set_nickname", True) and roblox_username:
         try:
             await member.edit(nick=roblox_username[:32], reason="Roblox verified")
+        except discord.Forbidden:
+            notes.append("• Couldn't set nickname — I need **Manage Nicknames**, and I can't rename the server owner or anyone with a role above mine.")
+            print("[Verify] nickname change forbidden")
         except Exception as e:
+            notes.append(f"• Couldn't set nickname — {e}")
             print(f"[Verify] nickname change failed: {e}")
-    role_id = roblox_config.get("verified_role_id")
-    if role_id:
+
+    # Verified role
+    role_id = str(roblox_config.get("verified_role_id") or "").strip()
+    if not role_id:
+        notes.append("• No Verified role is set in the dashboard — open the Verification block, pick a role, and Save.")
+        print("[Verify] no verified_role_id configured")
+    else:
         role = guild.get_role(int(role_id))
-        if role:
+        if not role:
+            notes.append("• The Verified role no longer exists in this server — pick a new one in the dashboard.")
+            print(f"[Verify] role {role_id} not found in guild")
+        else:
             try:
                 await member.add_roles(role, reason="Roblox verified")
+                print(f"[Verify] gave {member} the {role.name} role")
+            except discord.Forbidden:
+                notes.append(
+                    f"• Couldn't give the **{role.name}** role — my role must sit **above** it in Server Settings → Roles, "
+                    "and I need the **Manage Roles** permission."
+                )
+                print(f"[Verify] role assign forbidden (hierarchy/perms) for {role.name}")
             except Exception as e:
+                notes.append(f"• Couldn't give the **{role.name}** role — {e}")
                 print(f"[Verify] role assign failed: {e}")
-    log_id = roblox_config.get("log_channel_id")
+
+    # Report the outcome to the log channel so the owner can see it in Discord.
+    log_id = str(roblox_config.get("log_channel_id") or "").strip()
     if log_id:
         log_ch = guild.get_channel(int(log_id))
         if log_ch:
             try:
-                await log_ch.send(embed=success_embed("Roblox verified", f"{member.mention} linked **{roblox_username}**"))
+                if notes:
+                    await log_ch.send(embed=error_embed(
+                        "Verified — but something needs fixing",
+                        f"{member.mention} linked **{roblox_username}**, however:\n" + "\n".join(notes),
+                    ))
+                else:
+                    await log_ch.send(embed=success_embed(
+                        "Roblox verified",
+                        f"{member.mention} linked **{roblox_username}** — nickname and role applied.",
+                    ))
             except Exception:
                 pass
 
