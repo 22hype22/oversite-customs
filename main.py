@@ -623,17 +623,21 @@ async def send_v2_message(channel, components_v2, content=None):
             title = comp.get("title", "")
             if title:
                 text = f"**{title}**\n{text}" if text else f"**{title}**"
+            if not text:
+                return None
             thumb = comp.get("thumbnailUrl") or comp.get("thumbnail_url")
             button = comp.get("button")
-            children = [{"type": 10, "content": text}] if text else []
-            if not children:
-                return None
-            obj = {"type": 9, "components": children}
+            accessory = None
             if thumb and str(thumb).startswith("http"):
-                obj["accessory"] = {"type": 11, "media": {"url": thumb}}
+                accessory = {"type": 11, "media": {"url": thumb}}
             elif isinstance(button, dict) and button.get("label"):
-                obj["accessory"] = build_button(button, getattr(channel, "guild", None))
-            return obj
+                accessory = build_button(button, getattr(channel, "guild", None))
+            # A Components V2 Section (type 9) REQUIRES an accessory (thumbnail or
+            # button). If the design has neither, Discord rejects the whole
+            # message, so render the text as a plain text display instead.
+            if accessory is None:
+                return {"type": 10, "content": text}
+            return {"type": 9, "components": [{"type": 10, "content": text}], "accessory": accessory}
         if ctype in ("buttonRow", "button_row", "buttons", "action_row"):
             buttons = [build_button(b, getattr(channel, "guild", None)) for b in comp.get("buttons", [])]
             buttons = [b for b in buttons if b]
