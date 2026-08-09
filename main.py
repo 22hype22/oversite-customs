@@ -721,7 +721,10 @@ async def send_v2_message(channel, components_v2, content=None):
         payload["content"] = content
     route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
     try:
-        await bot.http.request(route, json=payload)
+        resp = await bot.http.request(route, json=payload)
+        # Return the new message id (truthy) so callers can track/replace it.
+        if isinstance(resp, dict) and resp.get("id"):
+            return str(resp["id"])
         return True
     except discord.HTTPException as e:
         body = getattr(e, "text", "") or ""
@@ -848,7 +851,7 @@ async def resolve_channel(channel_id):
     return channel
 
 
-async def apply_config(feature, cfg):
+async def apply_config(feature, cfg, post_panel=False):
     if not isinstance(cfg, dict):
         return
     if feature in ("welcome", "join-logs", "welcome-logs"):
@@ -903,9 +906,30 @@ async def apply_config(feature, cfg):
         roblox_config["button_label"] = str(cfg.get("verify_button_label") or "Verify")
         roblox_config["button_style"] = str(cfg.get("verify_button_style") or "primary")
         print(f"[Config] roblox-verify — channel {roblox_config['channel_id']} role {roblox_config['verified_role_id']} nick {roblox_config['set_nickname']} components {len(roblox_config['components'])}")
-        # Note: saving config no longer auto-posts the panel. The owner posts it
-        # on demand with the "Post panel" button (a post_message command with
-        # verify_panel=true). This avoids a surprise repost on every boot/save.
+        # Post the panel when this came from a save/apply (deliberate action),
+        # but NOT on boot — that avoids the surprise repost on every restart.
+        # _replace_panel dedupes so a re-post replaces the old panel.
+        if post_panel:
+            await post_verify_panel()
+
+
+async def _replace_panel(new_channel_id, new_message_id):
+    """Record the freshly-posted panel and delete the previous one, so posting
+    again REPLACES the old panel instead of stacking duplicates."""
+    old = roblox_config.get("panel_ref")
+    roblox_config["panel_ref"] = (
+        {"channel_id": str(new_channel_id), "message_id": str(new_message_id)}
+        if new_message_id and new_message_id is not True
+        else None
+    )
+    if old and old.get("message_id"):
+        try:
+            ch = await resolve_channel(old.get("channel_id"))
+            if ch:
+                msg = await ch.fetch_message(int(old["message_id"]))
+                await msg.delete()
+        except Exception:
+            pass
 
 
 async def _log_verify(text):
@@ -953,8 +977,10 @@ async def post_verify_panel():
         _V2_LAST_ERROR["msg"] = ""
         # Attempt 1: the panel exactly as designed in the dashboard.
         try:
-            if await send_v2_message(ch, _with_button(comps)):
+            mid = await send_v2_message(ch, _with_button(comps))
+            if mid:
                 print("[Verify] custom panel posted")
+                await _replace_panel(ch.id, mid)
                 return
         except Exception as e:
             print(f"[Verify] custom panel error: {e}")
@@ -964,8 +990,10 @@ async def post_verify_panel():
         stripped = _strip_galleries(comps)
         if stripped != comps:
             try:
-                if await send_v2_message(ch, _with_button(stripped)):
+                mid = await send_v2_message(ch, _with_button(stripped))
+                if mid:
                     print("[Verify] custom panel posted (images dropped — an image URL was rejected)")
+                    await _replace_panel(ch.id, mid)
                     await _log_verify(f"⚠️ Verify panel posted without its image(s): Discord rejected the image URL. {_V2_LAST_ERROR['msg']}")
                     return
             except Exception as e:
@@ -999,7 +1027,8 @@ async def post_verify_panel():
         custom_id="roblox_verify",
     ))
     try:
-        await ch.send(embed=embed, view=view)
+        msg = await ch.send(embed=embed, view=view)
+        await _replace_panel(ch.id, msg.id)
     except Exception as e:
         print(f"[Verify] panel post failed: {e}")
 
@@ -1239,7 +1268,9 @@ async def poll_configs():
             if feature:
                 cfg = await fetch_config(feature)
                 if cfg:
-                    await apply_config(feature, cfg)
+                    # A save/apply command is a deliberate action, so post the
+                    # verify panel here (boot loads config without posting).
+                    await apply_config(feature, cfg, post_panel=True)
                 await mark_config_applied(feature)
             await complete_command(command_id)
 
