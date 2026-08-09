@@ -709,8 +709,12 @@ async def send_v2_message(channel, components_v2, content=None):
     built = [b for b in (build(c) for c in components_v2) if b]
     if not built:
         return False
+    # These component types are all valid at the top level of a Components V2
+    # message, so images (12), sections (9), action rows (1), separators (14),
+    # etc. can live OUTSIDE a container. Only wrap if something invalid slips in.
+    ALLOWED_TOP = {1, 9, 10, 12, 13, 14, 17}
     top_types = {c.get("type") for c in built}
-    if not top_types.issubset({10, 14, 17}) or (17 in top_types and len(top_types) > 1):
+    if not top_types.issubset(ALLOWED_TOP):
         built = [{"type": 17, "components": built}]
     payload = {"components": built, "flags": 1 << 15}
     if content:
@@ -748,9 +752,9 @@ def build_button(btn, guild):
     channel_id = btn.get("channel_id", "")
     url = btn.get("url", "")
     style_name = str(btn.get("style", "primary")).lower()
-    # Turn :emoji: shortcodes into real emoji so a button label like ":w_love:"
-    # shows the custom emoji instead of the raw text.
-    label = _resolve_emoji_shortcodes(label, guild)
+    # Resolve :emoji: shortcodes and {count}-style variables in the label so a
+    # button labeled ":w_love: {count}" shows the emoji + live count.
+    label = _render_guild_text(label, guild)
     label, emoji = _extract_button_emoji(label)
 
     def _btn(data):
@@ -932,12 +936,15 @@ async def post_verify_panel():
     comps = roblox_config.get("components") or []
 
     def _with_button(source):
-        # Tuck the Verify button inside the single container if there is one, so
-        # we don't nest containers; otherwise add it as a sibling row.
+        # Tuck the Verify button inside a container (with the text) so it doesn't
+        # dangle at the very bottom outside the box. Prefer the last container;
+        # if the design has none, add it as a top-level sibling row.
         panel = [dict(c) for c in source]
-        if len(panel) == 1 and panel[0].get("type") == "container":
-            panel[0] = dict(panel[0])
-            panel[0]["children"] = list(panel[0].get("children") or []) + [verify_row]
+        container_idxs = [i for i, c in enumerate(panel) if c.get("type") == "container"]
+        if container_idxs:
+            i = container_idxs[-1]
+            panel[i] = dict(panel[i])
+            panel[i]["children"] = list(panel[i].get("children") or []) + [verify_row]
         else:
             panel.append(verify_row)
         return panel
