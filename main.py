@@ -65,6 +65,15 @@ ticket_config = {
 }
 credits_config = {"manager_role_ids": CREDIT_MANAGER_ROLE_IDS, "currency_name": "credits", "log_channel_id": ""}
 _credits_memory = {}
+# Roblox OAuth verification config (from the dashboard "Verification" block).
+roblox_config = {
+    "channel_id": "",
+    "verified_role_id": "",
+    "set_nickname": True,
+    "log_channel_id": "",
+    "client_id": "",
+    "client_secret": "",
+}
 
 
 def success_embed(title, description=None):
@@ -422,6 +431,8 @@ async def on_interaction(interaction: discord.Interaction):
         await open_ticket(interaction, "support")
     elif cid.startswith("ticket_close"):
         await close_ticket(interaction)
+    elif cid == "roblox_verify":
+        await start_roblox_verify(interaction)
 
 
 def _ticket_topic(opener_id, category):
@@ -799,6 +810,112 @@ async def apply_config(feature, cfg):
         msgs = cfg.get("messages")
         invite_config["messages"] = msgs if isinstance(msgs, list) else []
         print(f"[Config] invite — channel {invite_config['channel_id']} components {len(invite_config['components'])} embeds {len(invite_config['embeds'])}")
+    elif feature in ("roblox-verify", "verification"):
+        roblox_config["channel_id"] = str(cfg.get("channel_id") or "")
+        roblox_config["verified_role_id"] = str(cfg.get("verified_role_id") or "")
+        roblox_config["set_nickname"] = bool(cfg.get("set_nickname", True))
+        roblox_config["log_channel_id"] = str(cfg.get("log_channel_id") or "")
+        roblox_config["client_id"] = str(cfg.get("roblox_client_id") or "")
+        roblox_config["client_secret"] = str(cfg.get("roblox_client_secret") or "")
+        print(f"[Config] roblox-verify — channel {roblox_config['channel_id']} role {roblox_config['verified_role_id']} nick {roblox_config['set_nickname']}")
+        await post_verify_panel()
+
+
+async def post_verify_panel():
+    """(Re)post the Verify panel with the Roblox verify button."""
+    ch = await resolve_channel(roblox_config.get("channel_id"))
+    if not ch:
+        return
+    embed = discord.Embed(
+        title="Verify with Roblox",
+        description="Click **Verify** to link your Roblox account. Once you're done, your nickname is set to your Roblox name and you get access to the server.",
+        color=0x2B2D31,
+    )
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="Verify", style=discord.ButtonStyle.primary, custom_id="roblox_verify", emoji="✅"))
+    try:
+        await ch.send(embed=embed, view=view)
+    except Exception as e:
+        print(f"[Verify] panel post failed: {e}")
+
+
+async def apply_roblox_verification(payload):
+    """Bot side of a completed Roblox verify: set nickname + give the role."""
+    guild = bot.get_guild(int(payload["guild_id"])) if payload.get("guild_id") else None
+    if not guild:
+        return
+    uid = payload.get("discord_user_id")
+    member = guild.get_member(int(uid)) if uid else None
+    if member is None and uid:
+        try:
+            member = await guild.fetch_member(int(uid))
+        except Exception:
+            member = None
+    if not member:
+        return
+    roblox_username = (payload.get("roblox_username") or "").strip()
+    if roblox_config.get("set_nickname", True) and roblox_username:
+        try:
+            await member.edit(nick=roblox_username[:32], reason="Roblox verified")
+        except Exception as e:
+            print(f"[Verify] nickname change failed: {e}")
+    role_id = roblox_config.get("verified_role_id")
+    if role_id:
+        role = guild.get_role(int(role_id))
+        if role:
+            try:
+                await member.add_roles(role, reason="Roblox verified")
+            except Exception as e:
+                print(f"[Verify] role assign failed: {e}")
+    log_id = roblox_config.get("log_channel_id")
+    if log_id:
+        log_ch = guild.get_channel(int(log_id))
+        if log_ch:
+            try:
+                await log_ch.send(embed=success_embed("Roblox verified", f"{member.mention} linked **{roblox_username}**"))
+            except Exception:
+                pass
+
+
+async def start_roblox_verify(interaction):
+    """A member clicked Verify — ask the edge function for their Roblox login URL."""
+    await interaction.response.defer(ephemeral=True)
+    if not roblox_config.get("client_id"):
+        await interaction.followup.send(
+            embed=error_embed("Verification not set up", "An admin still needs to add the Roblox Client ID/Secret in the dashboard."),
+            ephemeral=True,
+        )
+        return
+    try:
+        session = await get_poll_session()
+        async with session.post(
+            f"{SUPABASE_FN_URL}/roblox-verify",
+            headers=_fn_headers(),
+            json={
+                "action": "start",
+                "bot_id": BOT_ORDER_ID,
+                "guild_id": str(interaction.guild_id),
+                "discord_user_id": str(interaction.user.id),
+            },
+        ) as r:
+            data = await r.json() if r.status == 200 else {}
+        url = data.get("url") if isinstance(data, dict) else None
+        if not url:
+            await interaction.followup.send(
+                embed=error_embed("Couldn't start verification", "Please try again in a moment."),
+                ephemeral=True,
+            )
+            return
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(label="Link Roblox", url=url, style=discord.ButtonStyle.link, emoji="🔗"))
+        await interaction.followup.send(
+            "Click **Link Roblox** to log in. When Roblox says you're verified, come back here — your nickname and role update automatically.",
+            view=view,
+            ephemeral=True,
+        )
+    except Exception as e:
+        print(f"[Verify] start failed: {e}")
+        await interaction.followup.send(embed=error_embed("Something went wrong", "Please try again."), ephemeral=True)
 
 
 async def fetch_config(feature):
@@ -839,7 +956,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
@@ -919,6 +1036,10 @@ async def poll_configs():
                 if cfg:
                     await apply_config(feature, cfg)
                 await mark_config_applied(feature)
+            await complete_command(command_id)
+
+        elif action == "roblox_apply":
+            await apply_roblox_verification(payload)
             await complete_command(command_id)
 
         elif action == "set_status":
