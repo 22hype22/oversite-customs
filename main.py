@@ -134,7 +134,7 @@ async def on_ready():
     print(f"[Boot] bot {BOT_ORDER_ID} using worker token prefix {WORKER_TOKEN[:12] if WORKER_TOKEN else 'MISSING'} (len {len(WORKER_TOKEN) if WORKER_TOKEN else 0})")
 
     if BOT_ORDER_ID and WORKER_TOKEN:
-        for loop in (send_heartbeat, poll_configs, poll_shutdown, record_metrics_loop, poll_roblox_apply):
+        for loop in (send_heartbeat, poll_configs, poll_shutdown, record_metrics_loop, poll_roblox_apply, poll_about_me):
             try:
                 if not loop.is_running():
                     loop.start()
@@ -439,8 +439,18 @@ async def refresh_status():
 @tasks.loop(minutes=10)
 async def update_status():
     await refresh_status()
-    # Pick up dashboard About Me edits promptly (only PATCHes when it changed).
+
+
+@tasks.loop(seconds=20)
+async def poll_about_me():
+    # Apply dashboard About Me edits within ~20s (only PATCHes when it changed,
+    # so this is cheap and never hits Discord unless the text is new).
     await apply_about_me()
+
+
+@poll_about_me.before_loop
+async def before_poll_about_me():
+    await bot.wait_until_ready()
 
 
 @update_status.before_loop
@@ -1659,7 +1669,7 @@ async def _shutdown():
         await bot.change_presence(status=discord.Status.invisible)
     except Exception:
         pass
-    for loop in (send_heartbeat, poll_configs, record_metrics_loop, poll_roblox_apply):
+    for loop in (send_heartbeat, poll_configs, record_metrics_loop, poll_roblox_apply, poll_about_me):
         try:
             loop.cancel()
         except Exception:
