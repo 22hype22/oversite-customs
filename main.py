@@ -168,6 +168,98 @@ async def on_ready():
         print(f"Sync error: {e}")
 
 
+async def _order_policy():
+    """Fetch the order's active flag + licensed server limit for bot-side
+    guards. Returns (active, server_limit). Fails SAFE (active=True, limit=None)
+    so an API hiccup never makes the bot abandon a legit server."""
+    data = await runtime_rpc("runtime_bot_server_policy", {"_token": WORKER_TOKEN, "_bot_id": BOT_ORDER_ID})
+    if isinstance(data, dict):
+        active = data.get("active", True)
+        lim = data.get("limit")
+        lim = int(lim) if isinstance(lim, (int, float)) or (isinstance(lim, str) and str(lim).isdigit()) else None
+        return (active is not False), lim
+    return True, None
+
+
+@bot.event
+async def on_guild_join(guild):
+    """The bot was added to a server. It may only STAY if the owner is within
+    their licensed server count (add more via 'Add to another server' in the
+    dashboard). Otherwise it posts a short note and leaves. Fails SAFE: it only
+    leaves on an explicit over-limit / inactive answer, never on an API error."""
+    print(f"[Guild] joined {guild.id} ({guild.name}) — {guild.member_count} members")
+    if not (BOT_ORDER_ID and WORKER_TOKEN):
+        return
+
+    # Register the join so it shows in the dashboard's server list (best effort).
+    try:
+        session = await get_poll_session()
+        await session.post(
+            f"{SUPABASE_FN_URL}/{BOT_API}/guild-join",
+            headers=_fn_headers(),
+            json={
+                "bot_id": BOT_ORDER_ID,
+                "guild_id": str(guild.id),
+                "guild_name": guild.name,
+                "member_count": guild.member_count or 0,
+            },
+        )
+    except Exception:
+        pass
+
+    active, limit = await _order_policy()
+    over_limit = isinstance(limit, int) and limit >= 0 and len(bot.guilds) > limit
+    if active and not over_limit:
+        try:
+            await cache_roles(guild.id)
+            await cache_channels(guild.id)
+        except Exception:
+            pass
+        return
+
+    # Not licensed for this server — explain, then leave.
+    reason = "the owner's plan is inactive" if not active else "this exceeds the owner's licensed server count"
+    print(f"[Guild] {guild.id} not allowed ({reason}) — leaving (limit={limit}, in={len(bot.guilds)})")
+    try:
+        target = guild.system_channel
+        if target is None or not target.permissions_for(guild.me).send_messages:
+            target = next(
+                (c for c in guild.text_channels if c.permissions_for(guild.me).send_messages),
+                None,
+            )
+        if target is not None:
+            await target.send(embed=error_embed(
+                "This bot is licensed per server",
+                "Oversite Customs only runs in servers the owner has added through "
+                "their **Oversite dashboard** (Add to another server). This server "
+                "isn't covered by their plan, so I'm leaving. Ask the owner to add "
+                "it from the dashboard, then re-invite.",
+            ))
+    except Exception:
+        pass
+    try:
+        await guild.leave()
+    except Exception as e:
+        print(f"[Guild] leave failed: {e}")
+
+
+@bot.event
+async def on_guild_remove(guild):
+    """Bot left / was kicked — free the server slot on the backend."""
+    print(f"[Guild] removed from {guild.id} ({guild.name})")
+    if not (BOT_ORDER_ID and WORKER_TOKEN):
+        return
+    try:
+        session = await get_poll_session()
+        await session.post(
+            f"{SUPABASE_FN_URL}/{BOT_API}/guild-leave",
+            headers=_fn_headers(),
+            json={"bot_id": BOT_ORDER_ID, "guild_id": str(guild.id)},
+        )
+    except Exception as e:
+        print(f"[Guild] guild-leave report failed: {e}")
+
+
 @bot.event
 async def on_member_join(member):
     await refresh_status()
