@@ -1598,6 +1598,7 @@ async def apply_bot_identity():
 
 
 _last_bio = None
+_about_me_diag = False
 
 
 async def apply_about_me():
@@ -1605,8 +1606,11 @@ async def apply_about_me():
     via PATCH /applications/@me (authorised with the bot's own token). Discord
     supports this now, so there's no manual portal step. Only re-sends when the
     text actually changes."""
-    global _last_bio
+    global _last_bio, _about_me_diag
     if not (SUPABASE_URL and BOT_ORDER_ID and TOKEN):
+        if not _about_me_diag:
+            print(f"[AboutMe] skipped — SUPABASE_URL:{bool(SUPABASE_URL)} BOT_ORDER_ID:{bool(BOT_ORDER_ID)} TOKEN:{bool(TOKEN)}")
+            _about_me_diag = True
         return
     try:
         async with httpx.AsyncClient() as client:
@@ -1614,14 +1618,22 @@ async def apply_about_me():
                 f"{SUPABASE_URL}/rest/v1/bot_orders?id=eq.{BOT_ORDER_ID}&select=bot_bio",
                 headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=10,
             )
+            status = r.status_code
             data = r.json()
-        if not data or not isinstance(data, list):
+        if not isinstance(data, list) or not data:
+            if not _about_me_diag:
+                print(f"[AboutMe] fetch returned no row — HTTP {status} body={str(data)[:200]}")
+                _about_me_diag = True
             return
         bio = data[0].get("bot_bio")
+        # One-time diagnostic so we can see exactly what the bot reads.
+        if not _about_me_diag:
+            print(f"[AboutMe] fetch OK — HTTP {status}, bot_bio={'<empty>' if not bio else repr(bio[:60])}")
+            _about_me_diag = True
     except Exception as e:
         print(f"[AboutMe] fetch failed: {e}")
         return
-    if bio is None or bio == _last_bio:
+    if bio is None or bio == "" or bio == _last_bio:
         return
     try:
         async with httpx.AsyncClient() as client:
