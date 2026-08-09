@@ -62,13 +62,12 @@ ticket_config = {
     "open_message": "",
     "ping_support": True,
     "one_per_user": True,
-    # Rich panel (posted to a channel with an Open Ticket button) + rich message
-    # shown inside a new ticket. Both are Components V2 item lists.
+    # Rich panel (posted to a channel) + a list of ticket TYPES, each with its
+    # own Open button (label/color) and its own opening message. types = [
+    #   {id, name, button_label, button_style, open_components:[...]}, ... ]
     "panel_channel_id": "",
     "panel_components": [],
-    "open_components": [],
-    "open_button_label": "Open Ticket",
-    "open_button_style": "primary",
+    "types": [],
     "panel_ref": None,
 }
 credits_config = {"manager_role_ids": CREDIT_MANAGER_ROLE_IDS, "currency_name": "credits", "log_channel_id": ""}
@@ -642,9 +641,12 @@ async def open_ticket(interaction, category):
 
     content = " ".join(filter(None, [interaction.user.mention, ping])) or None
 
-    # Rich opening message (designed in the dashboard) takes priority. A Close
-    # button is added automatically, and {user}/{username} are filled in.
-    open_comps = ticket_config.get("open_components") or []
+    # Find the ticket type the opener chose (category == type id) and use ITS
+    # opening message. A Close button is added automatically; {user}/{username}
+    # are filled in.
+    tdef = next((t for t in ticket_config.get("types", []) if t.get("id") == category), None)
+    open_comps = (tdef.get("open_components") if tdef else None) or []
+    type_name = (tdef.get("name") if tdef else None) or str(category).replace("_", " ").title()
     sent_rich = False
     if open_comps:
         try:
@@ -677,7 +679,7 @@ async def open_ticket(interaction, category):
     if not sent_rich:
         open_msg = ticket_config.get("open_message") or f"Thanks {interaction.user.mention}, a member of the team will be with you shortly."
         open_msg = open_msg.replace("{user}", interaction.user.mention)
-        embed = info_embed(f"{category.title()} ticket", open_msg)
+        embed = info_embed(f"{type_name} ticket", open_msg)
         embed.set_footer(text=f"Opened by {interaction.user}")
 
         close_view = discord.ui.View(timeout=None)
@@ -1034,13 +1036,31 @@ async def apply_config(feature, cfg, post_panel=False):
             ticket_config["panel_channel_id"] = str(cfg["panel_channel_id"])
         pc = cfg.get("panel_components")
         ticket_config["panel_components"] = pc if isinstance(pc, list) else []
-        oc = cfg.get("open_components")
-        ticket_config["open_components"] = oc if isinstance(oc, list) else []
-        if cfg.get("open_button_label"):
-            ticket_config["open_button_label"] = str(cfg["open_button_label"])
-        if cfg.get("open_button_style"):
-            ticket_config["open_button_style"] = str(cfg["open_button_style"])
-        print(f"[Config] tickets — category {ticket_config['category_id']} roles {ticket_config['support_role_ids']} panel_ch {ticket_config['panel_channel_id']} panel {len(ticket_config['panel_components'])} open {len(ticket_config['open_components'])}")
+        # Ticket types (each with its own button + opening message).
+        raw_types = cfg.get("ticket_types")
+        if isinstance(raw_types, list) and raw_types:
+            types = []
+            for t in raw_types:
+                if not isinstance(t, dict) or not t.get("id"):
+                    continue
+                types.append({
+                    "id": str(t.get("id")),
+                    "name": str(t.get("name") or "Ticket"),
+                    "button_label": str(t.get("button_label") or "Open Ticket"),
+                    "button_style": str(t.get("button_style") or "primary"),
+                    "open_components": t.get("open_components") if isinstance(t.get("open_components"), list) else [],
+                })
+            ticket_config["types"] = types
+        else:
+            # Legacy single-type fallback (from the earlier single open message).
+            oc = cfg.get("open_components")
+            ticket_config["types"] = [{
+                "id": "support", "name": "Support",
+                "button_label": str(cfg.get("open_button_label") or "Open Ticket"),
+                "button_style": str(cfg.get("open_button_style") or "primary"),
+                "open_components": oc if isinstance(oc, list) else [],
+            }]
+        print(f"[Config] tickets — category {ticket_config['category_id']} roles {ticket_config['support_role_ids']} panel_ch {ticket_config['panel_channel_id']} panel {len(ticket_config['panel_components'])} types {len(ticket_config['types'])}")
         # Post/refresh the ticket panel on a save/apply (not on boot).
         if post_panel:
             await post_ticket_panel()
@@ -1225,11 +1245,24 @@ async def post_ticket_panel():
     ch = await resolve_channel(ticket_config.get("panel_channel_id"))
     if not ch:
         return
-    btn_label = ticket_config.get("open_button_label") or "Open Ticket"
-    btn_style = ticket_config.get("open_button_style") or "primary"
-    open_row = {"type": "buttonRow", "buttons": [
-        {"label": btn_label, "style": btn_style, "__ticket_open": True, "category": "support"},
-    ]}
+    types = ticket_config.get("types") or []
+    if not types:
+        types = [{"id": "support", "name": "Support", "button_label": "Open Ticket", "button_style": "primary"}]
+    # One Open button per ticket type, chunked into rows of 5 (Discord's limit).
+    open_rows = []
+    current = []
+    for t in types:
+        current.append({
+            "label": t.get("button_label") or "Open Ticket",
+            "style": t.get("button_style") or "primary",
+            "__ticket_open": True,
+            "category": t.get("id") or "support",
+        })
+        if len(current) == 5:
+            open_rows.append({"type": "buttonRow", "buttons": current})
+            current = []
+    if current:
+        open_rows.append({"type": "buttonRow", "buttons": current})
     comps = ticket_config.get("panel_components") or []
 
     def _with_button(source):
@@ -1238,9 +1271,9 @@ async def post_ticket_panel():
         if container_idxs:
             i = container_idxs[-1]
             panel[i] = dict(panel[i])
-            panel[i]["children"] = list(panel[i].get("children") or []) + [open_row]
+            panel[i]["children"] = list(panel[i].get("children") or []) + open_rows
         else:
-            panel.append(open_row)
+            panel.extend(open_rows)
         return panel
 
     if comps:
@@ -1263,10 +1296,11 @@ async def post_ticket_panel():
             except Exception as e:
                 print(f"[Tickets] stripped panel error: {e}")
 
-    # Default panel (no custom design, or the custom one wouldn't send).
+    # Default panel (no custom design, or the custom one wouldn't send) — a
+    # button per type on a classic embed.
     embed = discord.Embed(
         title="Support Tickets",
-        description="Need help? Click **Open Ticket** below and our team will be with you.",
+        description="Need help? Pick an option below and our team will be with you.",
         color=ACCENT,
     )
     _style_map = {
@@ -1274,11 +1308,12 @@ async def post_ticket_panel():
         "secondary": discord.ButtonStyle.secondary, "danger": discord.ButtonStyle.danger,
     }
     view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(
-        label=(btn_label or "Open Ticket")[:80],
-        style=_style_map.get(btn_style, discord.ButtonStyle.primary),
-        custom_id="ticket_cat:support",
-    ))
+    for t in types[:25]:
+        view.add_item(discord.ui.Button(
+            label=(t.get("button_label") or "Open Ticket")[:80],
+            style=_style_map.get(t.get("button_style") or "primary", discord.ButtonStyle.primary),
+            custom_id=f"ticket_cat:{(t.get('id') or 'support')[:80]}",
+        ))
     try:
         msg = await ch.send(embed=embed, view=view)
         await _replace_ticket_panel(ch.id, msg.id)
