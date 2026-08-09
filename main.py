@@ -258,6 +258,36 @@ def _sub_placeholders(text, member):
     return _resolve_emoji_shortcodes(text, member.guild)
 
 
+def _render_guild_text(text, guild):
+    """Resolve :emoji: shortcodes and {count}-style placeholders for text posted
+    to a channel (no specific member). Used everywhere a panel/embed renders
+    text so custom emojis and variables work every time."""
+    if not isinstance(text, str) or not text:
+        return text
+    if guild is not None and "{" in text:
+        count = str(getattr(guild, "member_count", 0) or 0)
+        members = list(getattr(guild, "members", []) or [])
+        bot_count = str(sum(1 for m in members if m.bot)) if members else "0"
+        human_count = str(sum(1 for m in members if not m.bot)) if members else count
+        boosts = str(getattr(guild, "premium_subscription_count", 0) or 0)
+        boost_level = str(getattr(guild, "premium_tier", 0) or 0)
+        repl = {
+            "{server}": guild.name,
+            "{member_count}": count, "{members}": count, "{count}": count,
+            "{player count}": count, "{player_count}": count,
+            "{human_count}": human_count, "{humans}": human_count,
+            "{bot_count}": bot_count, "{bot count}": bot_count, "{bots}": bot_count,
+            "{boosts}": boosts, "{boost_count}": boosts,
+            "{total server boosts}": boosts, "{server_boosts}": boosts,
+            "{boost_level}": boost_level, "{boost_tier}": boost_level,
+            "{channel_count}": str(len(guild.channels)), "{channels}": str(len(guild.channels)),
+            "{role_count}": str(len(guild.roles)), "{roles}": str(len(guild.roles)),
+        }
+        for token, value in repl.items():
+            text = text.replace(token, value)
+    return _resolve_emoji_shortcodes(text, guild)
+
+
 _INVITE_TEXT_KEYS = {"text", "content", "label", "placeholder", "title", "description", "name", "value"}
 
 
@@ -589,6 +619,8 @@ def _strip_galleries(items):
 
 
 async def send_v2_message(channel, components_v2, content=None):
+    _guild = getattr(channel, "guild", None)
+
     def build(comp):
         ctype = comp.get("type", "")
         if ctype in ("text", "text_display"):
@@ -596,7 +628,7 @@ async def send_v2_message(channel, components_v2, content=None):
             title = comp.get("title", "")
             if title:
                 text = f"**{title}**\n{text}" if text else f"**{title}**"
-            return {"type": 10, "content": text} if text else None
+            return {"type": 10, "content": _render_guild_text(text, _guild)} if text else None
         if ctype == "container":
             accent = comp.get("accentColor") or comp.get("accent_color", "")
             try:
@@ -625,13 +657,14 @@ async def send_v2_message(channel, components_v2, content=None):
                 text = f"**{title}**\n{text}" if text else f"**{title}**"
             if not text:
                 return None
+            text = _render_guild_text(text, _guild)
             thumb = comp.get("thumbnailUrl") or comp.get("thumbnail_url")
             button = comp.get("button")
             accessory = None
             if thumb and str(thumb).startswith("http"):
                 accessory = {"type": 11, "media": {"url": thumb}}
             elif isinstance(button, dict) and button.get("label"):
-                accessory = build_button(button, getattr(channel, "guild", None))
+                accessory = build_button(button, _guild)
             # A Components V2 Section (type 9) REQUIRES an accessory (thumbnail or
             # button). If the design has neither, Discord rejects the whole
             # message, so render the text as a plain text display instead.
@@ -715,6 +748,9 @@ def build_button(btn, guild):
     channel_id = btn.get("channel_id", "")
     url = btn.get("url", "")
     style_name = str(btn.get("style", "primary")).lower()
+    # Turn :emoji: shortcodes into real emoji so a button label like ":w_love:"
+    # shows the custom emoji instead of the raw text.
+    label = _resolve_emoji_shortcodes(label, guild)
     label, emoji = _extract_button_emoji(label)
 
     def _btn(data):
@@ -741,27 +777,29 @@ def build_button(btn, guild):
     return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"btn_{label[:20] or 'x'}"})
 
 
-def build_embed(data):
+def build_embed(data, guild=None):
+    def _r(v):
+        return _render_guild_text(v, guild) if isinstance(v, str) else v
     try:
         color = int(data.get("color")) if data.get("color") is not None else ACCENT
     except Exception:
         color = ACCENT
     embed = discord.Embed(color=color)
     if data.get("title"):
-        embed.title = data["title"]
+        embed.title = _r(data["title"])
     if data.get("title_url"):
         embed.url = data["title_url"]
     if data.get("description"):
-        embed.description = data["description"]
+        embed.description = _r(data["description"])
     author = data.get("author")
     if isinstance(author, dict) and author.get("name"):
-        embed.set_author(name=author["name"], icon_url=author.get("icon_url") or None)
+        embed.set_author(name=_r(author["name"]), icon_url=author.get("icon_url") or None)
     footer = data.get("footer")
     if isinstance(footer, dict) and footer.get("text"):
-        embed.set_footer(text=footer["text"], icon_url=footer.get("icon_url") or None)
+        embed.set_footer(text=_r(footer["text"]), icon_url=footer.get("icon_url") or None)
     for f in data.get("fields", []) or []:
         if f.get("name") and f.get("value"):
-            embed.add_field(name=f["name"], value=f["value"], inline=bool(f.get("inline")))
+            embed.add_field(name=_r(f["name"]), value=_r(f["value"]), inline=bool(f.get("inline")))
     if data.get("thumbnail_url"):
         embed.set_thumbnail(url=data["thumbnail_url"])
     if data.get("image_url"):
@@ -777,8 +815,9 @@ async def handle_post(channel, payload):
         await send_v2_message(channel, components_v2, payload.get("content") or None)
         return
     embeds_data = payload.get("embeds") or []
-    content = payload.get("content") or None
-    embeds = [build_embed(e) for e in embeds_data if isinstance(e, dict)]
+    _guild = getattr(channel, "guild", None)
+    content = _render_guild_text(payload.get("content") or "", _guild) or None
+    embeds = [build_embed(e, _guild) for e in embeds_data if isinstance(e, dict)]
     extra_images = payload.get("images") or []
     for url in extra_images[1:10]:
         eb = discord.Embed(color=ACCENT)
