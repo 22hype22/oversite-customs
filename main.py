@@ -62,6 +62,14 @@ ticket_config = {
     "open_message": "",
     "ping_support": True,
     "one_per_user": True,
+    # Rich panel (posted to a channel with an Open Ticket button) + rich message
+    # shown inside a new ticket. Both are Components V2 item lists.
+    "panel_channel_id": "",
+    "panel_components": [],
+    "open_components": [],
+    "open_button_label": "Open Ticket",
+    "open_button_style": "primary",
+    "panel_ref": None,
 }
 credits_config = {"manager_role_ids": CREDIT_MANAGER_ROLE_IDS, "currency_name": "credits", "log_channel_id": ""}
 _credits_memory = {}
@@ -632,16 +640,50 @@ async def open_ticket(interaction, category):
     if ticket_config.get("ping_support", True) and support_roles:
         ping = " ".join(r.mention for r in support_roles)
 
-    open_msg = ticket_config.get("open_message") or f"Thanks {interaction.user.mention}, a member of the team will be with you shortly."
-    open_msg = open_msg.replace("{user}", interaction.user.mention)
-    embed = info_embed(f"{category.title()} ticket", open_msg)
-    embed.set_footer(text=f"Opened by {interaction.user}")
-
-    close_view = discord.ui.View(timeout=None)
-    close_view.add_item(discord.ui.Button(label="Close ticket", style=discord.ButtonStyle.danger, custom_id="ticket_close", emoji="🔒"))
-
     content = " ".join(filter(None, [interaction.user.mention, ping])) or None
-    await channel.send(content=content, embed=embed, view=close_view)
+
+    # Rich opening message (designed in the dashboard) takes priority. A Close
+    # button is added automatically, and {user}/{username} are filled in.
+    open_comps = ticket_config.get("open_components") or []
+    sent_rich = False
+    if open_comps:
+        try:
+            def _js(s):
+                return json.dumps(str(s))[1:-1]
+            raw = json.dumps(open_comps)
+            raw = raw.replace("{user}", _js(interaction.user.mention)).replace("{username}", _js(interaction.user.display_name))
+            comps = json.loads(raw)
+            close_row = {"type": "buttonRow", "buttons": [{"label": "Close ticket", "style": "danger", "__ticket_close": True}]}
+            panel = [dict(c) for c in comps]
+            container_idxs = [i for i, c in enumerate(panel) if c.get("type") == "container"]
+            if container_idxs:
+                i = container_idxs[-1]
+                panel[i] = dict(panel[i])
+                panel[i]["children"] = list(panel[i].get("children") or []) + [close_row]
+            else:
+                panel.append(close_row)
+            # Ping first (plain message) so the opener + support actually get notified,
+            # then the rich Components V2 message (which can't carry a pinging content).
+            if content:
+                try:
+                    await channel.send(content=content)
+                except Exception:
+                    pass
+            sent_rich = bool(await send_v2_message(channel, panel))
+        except Exception as e:
+            print(f"[Tickets] rich open message failed: {e}")
+            sent_rich = False
+
+    if not sent_rich:
+        open_msg = ticket_config.get("open_message") or f"Thanks {interaction.user.mention}, a member of the team will be with you shortly."
+        open_msg = open_msg.replace("{user}", interaction.user.mention)
+        embed = info_embed(f"{category.title()} ticket", open_msg)
+        embed.set_footer(text=f"Opened by {interaction.user}")
+
+        close_view = discord.ui.View(timeout=None)
+        close_view.add_item(discord.ui.Button(label="Close ticket", style=discord.ButtonStyle.danger, custom_id="ticket_close", emoji="🔒"))
+
+        await channel.send(content=content, embed=embed, view=close_view)
     await record_ticket(guild.id, channel.id, interaction.user.id, category, "open")
     await interaction.followup.send(embed=success_embed("Ticket opened", f"Your ticket is ready: {channel.mention}"), ephemeral=True)
 
@@ -879,6 +921,11 @@ def build_button(btn, guild):
 
     if btn.get("__verify"):
         return _btn({"type": 2, "label": (label[:80] or "Verify"), "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": "roblox_verify"})
+    if btn.get("__ticket_open"):
+        cat = str(btn.get("category") or "support")[:80]
+        return _btn({"type": 2, "label": (label[:80] or "Open Ticket"), "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_cat:{cat}"})
+    if btn.get("__ticket_close"):
+        return _btn({"type": 2, "label": (label[:80] or "Close ticket"), "style": BUTTON_STYLE_MAP.get(style_name, 4), "custom_id": "ticket_close"})
     if btn.get("disabled"):
         cid = f"display_{btn.get('id') or label[:20] or 'x'}"
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": cid[:100], "disabled": True})
@@ -983,7 +1030,20 @@ async def apply_config(feature, cfg, post_panel=False):
             ticket_config["ping_support"] = bool(cfg["ping_support"])
         if "one_per_user" in cfg:
             ticket_config["one_per_user"] = bool(cfg["one_per_user"])
-        print(f"[Config] tickets — category {ticket_config['category_id']} roles {ticket_config['support_role_ids']}")
+        if cfg.get("panel_channel_id"):
+            ticket_config["panel_channel_id"] = str(cfg["panel_channel_id"])
+        pc = cfg.get("panel_components")
+        ticket_config["panel_components"] = pc if isinstance(pc, list) else []
+        oc = cfg.get("open_components")
+        ticket_config["open_components"] = oc if isinstance(oc, list) else []
+        if cfg.get("open_button_label"):
+            ticket_config["open_button_label"] = str(cfg["open_button_label"])
+        if cfg.get("open_button_style"):
+            ticket_config["open_button_style"] = str(cfg["open_button_style"])
+        print(f"[Config] tickets — category {ticket_config['category_id']} roles {ticket_config['support_role_ids']} panel_ch {ticket_config['panel_channel_id']} panel {len(ticket_config['panel_components'])} open {len(ticket_config['open_components'])}")
+        # Post/refresh the ticket panel on a save/apply (not on boot).
+        if post_panel:
+            await post_ticket_panel()
     elif feature == "credits":
         if cfg.get("manager_role_ids") is not None:
             credits_config["manager_role_ids"] = [str(x) for x in cfg["manager_role_ids"] if x]
@@ -1139,6 +1199,91 @@ async def post_verify_panel():
         await _replace_panel(ch.id, msg.id)
     except Exception as e:
         print(f"[Verify] panel post failed: {e}")
+
+
+async def _replace_ticket_panel(new_channel_id, new_message_id):
+    """Record the freshly-posted ticket panel and delete the previous one, so a
+    re-post replaces it instead of stacking duplicates."""
+    old = ticket_config.get("panel_ref")
+    ticket_config["panel_ref"] = (
+        {"channel_id": str(new_channel_id), "message_id": str(new_message_id)}
+        if new_message_id and new_message_id is not True else None
+    )
+    if old and old.get("message_id"):
+        try:
+            ch = await resolve_channel(old.get("channel_id"))
+            if ch:
+                msg = await ch.fetch_message(int(old["message_id"]))
+                await msg.delete()
+        except Exception:
+            pass
+
+
+async def post_ticket_panel():
+    """(Re)post the ticket panel — the owner's designed message plus an Open
+    Ticket button — to the configured panel channel. Mirrors the verify panel."""
+    ch = await resolve_channel(ticket_config.get("panel_channel_id"))
+    if not ch:
+        return
+    btn_label = ticket_config.get("open_button_label") or "Open Ticket"
+    btn_style = ticket_config.get("open_button_style") or "primary"
+    open_row = {"type": "buttonRow", "buttons": [
+        {"label": btn_label, "style": btn_style, "__ticket_open": True, "category": "support"},
+    ]}
+    comps = ticket_config.get("panel_components") or []
+
+    def _with_button(source):
+        panel = [dict(c) for c in source]
+        container_idxs = [i for i, c in enumerate(panel) if c.get("type") == "container"]
+        if container_idxs:
+            i = container_idxs[-1]
+            panel[i] = dict(panel[i])
+            panel[i]["children"] = list(panel[i].get("children") or []) + [open_row]
+        else:
+            panel.append(open_row)
+        return panel
+
+    if comps:
+        try:
+            mid = await send_v2_message(ch, _with_button(comps))
+            if mid:
+                print("[Tickets] panel posted")
+                await _replace_ticket_panel(ch.id, mid)
+                return
+        except Exception as e:
+            print(f"[Tickets] panel error: {e}")
+        stripped = _strip_galleries(comps)
+        if stripped != comps:
+            try:
+                mid = await send_v2_message(ch, _with_button(stripped))
+                if mid:
+                    print("[Tickets] panel posted (images dropped)")
+                    await _replace_ticket_panel(ch.id, mid)
+                    return
+            except Exception as e:
+                print(f"[Tickets] stripped panel error: {e}")
+
+    # Default panel (no custom design, or the custom one wouldn't send).
+    embed = discord.Embed(
+        title="Support Tickets",
+        description="Need help? Click **Open Ticket** below and our team will be with you.",
+        color=ACCENT,
+    )
+    _style_map = {
+        "primary": discord.ButtonStyle.primary, "success": discord.ButtonStyle.success,
+        "secondary": discord.ButtonStyle.secondary, "danger": discord.ButtonStyle.danger,
+    }
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(
+        label=(btn_label or "Open Ticket")[:80],
+        style=_style_map.get(btn_style, discord.ButtonStyle.primary),
+        custom_id="ticket_cat:support",
+    ))
+    try:
+        msg = await ch.send(embed=embed, view=view)
+        await _replace_ticket_panel(ch.id, msg.id)
+    except Exception as e:
+        print(f"[Tickets] panel post failed: {e}")
 
 
 async def apply_roblox_verification(payload):
