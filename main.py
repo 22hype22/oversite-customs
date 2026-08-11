@@ -84,38 +84,42 @@ def _msg_key(open_components, label=""):
 
 def _register_ticket_components(comps):
     ticket_msgs.clear(); eph_msgs.clear()
-    trace = []
-    def _reg(x, path):
+
+    def _reg(x):
+        oc = x.get("open_components") or []
         if "ticket" in x:
-            k = _msg_key(x.get("open_components"), x.get("label", ""))
-            ticket_msgs[k] = x.get("open_components") or []
-            trace.append(f"{path} TICKET '{x.get('label')}' k={k}")
+            ticket_msgs[_msg_key(oc, x.get("label", ""))] = oc
         elif "ephemeral" in x:
-            k = _msg_key(x.get("open_components"), x.get("label", ""))
-            eph_msgs[k] = x.get("open_components") or []
-            trace.append(f"{path} EPH '{x.get('label')}' k={k}")
-    def walk(items, path):
-        for i, c in enumerate(items or []):
+            eph_msgs[_msg_key(oc, x.get("label", ""))] = oc
+        # A Ticket/Ephemeral message can itself contain more Ticket/Ephemeral
+        # buttons, so register the ones nested inside it too.
+        if oc:
+            walk(oc, 0)
+
+    def walk(items, depth):
+        if depth > 8:
+            return
+        for c in (items or []):
             if not isinstance(c, dict):
                 continue
             t = c.get("type")
-            trace.append(f"{path}[{i}]={t}")
             if t == "container":
-                walk(c.get("children") or c.get("components") or [], f"{path}[{i}].children")
+                walk(c.get("children") or c.get("components") or [], depth + 1)
             elif t in ("buttonRow", "button_row", "buttons", "action_row"):
-                for bi, b in enumerate(c.get("buttons") or []):
+                for b in (c.get("buttons") or []):
                     if isinstance(b, dict):
-                        _reg(b, f"{path}[{i}].btn[{bi}]")
+                        _reg(b)
             elif t in ("select_menu", "select"):
-                for oi, o in enumerate(c.get("options") or []):
+                for o in (c.get("options") or []):
                     if isinstance(o, dict):
-                        _reg(o, f"{path}[{i}].opt[{oi}]")
+                        _reg(o)
             elif t == "section":
                 b = c.get("button")
                 if isinstance(b, dict):
-                    _reg(b, f"{path}[{i}].section.btn")
-    walk(comps, "root")
-    print("[Tickets] STRUCTURE: " + " | ".join(trace))
+                    _reg(b)
+
+    walk(comps, 0)
+    print(f"[Tickets] registry: {len(ticket_msgs)} ticket + {len(eph_msgs)} ephemeral messages")
     print(f"[Tickets] registry built: tickets={{{', '.join(f'{k}:{len(v)}' for k,v in ticket_msgs.items())}}} eph={{{', '.join(f'{k}:{len(v)}' for k,v in eph_msgs.items())}}}")
 credits_config = {"manager_role_ids": CREDIT_MANAGER_ROLE_IDS, "currency_name": "credits", "log_channel_id": ""}
 _credits_memory = {}
@@ -1038,11 +1042,9 @@ def build_button(btn, guild):
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": cid[:100], "disabled": True})
     if "ticket" in btn:
         key = _msg_key(btn.get("open_components"), btn.get("label", ""))
-        print(f"[Tickets] RENDER ticket btn '{btn.get('label')}' k={key} oc={len(btn.get('open_components') or [])}")
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_msg:{key}"})
     if "ephemeral" in btn:
         key = _msg_key(btn.get("open_components"), btn.get("label", ""))
-        print(f"[Tickets] RENDER eph btn '{btn.get('label')}' k={key}")
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"eph:{key}"})
     if category:
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_cat:{category[:80]}"})
