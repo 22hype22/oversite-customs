@@ -2,6 +2,7 @@ import os
 import io
 import re
 import json
+import hashlib
 import signal
 import asyncio
 import datetime
@@ -70,6 +71,39 @@ ticket_config = {
     "types": [],
     "panel_ref": None,
 }
+
+# Registry mapping a clicked Ticket/Ephemeral component back to the message the
+# dashboard designed for it. Rebuilt from panel_components on every apply_config
+# (and on boot), so it survives restarts.
+ticket_msgs = {}   # key -> open_components (Ticket buttons/options)
+eph_msgs = {}      # key -> open_components (Ephemeral buttons/options)
+
+def _msg_key(open_components, label=""):
+    raw = json.dumps(open_components or [], sort_keys=True) + "|" + (label or "")
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
+
+def _register_ticket_components(comps):
+    ticket_msgs.clear(); eph_msgs.clear()
+    def walk(items):
+        for c in (items or []):
+            if not isinstance(c, dict):
+                continue
+            t = c.get("type")
+            if t == "container":
+                walk(c.get("children") or c.get("components") or [])
+            elif t in ("buttonRow", "button_row", "buttons", "action_row"):
+                for b in (c.get("buttons") or []):
+                    if isinstance(b, dict) and "ticket" in b:
+                        ticket_msgs[_msg_key(b.get("open_components"), b.get("label", ""))] = b.get("open_components") or []
+                    elif isinstance(b, dict) and "ephemeral" in b:
+                        eph_msgs[_msg_key(b.get("open_components"), b.get("label", ""))] = b.get("open_components") or []
+            elif t in ("select_menu", "select"):
+                for o in (c.get("options") or []):
+                    if isinstance(o, dict) and "ticket" in o:
+                        ticket_msgs[_msg_key(o.get("open_components"), o.get("label", ""))] = o.get("open_components") or []
+                    elif isinstance(o, dict) and "ephemeral" in o:
+                        eph_msgs[_msg_key(o.get("open_components"), o.get("label", ""))] = o.get("open_components") or []
+    walk(comps)
 credits_config = {"manager_role_ids": CREDIT_MANAGER_ROLE_IDS, "currency_name": "credits", "log_channel_id": ""}
 _credits_memory = {}
 # Roblox OAuth verification config (from the dashboard "Verification" block).
@@ -572,7 +606,22 @@ async def on_interaction(interaction: discord.Interaction):
     if cid == "ticket_select":
         values = (interaction.data or {}).get("values") or []
         if values:
-            await open_ticket(interaction, values[0])
+            v = values[0]
+            if v.startswith("ticket_msg:"):
+                await open_ticket(interaction, v, open_comps_override=ticket_msgs.get(v.split(":", 1)[1]))
+            elif v.startswith("eph:"):
+                await show_ephemeral(interaction, v.split(":", 1)[1])
+            elif v.startswith("ch:") or v.startswith("url:"):
+                try:
+                    await interaction.response.defer(ephemeral=True)
+                except Exception:
+                    pass
+            else:
+                await open_ticket(interaction, v)
+    elif cid.startswith("ticket_msg:"):
+        await open_ticket(interaction, cid, open_comps_override=ticket_msgs.get(cid.split(":", 1)[1]))
+    elif cid.startswith("eph:"):
+        await show_ephemeral(interaction, cid.split(":", 1)[1])
     elif cid.startswith("ticket_cat:"):
         await open_ticket(interaction, cid.split(":", 1)[1])
     elif cid == "ticket_open":
@@ -587,7 +636,7 @@ def _ticket_topic(opener_id, category):
     return f"ticket|{opener_id}|{category}"
 
 
-async def open_ticket(interaction, category):
+async def open_ticket(interaction, category, open_comps_override=None):
     guild = interaction.guild
     if not guild:
         return
@@ -645,7 +694,7 @@ async def open_ticket(interaction, category):
     # opening message. A Close button is added automatically; {user}/{username}
     # are filled in.
     tdef = next((t for t in ticket_config.get("types", []) if t.get("id") == category), None)
-    open_comps = (tdef.get("open_components") if tdef else None) or []
+    open_comps = open_comps_override if open_comps_override is not None else ((tdef.get("open_components") if tdef else None) or [])
     type_name = (tdef.get("name") if tdef else None) or str(category).replace("_", " ").title()
     sent_rich = False
     if open_comps:
@@ -688,6 +737,35 @@ async def open_ticket(interaction, category):
         await channel.send(content=content, embed=embed, view=close_view)
     await record_ticket(guild.id, channel.id, interaction.user.id, category, "open")
     await interaction.followup.send(embed=success_embed("Ticket opened", f"Your ticket is ready: {channel.mention}"), ephemeral=True)
+
+
+async def show_ephemeral(interaction, key):
+    comps = eph_msgs.get(key)
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception:
+        pass
+    if not comps:
+        try:
+            await interaction.followup.send(embed=info_embed("Nothing here", "This option isn't set up yet."), ephemeral=True)
+        except Exception:
+            pass
+        return
+
+    def _js(x):
+        return json.dumps(str(x))[1:-1]
+    try:
+        raw = json.dumps(comps)
+        raw = raw.replace("{user}", _js(interaction.user.mention)).replace("{username}", _js(interaction.user.display_name))
+        comps2 = json.loads(raw)
+    except Exception:
+        comps2 = comps
+    ok = await send_v2_message(interaction.channel, comps2, interaction=interaction, ephemeral=True)
+    if not ok:
+        try:
+            await interaction.followup.send(embed=info_embed("Note", "Couldn't render this message."), ephemeral=True)
+        except Exception:
+            pass
 
 
 async def close_ticket(interaction):
@@ -770,7 +848,7 @@ def _strip_galleries(items):
     return out
 
 
-async def send_v2_message(channel, components_v2, content=None):
+async def send_v2_message(channel, components_v2, content=None, interaction=None, ephemeral=False):
     _guild = getattr(channel, "guild", None)
 
     def build(comp):
@@ -836,7 +914,13 @@ async def send_v2_message(channel, components_v2, content=None):
                 category = opt.get("category", "")
                 channel_id = opt.get("channel_id", "")
                 url = opt.get("url", "")
-                if category:
+                if "ticket" in opt:
+                    has_category = True
+                    value = f"ticket_msg:{_msg_key(opt.get('open_components'), opt.get('label', ''))}"
+                elif "ephemeral" in opt:
+                    has_category = True
+                    value = f"eph:{_msg_key(opt.get('open_components'), opt.get('label', ''))}"
+                elif category:
                     has_category = True
                     value = category
                 elif channel_id:
@@ -868,10 +952,16 @@ async def send_v2_message(channel, components_v2, content=None):
     top_types = {c.get("type") for c in built}
     if not top_types.issubset(ALLOWED_TOP):
         built = [{"type": 17, "components": built}]
-    payload = {"components": built, "flags": 1 << 15}
+    flags = 1 << 15
+    if ephemeral:
+        flags |= 1 << 6
+    payload = {"components": built, "flags": flags}
     if content:
         payload["content"] = content
-    route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
+    if interaction is not None:
+        route = discord.http.Route("POST", "/webhooks/{application_id}/{interaction_token}", application_id=bot.application_id, interaction_token=interaction.token)
+    else:
+        route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
     try:
         resp = await bot.http.request(route, json=payload)
         # Return the new message id (truthy) so callers can track/replace it.
@@ -931,6 +1021,12 @@ def build_button(btn, guild):
     if btn.get("disabled"):
         cid = f"display_{btn.get('id') or label[:20] or 'x'}"
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": cid[:100], "disabled": True})
+    if "ticket" in btn:
+        key = _msg_key(btn.get("open_components"), btn.get("label", ""))
+        return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_msg:{key}"})
+    if "ephemeral" in btn:
+        key = _msg_key(btn.get("open_components"), btn.get("label", ""))
+        return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"eph:{key}"})
     if category:
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_cat:{category[:80]}"})
     if channel_id:
@@ -1036,6 +1132,7 @@ async def apply_config(feature, cfg, post_panel=False):
             ticket_config["panel_channel_id"] = str(cfg["panel_channel_id"])
         pc = cfg.get("panel_components")
         ticket_config["panel_components"] = pc if isinstance(pc, list) else []
+        _register_ticket_components(ticket_config["panel_components"])
         # Ticket types (each with its own button + opening message).
         raw_types = cfg.get("ticket_types")
         if isinstance(raw_types, list) and raw_types:
