@@ -104,6 +104,7 @@ def _register_ticket_components(comps):
                     elif isinstance(o, dict) and "ephemeral" in o:
                         eph_msgs[_msg_key(o.get("open_components"), o.get("label", ""))] = o.get("open_components") or []
     walk(comps)
+    print(f"[Tickets] registry built: tickets={{{', '.join(f'{k}:{len(v)}' for k,v in ticket_msgs.items())}}} eph={{{', '.join(f'{k}:{len(v)}' for k,v in eph_msgs.items())}}}")
 credits_config = {"manager_role_ids": CREDIT_MANAGER_ROLE_IDS, "currency_name": "credits", "log_channel_id": ""}
 _credits_memory = {}
 # Roblox OAuth verification config (from the dashboard "Verification" block).
@@ -603,6 +604,8 @@ async def on_interaction(interaction: discord.Interaction):
     if interaction.type != discord.InteractionType.component:
         return
     cid = (interaction.data or {}).get("custom_id", "")
+    if cid.startswith(("ticket_msg:", "eph:", "ticket_cat:")) or cid in ("ticket_select", "ticket_open"):
+        print(f"[Tickets] interaction cid={cid!r} values={(interaction.data or {}).get('values')}")
     if cid == "ticket_select":
         values = (interaction.data or {}).get("values") or []
         if values:
