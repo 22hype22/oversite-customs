@@ -1375,7 +1375,7 @@ async def post_ticket_panel():
 
     if comps:
         try:
-            mid = await send_v2_message(ch, _with_button(comps))
+            mid = await send_v2_message(ch, comps)
             if mid:
                 print("[Tickets] panel posted")
                 await _replace_ticket_panel(ch.id, mid)
@@ -1385,7 +1385,7 @@ async def post_ticket_panel():
         stripped = _strip_galleries(comps)
         if stripped != comps:
             try:
-                mid = await send_v2_message(ch, _with_button(stripped))
+                mid = await send_v2_message(ch, stripped)
                 if mid:
                     print("[Tickets] panel posted (images dropped)")
                     await _replace_ticket_panel(ch.id, mid)
