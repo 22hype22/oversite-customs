@@ -881,35 +881,27 @@ async def ticket_claim_toggle(interaction, claimed):
         print(f"[Tickets] claim toggle failed: {e}")
 
 
-class CloseReasonModal(discord.ui.Modal):
-    def __init__(self, mode):
+class CloseOrderModal(discord.ui.Modal):
+    def __init__(self):
         super().__init__(title="Close Order", timeout=600)
-        self._mode = mode
-        self.reason_input = discord.ui.TextInput(
+        self.close_type = discord.ui.Select(min_values=1, max_values=1, options=[
+            discord.SelectOption(label="Instant Close", value="instant", description="End the order now"),
+            discord.SelectOption(label="Request Close", value="request", description="Ask the opener to confirm first"),
+        ])
+        self.reason = discord.ui.TextInput(
             label="Reason", style=discord.TextStyle.paragraph, required=False,
             max_length=500, placeholder="Reason for closing (optional)",
         )
-        self.add_item(self.reason_input)
+        self.add_item(discord.ui.Label(text="Close type", component=self.close_type))
+        self.add_item(discord.ui.Label(text="Reason", component=self.reason))
 
     async def on_submit(self, interaction):
-        reason = (self.reason_input.value or "").strip() or "No reason provided."
-        if self._mode == "instant":
+        mode = self.close_type.values[0] if self.close_type.values else "instant"
+        reason = (self.reason.value or "").strip() or "No reason provided."
+        if mode == "instant":
             await do_instant_close(interaction, reason)
         else:
             await do_request_close(interaction, reason)
-
-
-class CloseChoiceView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    @discord.ui.button(label="Instant Close", style=discord.ButtonStyle.danger)
-    async def instant(self, interaction, button):
-        await interaction.response.send_modal(CloseReasonModal("instant"))
-
-    @discord.ui.button(label="Request Close", style=discord.ButtonStyle.secondary)
-    async def request(self, interaction, button):
-        await interaction.response.send_modal(CloseReasonModal("request"))
 
 
 async def ticket_close_prompt(interaction):
@@ -917,10 +909,7 @@ async def ticket_close_prompt(interaction):
     if not topic.startswith("ticket|"):
         await interaction.response.send_message(embed=error_embed("Not a ticket", "This isn't a ticket channel."), ephemeral=True)
         return
-    await interaction.response.send_message(
-        embed=info_embed("Close Order", "**Instant Close** ends the order now.\n**Request Close** asks the opener to confirm first."),
-        view=CloseChoiceView(), ephemeral=True,
-    )
+    await interaction.response.send_modal(CloseOrderModal())
 
 
 async def do_instant_close(interaction, reason):
