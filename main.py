@@ -198,6 +198,8 @@ async def runtime_rpc(name, payload):
 async def on_ready():
     print(f"{SERVER_NAME} bot online as {bot.user}")
     print(f"[Boot] bot {BOT_ORDER_ID} using worker token prefix {WORKER_TOKEN[:12] if WORKER_TOKEN else 'MISSING'} (len {len(WORKER_TOKEN) if WORKER_TOKEN else 0})")
+    # Dropdown-in-modal (Close Order form) needs discord.py 2.6+ (discord.ui.Label).
+    print(f"[Boot] discord.py {discord.__version__} | dropdown-in-modal supported: {hasattr(discord.ui, 'Label')}")
 
     if BOT_ORDER_ID and WORKER_TOKEN:
         for loop in (send_heartbeat, poll_configs, poll_shutdown, record_metrics_loop, poll_roblox_apply, poll_about_me):
@@ -931,9 +933,35 @@ async def ticket_claim_toggle(interaction, claimed):
         print(f"[Tickets] rename failed: {e}")
 
 
-# Reason box only — a plain text modal. Selects inside modals are unreliable on
-# some discord.py builds (they make the modal fail to open / respond), so the
-# Instant vs Manual choice is a normal message dropdown handled before this.
+# Preferred: a single form (modal) with the Instant/Manual dropdown inside it.
+# Dropdowns inside modals require discord.py 2.6+ (discord.ui.Label). Where the
+# runtime supports it this is what the user sees; otherwise ticket_close_prompt
+# falls back to the plain-dropdown flow below so it can never time out.
+class CloseOrderModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="Close Order", timeout=600)
+        self.close_type = discord.ui.Select(min_values=1, max_values=1, options=[
+            discord.SelectOption(label="Instant Close", value="instant", default=True, description="Close this order right now"),
+            discord.SelectOption(label="Manual Close", value="request", description="Ask the opener to confirm first"),
+        ])
+        self.reason = discord.ui.TextInput(
+            label="Reason", style=discord.TextStyle.paragraph, required=False,
+            max_length=500, placeholder="Reason for closing (optional)",
+        )
+        self.add_item(discord.ui.Label(text="Close Type", component=self.close_type))
+        self.add_item(discord.ui.Label(text="Reason", component=self.reason))
+
+    async def on_submit(self, interaction):
+        mode = self.close_type.values[0] if self.close_type.values else "instant"
+        reason = (self.reason.value or "").strip() or "No reason provided."
+        if mode == "request":
+            await do_request_close(interaction, reason)
+        else:
+            await do_instant_close(interaction, reason)
+
+
+# Fallback path: a plain-message dropdown, then a text-only reason box. Used only
+# when the single form above isn't supported by the running discord.py build.
 class CloseReasonModal(discord.ui.Modal):
     def __init__(self, mode):
         super().__init__(title="Close Order", timeout=600)
@@ -969,6 +997,15 @@ async def ticket_close_prompt(interaction):
     if not topic.startswith("ticket|"):
         await interaction.response.send_message(embed=error_embed("Not a ticket", "This isn't a ticket channel."), ephemeral=True)
         return
+    # Try the single form first. If this runtime can't build a dropdown-in-modal,
+    # the modal is never sent (send_modal raises before acking), so we fall back
+    # to the plain dropdown instead of leaving the click unanswered.
+    if hasattr(discord.ui, "Label"):
+        try:
+            await interaction.response.send_modal(CloseOrderModal())
+            return
+        except Exception as e:
+            print(f"[Ticket] single-form close modal unavailable ({e}); using dropdown fallback")
     await interaction.response.send_message(
         embed=info_embed("Close Order", "Choose how you'd like to close this order."),
         view=_close_type_view(), ephemeral=True,
