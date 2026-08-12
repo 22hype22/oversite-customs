@@ -659,6 +659,10 @@ async def on_interaction(interaction: discord.Interaction):
         await ticket_claim_toggle(interaction, False)
     elif cid == "ticket_close":
         await ticket_close_prompt(interaction)
+    elif cid == "ticket_closetype":
+        values = (interaction.data or {}).get("values") or []
+        mode = values[0] if values else "instant"
+        await interaction.response.send_modal(CloseReasonModal(mode))
     elif cid == "ticket_close_confirm":
         await close_ticket(interaction)
     elif cid == "roblox_verify":
@@ -927,27 +931,37 @@ async def ticket_claim_toggle(interaction, claimed):
         print(f"[Tickets] rename failed: {e}")
 
 
-class CloseOrderModal(discord.ui.Modal):
-    def __init__(self):
+# Reason box only — a plain text modal. Selects inside modals are unreliable on
+# some discord.py builds (they make the modal fail to open / respond), so the
+# Instant vs Manual choice is a normal message dropdown handled before this.
+class CloseReasonModal(discord.ui.Modal):
+    def __init__(self, mode):
         super().__init__(title="Close Order", timeout=600)
-        self.close_type = discord.ui.Select(min_values=1, max_values=1, options=[
-            discord.SelectOption(label="Instant Close", value="instant", default=True, description="End the order now"),
-            discord.SelectOption(label="Manual Close", value="request", description="Ask the opener to confirm first"),
-        ])
+        self.mode = mode
         self.reason = discord.ui.TextInput(
             label="Reason", style=discord.TextStyle.paragraph, required=False,
             max_length=500, placeholder="Reason for closing (optional)",
         )
-        self.add_item(discord.ui.Label(text="Close Type", component=self.close_type))
-        self.add_item(discord.ui.Label(text="Reason", component=self.reason))
+        self.add_item(self.reason)
 
     async def on_submit(self, interaction):
-        mode = self.close_type.values[0] if self.close_type.values else "instant"
         reason = (self.reason.value or "").strip() or "No reason provided."
-        if mode == "instant":
-            await do_instant_close(interaction, reason)
-        else:
+        if self.mode == "request":
             await do_request_close(interaction, reason)
+        else:
+            await do_instant_close(interaction, reason)
+
+
+def _close_type_view():
+    view = discord.ui.View(timeout=300)
+    view.add_item(discord.ui.Select(
+        custom_id="ticket_closetype", placeholder="Choose how to close…",
+        min_values=1, max_values=1, options=[
+            discord.SelectOption(label="Instant Close", value="instant", description="Close this order right now"),
+            discord.SelectOption(label="Manual Close", value="request", description="Ask the opener to confirm first"),
+        ],
+    ))
+    return view
 
 
 async def ticket_close_prompt(interaction):
@@ -955,7 +969,10 @@ async def ticket_close_prompt(interaction):
     if not topic.startswith("ticket|"):
         await interaction.response.send_message(embed=error_embed("Not a ticket", "This isn't a ticket channel."), ephemeral=True)
         return
-    await interaction.response.send_modal(CloseOrderModal())
+    await interaction.response.send_message(
+        embed=info_embed("Close Order", "Choose how you'd like to close this order."),
+        view=_close_type_view(), ephemeral=True,
+    )
 
 
 async def do_instant_close(interaction, reason):
