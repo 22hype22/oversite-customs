@@ -1020,7 +1020,9 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
                     await channel.send(content=content)
                 except Exception:
                     pass
-            sent_rich = bool(await send_v2_message(channel, panel))
+            # Allow role + user mentions inside the ticket message to actually
+            # ping (e.g. a @Livery Designer role written into the design).
+            sent_rich = bool(await send_v2_message(channel, panel, allowed_mentions={"parse": ["users", "roles"]}))
         except Exception as e:
             print(f"[Tickets] rich open message failed: {e}")
             sent_rich = False
@@ -1327,7 +1329,7 @@ def _strip_galleries(items):
     return out
 
 
-async def send_v2_message(channel, components_v2, content=None, interaction=None, ephemeral=False):
+async def send_v2_message(channel, components_v2, content=None, interaction=None, ephemeral=False, allowed_mentions=None):
     _guild = getattr(channel, "guild", None)
 
     def build(comp):
@@ -1440,6 +1442,11 @@ async def send_v2_message(channel, components_v2, content=None, interaction=None
     payload = {"components": built, "flags": flags}
     if content:
         payload["content"] = content
+    # Components V2 messages don't fire mention notifications unless the payload
+    # explicitly allows them, so a <@&role> in a ticket message renders but never
+    # pings without this.
+    if allowed_mentions is not None:
+        payload["allowed_mentions"] = allowed_mentions
     if interaction is not None:
         route = discord.http.Route("POST", "/webhooks/{application_id}/{interaction_token}", application_id=bot.application_id, interaction_token=interaction.token)
     else:
