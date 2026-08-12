@@ -77,6 +77,8 @@ ticket_config = {
 # (and on boot), so it survives restarts.
 ticket_msgs = {}   # key -> open_components (Ticket buttons/options)
 eph_msgs = {}      # key -> open_components (Ephemeral buttons/options)
+form_msgs = {}     # key -> open_components (Form buttons/options — collect {Question:} answers first)
+form_titles = {}   # key -> modal title (the button/option label)
 
 def _msg_key(open_components, label=""):
     raw = json.dumps(open_components or [], sort_keys=True) + "|" + (label or "")
@@ -91,12 +93,16 @@ def _comp_key(x):
     return _msg_key(x.get("open_components"), x.get("label", ""))
 
 def _register_ticket_components(comps):
-    ticket_msgs.clear(); eph_msgs.clear()
+    ticket_msgs.clear(); eph_msgs.clear(); form_msgs.clear(); form_titles.clear()
 
     def _reg(x):
         oc = x.get("open_components") or []
         if "ticket" in x:
             ticket_msgs[_comp_key(x)] = oc
+        elif "form" in x:
+            k = _comp_key(x)
+            form_msgs[k] = oc
+            form_titles[k] = x.get("label") or "Application"
         elif "ephemeral" in x:
             eph_msgs[_comp_key(x)] = oc
         # A Ticket/Ephemeral message can itself contain more Ticket/Ephemeral
@@ -127,7 +133,7 @@ def _register_ticket_components(comps):
                     _reg(b)
 
     walk(comps, 0)
-    print(f"[Tickets] registry: {len(ticket_msgs)} ticket + {len(eph_msgs)} ephemeral messages")
+    print(f"[Tickets] registry: {len(ticket_msgs)} ticket + {len(form_msgs)} form + {len(eph_msgs)} ephemeral messages")
     print(f"[Tickets] registry built: tickets={{{', '.join(f'{k}:{len(v)}' for k,v in ticket_msgs.items())}}} eph={{{', '.join(f'{k}:{len(v)}' for k,v in eph_msgs.items())}}}")
 credits_config = {"manager_role_ids": CREDIT_MANAGER_ROLE_IDS, "currency_name": "credits", "log_channel_id": ""}
 _credits_memory = {}
@@ -627,10 +633,19 @@ bot.tree.add_command(credits_group)
 
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
+    # Form submits arrive as modal_submit interactions (not component). Handle
+    # ours here; leave every other modal (Close Order, etc.) to discord.py's own
+    # Modal dispatch by returning. This fires regardless of restarts, so forms
+    # keep working across redeploys.
+    if interaction.type == discord.InteractionType.modal_submit:
+        cid = (interaction.data or {}).get("custom_id", "")
+        if cid.startswith("ticketform:"):
+            await handle_ticket_form_submit(interaction, cid.split(":", 1)[1])
+        return
     if interaction.type != discord.InteractionType.component:
         return
     cid = (interaction.data or {}).get("custom_id", "")
-    if cid.startswith(("ticket_msg:", "eph:", "ticket_cat:")) or cid in ("ticket_select", "ticket_open"):
+    if cid.startswith(("ticket_msg:", "ticket_form:", "eph:", "ticket_cat:")) or cid in ("ticket_select", "ticket_open"):
         print(f"[Tickets] interaction cid={cid!r} values={(interaction.data or {}).get('values')}")
     if cid == "ticket_select":
         values = (interaction.data or {}).get("values") or []
@@ -638,6 +653,8 @@ async def on_interaction(interaction: discord.Interaction):
             v = values[0]
             if v.startswith("ticket_msg:"):
                 await open_ticket(interaction, v, open_comps_override=ticket_msgs.get(v.split(":", 1)[1]))
+            elif v.startswith("ticket_form:"):
+                await open_ticket_form(interaction, v.split(":", 1)[1])
             elif v.startswith("eph:"):
                 await show_ephemeral(interaction, v.split(":", 1)[1])
             elif v.startswith("ch:") or v.startswith("url:"):
@@ -649,6 +666,8 @@ async def on_interaction(interaction: discord.Interaction):
                 await open_ticket(interaction, v)
     elif cid.startswith("ticket_msg:"):
         await open_ticket(interaction, cid, open_comps_override=ticket_msgs.get(cid.split(":", 1)[1]))
+    elif cid.startswith("ticket_form:"):
+        await open_ticket_form(interaction, cid.split(":", 1)[1])
     elif cid.startswith("eph:"):
         await show_ephemeral(interaction, cid.split(":", 1)[1])
     elif cid.startswith("ticket_cat:"):
@@ -702,6 +721,131 @@ def _ticket_first_word(open_comps):
     txt = re.sub(r"[*_`~>#|:\-]", " ", txt)
     words = [w for w in txt.split() if w]
     return words[0] if words else ""
+
+
+_QUESTION_RE = re.compile(r"\{Question:\s*(.*?)\}", re.IGNORECASE)
+
+
+def _existing_ticket_for(guild, user_id):
+    for ch in guild.text_channels:
+        topic = ch.topic or ""
+        if topic.startswith("ticket|") and topic.split("|")[1] == str(user_id):
+            return ch
+    return None
+
+
+def _parse_questions(open_comps):
+    """Ordered, de-duplicated list of {Question: LABEL} labels in a design (max 5)."""
+    raw = json.dumps(open_comps or [])
+    seen = []
+    for m in _QUESTION_RE.finditer(raw):
+        lbl = (m.group(1) or "").strip()
+        if lbl and lbl not in seen:
+            seen.append(lbl)
+    return seen[:5]
+
+
+def _form_input_style(label):
+    l = (label or "").lower()
+    if any(k in l for k in ("descri", "about", "why", "reason", "detail", "explain", "tell", "message")):
+        return 2  # paragraph
+    return 1  # short
+
+
+def _collect_modal_values(components):
+    """Flatten a modal_submit component tree into {custom_id: value}. Handles
+    Label-wrapped inputs (type 18 -> component), action rows (type 1), and bare
+    text inputs (type 4)."""
+    vals = {}
+    for row in components or []:
+        if not isinstance(row, dict):
+            continue
+        inner = row.get("component")
+        if isinstance(inner, dict) and inner.get("custom_id"):
+            vals[inner["custom_id"]] = inner.get("value", "") or ""
+        for c in (row.get("components") or []):
+            if isinstance(c, dict) and c.get("custom_id"):
+                vals[c["custom_id"]] = c.get("value", "") or ""
+        if row.get("type") == 4 and row.get("custom_id"):
+            vals[row["custom_id"]] = row.get("value", "") or ""
+    return vals
+
+
+def _apply_answers(open_comps, mapping):
+    """Replace each {Question: LABEL} token with '**LABEL** answer'."""
+    raw = json.dumps(open_comps or [])
+
+    def repl(m):
+        label = (m.group(1) or "").strip()
+        answer = mapping.get(label, "")
+        out = f"**{label}** {answer}".strip() if answer else f"**{label}**"
+        return json.dumps(out)[1:-1]  # JSON-escape (we're inside a string literal)
+
+    return json.loads(_QUESTION_RE.sub(repl, raw))
+
+
+async def open_ticket_form(interaction, key):
+    """A Form button/option: pop a modal to collect {Question:} answers, then
+    open the ticket with those answers filled into the designed message."""
+    open_comps = form_msgs.get(key) or []
+    questions = _parse_questions(open_comps)
+    if not questions:
+        # No questions defined — behave exactly like a Ticket button.
+        await open_ticket(interaction, f"ticket_form:{key}", open_comps_override=open_comps)
+        return
+
+    guild = interaction.guild
+    if guild and ticket_config.get("one_per_user", True):
+        existing = _existing_ticket_for(guild, interaction.user.id)
+        if existing:
+            try:
+                await interaction.response.send_message(
+                    embed=error_embed("Ticket already open", f"You already have an open ticket: {existing.mention}"),
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
+            return
+
+    components = []
+    for i, q in enumerate(questions):
+        components.append({
+            "type": 18,  # Label — carries the field label
+            "label": q[:45],
+            "component": {
+                "type": 4,  # text input (no own label when inside a Label)
+                "custom_id": f"q{i}",
+                "style": _form_input_style(q),
+                "required": True,
+                "max_length": 1000,
+            },
+        })
+    data = {
+        "title": (form_titles.get(key) or "Application")[:45],
+        "custom_id": f"ticketform:{key}",
+        "components": components,
+    }
+    try:
+        route = discord.http.Route(
+            "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+            interaction_id=interaction.id, interaction_token=interaction.token,
+        )
+        await bot.http.request(route, json={"type": 9, "data": data})
+    except Exception as e:
+        print(f"[Ticket] form modal failed: {e}")
+        try:
+            await interaction.response.send_message(embed=error_embed("Couldn't open form", "Please try again."), ephemeral=True)
+        except Exception:
+            pass
+
+
+async def handle_ticket_form_submit(interaction, key):
+    open_comps = form_msgs.get(key) or []
+    labels = _parse_questions(open_comps)
+    vals = _collect_modal_values((interaction.data or {}).get("components"))
+    mapping = {lbl: (vals.get(f"q{i}") or "").strip() for i, lbl in enumerate(labels)}
+    substituted = _apply_answers(open_comps, mapping)
+    await open_ticket(interaction, f"ticket_form:{key}", open_comps_override=substituted)
 
 
 async def open_ticket(interaction, category, open_comps_override=None):
@@ -1144,6 +1288,9 @@ async def send_v2_message(channel, components_v2, content=None, interaction=None
                 if "ticket" in opt:
                     has_category = True
                     value = f"ticket_msg:{_comp_key(opt)}"
+                elif "form" in opt:
+                    has_category = True
+                    value = f"ticket_form:{_comp_key(opt)}"
                 elif "ephemeral" in opt:
                     has_category = True
                     value = f"eph:{_comp_key(opt)}"
@@ -1255,6 +1402,9 @@ def build_button(btn, guild):
     if "ticket" in btn:
         key = _comp_key(btn)
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_msg:{key}"})
+    if "form" in btn:
+        key = _comp_key(btn)
+        return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_form:{key}"})
     if "ephemeral" in btn:
         key = _comp_key(btn)
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"eph:{key}"})
