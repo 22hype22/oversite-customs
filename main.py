@@ -890,19 +890,42 @@ async def handle_ticket_form_submit(interaction, key):
             pass
 
 
+_category_locks = {}
+
+
 async def _get_or_create_category(guild, name):
-    """Find a category by name (case-insensitive), creating it if missing."""
+    """Find a category by name (case-insensitive), creating it only if none
+    exists. A per-name lock + re-check makes concurrent ticket opens reuse the
+    same category instead of racing to create duplicate 'ELS' categories."""
     name = (name or "").strip()
     if not name:
         return None
-    for cat in guild.categories:
-        if cat.name.lower() == name.lower():
-            return cat
-    try:
-        return await guild.create_category(name=name[:100], reason="Ticket category")
-    except Exception as e:
-        print(f"[Tickets] category create failed for {name!r}: {e}")
+    target = name.lower()
+
+    def _find():
+        for cat in guild.categories:
+            if cat.name.strip().lower() == target:
+                return cat
         return None
+
+    existing = _find()
+    if existing:
+        return existing
+
+    key = (guild.id, target)
+    lock = _category_locks.get(key)
+    if lock is None:
+        lock = _category_locks[key] = asyncio.Lock()
+    async with lock:
+        # Another open may have created it while we waited for the lock.
+        existing = _find()
+        if existing:
+            return existing
+        try:
+            return await guild.create_category(name=name[:100], reason="Ticket category")
+        except Exception as e:
+            print(f"[Tickets] category create failed for {name!r}: {e}")
+            return None
 
 
 async def open_ticket(interaction, category, open_comps_override=None, category_name_override=None, already_responded=False):
