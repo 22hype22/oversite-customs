@@ -930,20 +930,19 @@ async def ticket_claim_toggle(interaction, claimed):
 class CloseOrderModal(discord.ui.Modal):
     def __init__(self):
         super().__init__(title="Close Order", timeout=600)
-        self.close_type = discord.ui.TextInput(
-            label="Close type", style=discord.TextStyle.short, required=False,
-            default="Instant", placeholder="Instant  or  Request", max_length=20,
-        )
+        self.close_type = discord.ui.Select(min_values=1, max_values=1, options=[
+            discord.SelectOption(label="Instant Close", value="instant", default=True, description="End the order now"),
+            discord.SelectOption(label="Manual Close", value="request", description="Ask the opener to confirm first"),
+        ])
         self.reason = discord.ui.TextInput(
             label="Reason", style=discord.TextStyle.paragraph, required=False,
             max_length=500, placeholder="Reason for closing (optional)",
         )
-        self.add_item(self.close_type)
-        self.add_item(self.reason)
+        self.add_item(discord.ui.Label(text="Close Type", component=self.close_type))
+        self.add_item(discord.ui.Label(text="Reason", component=self.reason))
 
     async def on_submit(self, interaction):
-        v = (self.close_type.value or "instant").strip().lower()
-        mode = "request" if v.startswith("r") else "instant"
+        mode = self.close_type.values[0] if self.close_type.values else "instant"
         reason = (self.reason.value or "").strip() or "No reason provided."
         if mode == "instant":
             await do_instant_close(interaction, reason)
