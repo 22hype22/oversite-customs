@@ -82,15 +82,23 @@ def _msg_key(open_components, label=""):
     raw = json.dumps(open_components or [], sort_keys=True) + "|" + (label or "")
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
 
+def _comp_key(x):
+    # Prefer the component's stable id (untouched by {user} substitution). Fall
+    # back to a content hash only for components that carry no id (e.g. options).
+    cid = x.get("id")
+    if cid:
+        return str(cid)[:64]
+    return _msg_key(x.get("open_components"), x.get("label", ""))
+
 def _register_ticket_components(comps):
     ticket_msgs.clear(); eph_msgs.clear()
 
     def _reg(x):
         oc = x.get("open_components") or []
         if "ticket" in x:
-            ticket_msgs[_msg_key(oc, x.get("label", ""))] = oc
+            ticket_msgs[_comp_key(x)] = oc
         elif "ephemeral" in x:
-            eph_msgs[_msg_key(oc, x.get("label", ""))] = oc
+            eph_msgs[_comp_key(x)] = oc
         # A Ticket/Ephemeral message can itself contain more Ticket/Ephemeral
         # buttons, so register the ones nested inside it too.
         if oc:
@@ -935,10 +943,10 @@ async def send_v2_message(channel, components_v2, content=None, interaction=None
                 url = opt.get("url", "")
                 if "ticket" in opt:
                     has_category = True
-                    value = f"ticket_msg:{_msg_key(opt.get('open_components'), opt.get('label', ''))}"
+                    value = f"ticket_msg:{_comp_key(opt)}"
                 elif "ephemeral" in opt:
                     has_category = True
-                    value = f"eph:{_msg_key(opt.get('open_components'), opt.get('label', ''))}"
+                    value = f"eph:{_comp_key(opt)}"
                 elif category:
                     has_category = True
                     value = category
@@ -1041,10 +1049,10 @@ def build_button(btn, guild):
         cid = f"display_{btn.get('id') or label[:20] or 'x'}"
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": cid[:100], "disabled": True})
     if "ticket" in btn:
-        key = _msg_key(btn.get("open_components"), btn.get("label", ""))
+        key = _comp_key(btn)
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_msg:{key}"})
     if "ephemeral" in btn:
-        key = _msg_key(btn.get("open_components"), btn.get("label", ""))
+        key = _comp_key(btn)
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"eph:{key}"})
     if category:
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_cat:{category[:80]}"})
