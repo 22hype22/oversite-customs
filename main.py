@@ -79,6 +79,7 @@ ticket_msgs = {}   # key -> open_components (Ticket buttons/options)
 eph_msgs = {}      # key -> open_components (Ephemeral buttons/options)
 form_msgs = {}     # key -> open_components (Form buttons/options — collect {Question:} answers first)
 form_titles = {}   # key -> modal title (the button/option label)
+ticket_categories = {}  # key -> category name a Ticket/Form drops its channels into
 
 def _msg_key(open_components, label=""):
     raw = json.dumps(open_components or [], sort_keys=True) + "|" + (label or "")
@@ -93,16 +94,19 @@ def _comp_key(x):
     return _msg_key(x.get("open_components"), x.get("label", ""))
 
 def _register_ticket_components(comps):
-    ticket_msgs.clear(); eph_msgs.clear(); form_msgs.clear(); form_titles.clear()
+    ticket_msgs.clear(); eph_msgs.clear(); form_msgs.clear(); form_titles.clear(); ticket_categories.clear()
 
     def _reg(x):
         oc = x.get("open_components") or []
         if "ticket" in x:
-            ticket_msgs[_comp_key(x)] = oc
+            k = _comp_key(x)
+            ticket_msgs[k] = oc
+            ticket_categories[k] = (x.get("category_name") or "").strip()
         elif "form" in x:
             k = _comp_key(x)
             form_msgs[k] = oc
             form_titles[k] = x.get("label") or "Application"
+            ticket_categories[k] = (x.get("category_name") or "").strip()
         elif "ephemeral" in x:
             eph_msgs[_comp_key(x)] = oc
         # A Ticket/Ephemeral message can itself contain more Ticket/Ephemeral
@@ -652,7 +656,8 @@ async def on_interaction(interaction: discord.Interaction):
         if values:
             v = values[0]
             if v.startswith("ticket_msg:"):
-                await open_ticket(interaction, v, open_comps_override=ticket_msgs.get(v.split(":", 1)[1]))
+                mk = v.split(":", 1)[1]
+                await open_ticket(interaction, v, open_comps_override=ticket_msgs.get(mk), category_name_override=ticket_categories.get(mk))
             elif v.startswith("ticket_form:"):
                 await open_ticket_form(interaction, v.split(":", 1)[1])
             elif v.startswith("eph:"):
@@ -665,7 +670,8 @@ async def on_interaction(interaction: discord.Interaction):
             else:
                 await open_ticket(interaction, v)
     elif cid.startswith("ticket_msg:"):
-        await open_ticket(interaction, cid, open_comps_override=ticket_msgs.get(cid.split(":", 1)[1]))
+        mk = cid.split(":", 1)[1]
+        await open_ticket(interaction, cid, open_comps_override=ticket_msgs.get(mk), category_name_override=ticket_categories.get(mk))
     elif cid.startswith("ticket_form:"):
         await open_ticket_form(interaction, cid.split(":", 1)[1])
     elif cid.startswith("eph:"):
@@ -845,10 +851,26 @@ async def handle_ticket_form_submit(interaction, key):
     vals = _collect_modal_values((interaction.data or {}).get("components"))
     mapping = {lbl: (vals.get(f"q{i}") or "").strip() for i, lbl in enumerate(labels)}
     substituted = _apply_answers(open_comps, mapping)
-    await open_ticket(interaction, f"ticket_form:{key}", open_comps_override=substituted)
+    await open_ticket(interaction, f"ticket_form:{key}", open_comps_override=substituted,
+                      category_name_override=ticket_categories.get(key))
 
 
-async def open_ticket(interaction, category, open_comps_override=None):
+async def _get_or_create_category(guild, name):
+    """Find a category by name (case-insensitive), creating it if missing."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    for cat in guild.categories:
+        if cat.name.lower() == name.lower():
+            return cat
+    try:
+        return await guild.create_category(name=name[:100], reason="Ticket category")
+    except Exception as e:
+        print(f"[Tickets] category create failed for {name!r}: {e}")
+        return None
+
+
+async def open_ticket(interaction, category, open_comps_override=None, category_name_override=None):
     guild = interaction.guild
     if not guild:
         return
@@ -861,10 +883,15 @@ async def open_ticket(interaction, category, open_comps_override=None):
                 await interaction.followup.send(embed=error_embed("Ticket already open", f"You already have an open ticket: {ch.mention}"), ephemeral=True)
                 return
 
+    # Per-Ticket/Form category (by name, created on demand) wins; otherwise fall
+    # back to the globally configured category id.
     category_channel = None
-    cat_id = ticket_config.get("category_id") or ""
-    if cat_id:
-        category_channel = guild.get_channel(int(cat_id))
+    if category_name_override:
+        category_channel = await _get_or_create_category(guild, category_name_override)
+    if category_channel is None:
+        cat_id = ticket_config.get("category_id") or ""
+        if cat_id:
+            category_channel = guild.get_channel(int(cat_id))
 
     support_roles = []
     for rid in ticket_config.get("support_role_ids", []):
