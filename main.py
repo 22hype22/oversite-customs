@@ -740,6 +740,12 @@ def _existing_ticket_for(guild, user_id):
     return None
 
 
+def _clean_label(s):
+    """Strip markdown emphasis so a {Question: **Server Name:**} token shows a
+    clean 'Server Name:' label in the modal instead of literal asterisks."""
+    return re.sub(r"[*_`~]", "", s or "").strip()
+
+
 def _parse_questions(open_comps):
     """Ordered, de-duplicated list of {Question: LABEL} labels in a design (max 5)."""
     raw = json.dumps(open_comps or [])
@@ -784,7 +790,8 @@ def _apply_answers(open_comps, mapping):
     def repl(m):
         label = (m.group(1) or "").strip()
         answer = mapping.get(label, "")
-        out = f"**{label}** {answer}".strip() if answer else f"**{label}**"
+        clean = _clean_label(label)
+        out = f"**{clean}** {answer}".strip() if answer else f"**{clean}**"
         return json.dumps(out)[1:-1]  # JSON-escape (we're inside a string literal)
 
     return json.loads(_QUESTION_RE.sub(repl, raw))
@@ -817,7 +824,7 @@ async def open_ticket_form(interaction, key):
     for i, q in enumerate(questions):
         components.append({
             "type": 18,  # Label — carries the field label
-            "label": q[:45],
+            "label": (_clean_label(q) or q)[:45],
             "component": {
                 "type": 4,  # text input (no own label when inside a Label)
                 "custom_id": f"q{i}",
@@ -846,13 +853,27 @@ async def open_ticket_form(interaction, key):
 
 
 async def handle_ticket_form_submit(interaction, key):
-    open_comps = form_msgs.get(key) or []
-    labels = _parse_questions(open_comps)
-    vals = _collect_modal_values((interaction.data or {}).get("components"))
-    mapping = {lbl: (vals.get(f"q{i}") or "").strip() for i, lbl in enumerate(labels)}
-    substituted = _apply_answers(open_comps, mapping)
-    await open_ticket(interaction, f"ticket_form:{key}", open_comps_override=substituted,
-                      category_name_override=ticket_categories.get(key))
+    # Acknowledge the modal IMMEDIATELY (before any work) so Discord never shows
+    # "Something went wrong" — then build the ticket and follow up.
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception as e:
+        print(f"[Ticket] form submit defer failed: {e}")
+    try:
+        open_comps = form_msgs.get(key) or []
+        labels = _parse_questions(open_comps)
+        vals = _collect_modal_values((interaction.data or {}).get("components"))
+        mapping = {lbl: (vals.get(f"q{i}") or "").strip() for i, lbl in enumerate(labels)}
+        substituted = _apply_answers(open_comps, mapping)
+        await open_ticket(interaction, f"ticket_form:{key}", open_comps_override=substituted,
+                          category_name_override=ticket_categories.get(key), already_responded=True)
+    except Exception as e:
+        import traceback
+        print(f"[Ticket] form submit failed: {e}\n{traceback.format_exc()}")
+        try:
+            await interaction.followup.send(embed=error_embed("Couldn't open ticket", "Something went wrong creating your ticket. Please try again."), ephemeral=True)
+        except Exception:
+            pass
 
 
 async def _get_or_create_category(guild, name):
@@ -870,11 +891,12 @@ async def _get_or_create_category(guild, name):
         return None
 
 
-async def open_ticket(interaction, category, open_comps_override=None, category_name_override=None):
+async def open_ticket(interaction, category, open_comps_override=None, category_name_override=None, already_responded=False):
     guild = interaction.guild
     if not guild:
         return
-    await interaction.response.defer(ephemeral=True)
+    if not already_responded:
+        await interaction.response.defer(ephemeral=True)
 
     if ticket_config.get("one_per_user", True):
         for ch in guild.text_channels:
