@@ -665,8 +665,37 @@ async def on_interaction(interaction: discord.Interaction):
         await start_roblox_verify(interaction)
 
 
-def _ticket_topic(opener_id, category):
-    return f"ticket|{opener_id}|{category}"
+def _ticket_topic(opener_id, category, base=""):
+    return f"ticket|{opener_id}|{category}|{base}"
+
+
+def _san_name(x):
+    x = re.sub(r"<[^>]+>", "", str(x or ""))
+    x = x.lower().replace(" ", "-")
+    x = re.sub(r"[^a-z0-9\-]", "", x)
+    x = re.sub(r"-+", "-", x).strip("-")
+    return x[:40] or "ticket"
+
+
+def _ticket_first_word(open_comps):
+    def find_text(items):
+        for c in (items or []):
+            if not isinstance(c, dict):
+                continue
+            t = c.get("type")
+            if t in ("text", "text_display", "section"):
+                txt = c.get("text") or c.get("content") or c.get("title") or ""
+                if str(txt).strip():
+                    return str(txt)
+            if t == "container":
+                r = find_text(c.get("children") or c.get("components") or [])
+                if r:
+                    return r
+        return ""
+    txt = re.sub(r"<[^>]+>", "", find_text(open_comps))
+    txt = re.sub(r"[*_`~>#|:\-]", " ", txt)
+    words = [w for w in txt.split() if w]
+    return words[0] if words else ""
 
 
 async def open_ticket(interaction, category, open_comps_override=None):
@@ -701,13 +730,18 @@ async def open_ticket(interaction, category, open_comps_override=None):
     for role in support_roles:
         overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
-    base_name = f"ticket-{interaction.user.name}".lower().replace(" ", "-")[:90]
+    tdef = next((t for t in ticket_config.get("types", []) if t.get("id") == category), None)
+    open_comps = open_comps_override if open_comps_override is not None else ((tdef.get("open_components") if tdef else None) or [])
+    type_name = (tdef.get("name") if tdef else None) or str(category).replace("_", " ").title()
+    first_word = _ticket_first_word(open_comps) or (type_name.split()[0] if type_name.split() else "ticket")
+    ticket_base = f"{_san_name(interaction.user.name)}-{_san_name(first_word)}".strip("-") or _san_name(interaction.user.name)
+    base_name = f"\U0001F534\u30FB{ticket_base}"[:90]
     try:
         channel = await guild.create_text_channel(
             name=base_name,
             category=category_channel if isinstance(category_channel, discord.CategoryChannel) else None,
             overwrites=overwrites,
-            topic=_ticket_topic(interaction.user.id, category),
+            topic=_ticket_topic(interaction.user.id, category, ticket_base),
             reason=f"Ticket opened by {interaction.user}",
         )
     except discord.Forbidden:
@@ -723,12 +757,7 @@ async def open_ticket(interaction, category, open_comps_override=None):
 
     content = " ".join(filter(None, [interaction.user.mention, ping])) or None
 
-    # Find the ticket type the opener chose (category == type id) and use ITS
-    # opening message. A Close button is added automatically; {user}/{username}
-    # are filled in.
-    tdef = next((t for t in ticket_config.get("types", []) if t.get("id") == category), None)
-    open_comps = open_comps_override if open_comps_override is not None else ((tdef.get("open_components") if tdef else None) or [])
-    type_name = (tdef.get("name") if tdef else None) or str(category).replace("_", " ").title()
+    # (ticket type + opening components resolved above for the channel name)
     sent_rich = False
     if open_comps:
         try:
@@ -868,7 +897,7 @@ async def ticket_claim_toggle(interaction, claimed):
         return
     channel, msg = interaction.channel, interaction.message
     if claimed:
-        await interaction.response.send_message(embed=info_embed("Order claimed", f"\U0001F64B {member.mention} claimed this order."))
+        await interaction.response.send_message(embed=info_embed("Order claimed", f"{member.mention} claimed this order."))
     else:
         await interaction.response.send_message(embed=info_embed("Order unclaimed", f"{member.mention} unclaimed this order."))
     try:
@@ -879,6 +908,17 @@ async def ticket_claim_toggle(interaction, claimed):
         await bot.http.request(route, json={"components": comps, "flags": raw.get("flags", 0)})
     except Exception as e:
         print(f"[Tickets] claim toggle failed: {e}")
+    # Rename: green + claimer when claimed, back to red + opener-firstword when not.
+    try:
+        parts = (getattr(channel, "topic", "") or "").split("|")
+        base = parts[3] if len(parts) > 3 and parts[3] else _san_name(getattr(channel, "name", "ticket"))
+        if claimed:
+            new_name = f"\U0001F7E2\u30FB{_san_name(member.name)}"[:90]
+        else:
+            new_name = f"\U0001F534\u30FB{base}"[:90]
+        await channel.edit(name=new_name, reason=f"Ticket {'claimed' if claimed else 'unclaimed'} by {member}")
+    except Exception as e:
+        print(f"[Tickets] rename failed: {e}")
 
 
 class CloseOrderModal(discord.ui.Modal):
