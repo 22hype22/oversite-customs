@@ -831,40 +831,46 @@ async def show_ephemeral(interaction, key):
             pass
 
 
+async def _do_close(channel, guild, closer, reason=""):
+    topic = getattr(channel, "topic", "") or ""
+    parts = topic.split("|")
+    opener_id = parts[1] if len(parts) > 1 else ""
+    category = parts[2] if len(parts) > 2 else "support"
+    transcript = await build_transcript(channel)
+    log_id = ticket_config.get("log_channel_id") or ""
+    opener = guild.get_member(int(opener_id)) if opener_id.isdigit() else None
+    if log_id:
+        log_channel = guild.get_channel(int(log_id))
+        if log_channel:
+            desc = f"**Category:** {category}\n**Opened by:** {opener.mention if opener else opener_id}\n**Closed by:** {closer.mention}"
+            if reason:
+                desc += f"\n**Reason:** {reason}"
+            try:
+                await log_channel.send(embed=info_embed("Ticket closed", desc), file=discord.File(io.BytesIO(transcript.encode("utf-8")), filename=f"{channel.name}.txt"))
+            except Exception as e:
+                print(f"[Ticket] log failed: {e}")
+    await record_ticket(guild.id, channel.id, opener_id, category, "closed")
+    await asyncio.sleep(2)
+    try:
+        await channel.delete(reason=f"Ticket closed by {closer}")
+    except Exception as e:
+        print(f"[Ticket] delete failed: {e}")
+
+
 async def close_ticket(interaction):
     channel = interaction.channel
     topic = getattr(channel, "topic", "") or ""
     if not topic.startswith("ticket|"):
         await interaction.response.send_message(embed=error_embed("Not a ticket", "This channel isn't a ticket."), ephemeral=True)
         return
-    parts = topic.split("|")
-    opener_id = parts[1] if len(parts) > 1 else ""
-    category = parts[2] if len(parts) > 2 else "support"
-
+    opener_id = topic.split("|")[1] if len(topic.split("|")) > 1 else ""
     is_support = has_any_role(interaction.user, ticket_config.get("support_role_ids", []))
     is_opener = str(interaction.user.id) == opener_id
     if not (is_support or is_opener or interaction.user.guild_permissions.manage_channels):
         await interaction.response.send_message(embed=error_embed("No permission", "Only staff or the opener can close this."), ephemeral=True)
         return
-
-    await interaction.response.send_message(embed=info_embed("Closing ticket", "Saving transcript and closing in a moment."))
-    transcript = await build_transcript(channel)
-    log_id = ticket_config.get("log_channel_id") or ""
-    opener = interaction.guild.get_member(int(opener_id)) if opener_id.isdigit() else None
-    if log_id:
-        log_channel = interaction.guild.get_channel(int(log_id))
-        if log_channel:
-            embed = info_embed("Ticket closed", f"**Category:** {category}\n**Opened by:** {opener.mention if opener else opener_id}\n**Closed by:** {interaction.user.mention}")
-            try:
-                await log_channel.send(embed=embed, file=discord.File(io.BytesIO(transcript.encode("utf-8")), filename=f"{channel.name}.txt"))
-            except Exception as e:
-                print(f"[Ticket] log failed: {e}")
-    await record_ticket(interaction.guild.id, channel.id, opener_id, category, "closed")
-    await asyncio.sleep(3)
-    try:
-        await channel.delete(reason=f"Ticket closed by {interaction.user}")
-    except Exception as e:
-        print(f"[Ticket] delete failed: {e}")
+    await interaction.response.send_message(embed=info_embed("Closing order", "Saving transcript and closing\u2026"))
+    await _do_close(channel, interaction.guild, interaction.user)
 
 
 def _is_ticket_staff(member):
@@ -924,19 +930,20 @@ async def ticket_claim_toggle(interaction, claimed):
 class CloseOrderModal(discord.ui.Modal):
     def __init__(self):
         super().__init__(title="Close Order", timeout=600)
-        self.close_type = discord.ui.Select(min_values=1, max_values=1, options=[
-            discord.SelectOption(label="Instant Close", value="instant", description="End the order now"),
-            discord.SelectOption(label="Request Close", value="request", description="Ask the opener to confirm first"),
-        ])
+        self.close_type = discord.ui.TextInput(
+            label="Close type", style=discord.TextStyle.short, required=False,
+            default="Instant", placeholder="Instant  or  Request", max_length=20,
+        )
         self.reason = discord.ui.TextInput(
             label="Reason", style=discord.TextStyle.paragraph, required=False,
             max_length=500, placeholder="Reason for closing (optional)",
         )
-        self.add_item(discord.ui.Label(text="Close type", component=self.close_type))
-        self.add_item(discord.ui.Label(text="Reason", component=self.reason))
+        self.add_item(self.close_type)
+        self.add_item(self.reason)
 
     async def on_submit(self, interaction):
-        mode = self.close_type.values[0] if self.close_type.values else "instant"
+        v = (self.close_type.value or "instant").strip().lower()
+        mode = "request" if v.startswith("r") else "instant"
         reason = (self.reason.value or "").strip() or "No reason provided."
         if mode == "instant":
             await do_instant_close(interaction, reason)
@@ -953,11 +960,9 @@ async def ticket_close_prompt(interaction):
 
 
 async def do_instant_close(interaction, reason):
-    try:
-        await interaction.channel.send(embed=info_embed("Order closed", f"Closed by {interaction.user.mention}\n**Reason:** {reason}"))
-    except Exception:
-        pass
-    await close_ticket(interaction)
+    channel = interaction.channel
+    await interaction.response.send_message(embed=info_embed("Closing order", f"Closed by {interaction.user.mention}\n**Reason:** {reason}\nSaving transcript\u2026"))
+    await _do_close(channel, interaction.guild, interaction.user, reason)
 
 
 async def do_request_close(interaction, reason):
