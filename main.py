@@ -944,8 +944,11 @@ class CloseOrderModal(discord.ui.Modal):
             discord.SelectOption(label="Instant Close", value="instant", default=True, description="Close this order right now"),
             discord.SelectOption(label="Manual Close", value="request", description="Ask the opener to confirm first"),
         ])
+        # A TextInput wrapped in a Label must NOT carry its own label — the
+        # Label provides it. Setting both makes Discord reject the modal
+        # (error 50035: "Cannot set label on a TextInput in a Label component").
         self.reason = discord.ui.TextInput(
-            label="Reason", style=discord.TextStyle.paragraph, required=False,
+            style=discord.TextStyle.paragraph, required=False,
             max_length=500, placeholder="Reason for closing (optional)",
         )
         self.add_item(discord.ui.Label(text="Close Type", component=self.close_type))
