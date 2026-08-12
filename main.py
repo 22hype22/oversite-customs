@@ -653,7 +653,13 @@ async def on_interaction(interaction: discord.Interaction):
         await open_ticket(interaction, cid.split(":", 1)[1])
     elif cid == "ticket_open":
         await open_ticket(interaction, "support")
-    elif cid.startswith("ticket_close"):
+    elif cid == "ticket_claim":
+        await ticket_claim_toggle(interaction, True)
+    elif cid == "ticket_unclaim":
+        await ticket_claim_toggle(interaction, False)
+    elif cid == "ticket_close":
+        await ticket_close_prompt(interaction)
+    elif cid == "ticket_close_confirm":
         await close_ticket(interaction)
     elif cid == "roblox_verify":
         await start_roblox_verify(interaction)
@@ -731,7 +737,7 @@ async def open_ticket(interaction, category, open_comps_override=None):
             raw = json.dumps(open_comps)
             raw = raw.replace("{user}", _js(interaction.user.mention)).replace("{username}", _js(interaction.user.display_name))
             comps = json.loads(raw)
-            close_row = {"type": "buttonRow", "buttons": [{"label": "Close ticket", "style": "danger", "__ticket_close": True}]}
+            close_row = {"type": "buttonRow", "buttons": [{"label": "Claim", "style": "success", "__ticket_claim": True}, {"label": "Close Order", "style": "danger", "__ticket_close": True}]}
             panel = [dict(c) for c in comps]
             container_idxs = [i for i, c in enumerate(panel) if c.get("type") == "container"]
             if container_idxs:
@@ -759,7 +765,8 @@ async def open_ticket(interaction, category, open_comps_override=None):
         embed.set_footer(text=f"Opened by {interaction.user}")
 
         close_view = discord.ui.View(timeout=None)
-        close_view.add_item(discord.ui.Button(label="Close ticket", style=discord.ButtonStyle.danger, custom_id="ticket_close", emoji="🔒"))
+        close_view.add_item(discord.ui.Button(label="Claim", style=discord.ButtonStyle.success, custom_id="ticket_claim"))
+        close_view.add_item(discord.ui.Button(label="Close Order", style=discord.ButtonStyle.danger, custom_id="ticket_close", emoji="🔒"))
 
         await channel.send(content=content, embed=embed, view=close_view)
     await record_ticket(guild.id, channel.id, interaction.user.id, category, "open")
@@ -829,6 +836,109 @@ async def close_ticket(interaction):
         await channel.delete(reason=f"Ticket closed by {interaction.user}")
     except Exception as e:
         print(f"[Ticket] delete failed: {e}")
+
+
+def _is_ticket_staff(member):
+    try:
+        if member.guild_permissions.manage_channels:
+            return True
+    except Exception:
+        pass
+    return has_any_role(member, ticket_config.get("support_role_ids", []))
+
+
+def _toggle_claim_in_components(comps, claimed):
+    for c in (comps or []):
+        if not isinstance(c, dict):
+            continue
+        if isinstance(c.get("components"), list):
+            _toggle_claim_in_components(c["components"], claimed)
+        if c.get("type") == 2 and c.get("custom_id") in ("ticket_claim", "ticket_unclaim"):
+            c.pop("emoji", None)
+            if claimed:
+                c["custom_id"], c["label"], c["style"] = "ticket_unclaim", "Unclaim", 2
+            else:
+                c["custom_id"], c["label"], c["style"] = "ticket_claim", "Claim", 3
+
+
+async def ticket_claim_toggle(interaction, claimed):
+    member = interaction.user
+    if not _is_ticket_staff(member):
+        await interaction.response.send_message(embed=error_embed("No permission", "Only staff can claim orders."), ephemeral=True)
+        return
+    channel, msg = interaction.channel, interaction.message
+    if claimed:
+        await interaction.response.send_message(embed=info_embed("Order claimed", f"\U0001F64B {member.mention} claimed this order."))
+    else:
+        await interaction.response.send_message(embed=info_embed("Order unclaimed", f"{member.mention} unclaimed this order."))
+    try:
+        raw = await bot.http.get_message(channel.id, msg.id)
+        comps = raw.get("components", []) or []
+        _toggle_claim_in_components(comps, claimed)
+        route = discord.http.Route("PATCH", "/channels/{channel_id}/messages/{message_id}", channel_id=channel.id, message_id=msg.id)
+        await bot.http.request(route, json={"components": comps, "flags": raw.get("flags", 0)})
+    except Exception as e:
+        print(f"[Tickets] claim toggle failed: {e}")
+
+
+class CloseReasonModal(discord.ui.Modal):
+    def __init__(self, mode):
+        super().__init__(title="Close Order", timeout=600)
+        self._mode = mode
+        self.reason_input = discord.ui.TextInput(
+            label="Reason", style=discord.TextStyle.paragraph, required=False,
+            max_length=500, placeholder="Reason for closing (optional)",
+        )
+        self.add_item(self.reason_input)
+
+    async def on_submit(self, interaction):
+        reason = (self.reason_input.value or "").strip() or "No reason provided."
+        if self._mode == "instant":
+            await do_instant_close(interaction, reason)
+        else:
+            await do_request_close(interaction, reason)
+
+
+class CloseChoiceView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="Instant Close", style=discord.ButtonStyle.danger)
+    async def instant(self, interaction, button):
+        await interaction.response.send_modal(CloseReasonModal("instant"))
+
+    @discord.ui.button(label="Request Close", style=discord.ButtonStyle.secondary)
+    async def request(self, interaction, button):
+        await interaction.response.send_modal(CloseReasonModal("request"))
+
+
+async def ticket_close_prompt(interaction):
+    topic = getattr(interaction.channel, "topic", "") or ""
+    if not topic.startswith("ticket|"):
+        await interaction.response.send_message(embed=error_embed("Not a ticket", "This isn't a ticket channel."), ephemeral=True)
+        return
+    await interaction.response.send_message(
+        embed=info_embed("Close Order", "**Instant Close** ends the order now.\n**Request Close** asks the opener to confirm first."),
+        view=CloseChoiceView(), ephemeral=True,
+    )
+
+
+async def do_instant_close(interaction, reason):
+    try:
+        await interaction.channel.send(embed=info_embed("Order closed", f"Closed by {interaction.user.mention}\n**Reason:** {reason}"))
+    except Exception:
+        pass
+    await close_ticket(interaction)
+
+
+async def do_request_close(interaction, reason):
+    topic = getattr(interaction.channel, "topic", "") or ""
+    opener_id = topic.split("|")[1] if topic.startswith("ticket|") and len(topic.split("|")) > 1 else ""
+    mention = f"<@{opener_id}>" if opener_id.isdigit() else ""
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="Confirm Close", style=discord.ButtonStyle.danger, custom_id="ticket_close_confirm"))
+    embed = info_embed("Close requested", f"{interaction.user.mention} requested to close this order.\n**Reason:** {reason}\n\nThe opener or staff can confirm below.")
+    await interaction.response.send_message(content=mention or None, embed=embed, view=view)
 
 
 async def build_transcript(channel):
@@ -1043,8 +1153,12 @@ def build_button(btn, guild):
     if btn.get("__ticket_open"):
         cat = str(btn.get("category") or "support")[:80]
         return _btn({"type": 2, "label": (label[:80] or "Open Ticket"), "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_cat:{cat}"})
+    if btn.get("__ticket_claim"):
+        return _btn({"type": 2, "label": (label[:80] or "Claim"), "style": 3, "custom_id": "ticket_claim"})
+    if btn.get("__ticket_unclaim"):
+        return _btn({"type": 2, "label": (label[:80] or "Unclaim"), "style": 2, "custom_id": "ticket_unclaim"})
     if btn.get("__ticket_close"):
-        return _btn({"type": 2, "label": (label[:80] or "Close ticket"), "style": BUTTON_STYLE_MAP.get(style_name, 4), "custom_id": "ticket_close"})
+        return _btn({"type": 2, "label": (label[:80] or "Close Order"), "style": BUTTON_STYLE_MAP.get(style_name, 4), "custom_id": "ticket_close"})
     if btn.get("disabled"):
         cid = f"display_{btn.get('id') or label[:20] or 'x'}"
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": cid[:100], "disabled": True})
