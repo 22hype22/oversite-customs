@@ -954,7 +954,9 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
     if ticket_config.get("ping_support", True) and support_roles:
         ping = " ".join(r.mention for r in support_roles)
 
-    content = " ".join(filter(None, [interaction.user.mention, ping])) or None
+    # Only ping support roles (when enabled). The opener isn't pinged — they
+    # already have access and get an ephemeral link to the channel.
+    content = ping or None
 
     # (ticket type + opening components resolved above for the channel name)
     sent_rich = False
@@ -1113,17 +1115,37 @@ async def ticket_claim_toggle(interaction, claimed):
         await bot.http.request(route, json={"components": comps, "flags": raw.get("flags", 0)})
     except Exception as e:
         print(f"[Tickets] claim toggle failed: {e}")
-    # Rename: green + claimer when claimed, back to red + opener-firstword when not.
+    # Rename + reorder: on claim, go green + claimer and jump to the TOP of the
+    # category (saving the old slot in the topic). On unclaim, go back to red +
+    # opener-firstword and drop back to where it was.
     try:
         parts = (getattr(channel, "topic", "") or "").split("|")
+        opener_id = parts[1] if len(parts) > 1 else ""
+        cat = parts[2] if len(parts) > 2 else "support"
         base = parts[3] if len(parts) > 3 and parts[3] else _san_name(getattr(channel, "name", "ticket"))
         if claimed:
+            saved_pos = getattr(channel, "position", 0)
             new_name = f"\U0001F7E2\u30FB{_san_name(member.name)}"[:90]
+            new_topic = f"ticket|{opener_id}|{cat}|{base}|{saved_pos}"
+            await channel.edit(name=new_name, topic=new_topic, reason=f"Ticket claimed by {member}")
+            try:
+                await channel.move(beginning=True, category=channel.category, sync_permissions=False, reason="Claimed ticket to top")
+            except Exception as e:
+                print(f"[Tickets] move-to-top failed: {e}")
         else:
+            saved_pos = None
+            if len(parts) > 4 and parts[4].strip().lstrip("-").isdigit():
+                saved_pos = int(parts[4])
             new_name = f"\U0001F534\u30FB{base}"[:90]
-        await channel.edit(name=new_name, reason=f"Ticket {'claimed' if claimed else 'unclaimed'} by {member}")
+            new_topic = f"ticket|{opener_id}|{cat}|{base}"
+            await channel.edit(name=new_name, topic=new_topic, reason=f"Ticket unclaimed by {member}")
+            if saved_pos is not None:
+                try:
+                    await channel.edit(position=saved_pos)
+                except Exception as e:
+                    print(f"[Tickets] restore-position failed: {e}")
     except Exception as e:
-        print(f"[Tickets] rename failed: {e}")
+        print(f"[Tickets] rename/reorder failed: {e}")
 
 
 # Preferred: a single form (modal) with the Instant/Manual dropdown inside it.
