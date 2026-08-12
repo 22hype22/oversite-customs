@@ -383,6 +383,8 @@ async def on_member_remove(member):
 
 
 _EMOJI_SHORTCODE_RE = re.compile(r":([a-zA-Z][a-zA-Z0-9_]*)(?:~\d+)?:")
+# A complete custom emoji already written out: <:name:id> or <a:name:id>.
+_FULL_EMOJI_RE = re.compile(r"<a?:[a-zA-Z0-9_]+:\d+>")
 
 
 def _resolve_emoji_shortcodes(text, guild):
@@ -392,13 +394,25 @@ def _resolve_emoji_shortcodes(text, guild):
     if not lookup:
         return text
 
+    # Stash any already-complete custom emojis so we don't rewrite the `:name:`
+    # inside <:name:id> — doing so leaves the raw emoji id dangling next to the
+    # rendered emoji (e.g. "🔥 1527943242115579905>").
+    saved = []
+
+    def _stash(m):
+        saved.append(m.group(0))
+        return f"\x00{len(saved) - 1}\x00"
+
+    protected = _FULL_EMOJI_RE.sub(_stash, text)
+
     def repl(match):
         emoji = lookup.get(match.group(1).lower())
         if emoji is None:
             return match.group(0)
         return f"<{'a' if emoji.animated else ''}:{emoji.name}:{emoji.id}>"
 
-    return _EMOJI_SHORTCODE_RE.sub(repl, text)
+    resolved = _EMOJI_SHORTCODE_RE.sub(repl, protected)
+    return re.sub(r"\x00(\d+)\x00", lambda m: saved[int(m.group(1))], resolved)
 
 
 def _sub_placeholders(text, member):
