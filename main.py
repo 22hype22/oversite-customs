@@ -873,10 +873,16 @@ def _giveaway_tokens(g, ended, winner_ids):
         wl = "No winners"
     else:
         wl = "TBD"
+    entrants = list(g.get("entrants") or [])
+    if entrants:
+        participants = ", ".join(f"<@{u}>" for u in entrants)
+    else:
+        participants = "No one yet"
     return {
         "{prize}": g["prize"],
         "{winners}": str(int(g["winners"])),
         "{entries}": str(len(g["entrants"])),
+        "{participants}": participants,
         "{end}": f"<t:{end_ts}:R>",
         "{end_full}": f"<t:{end_ts}:F>",
         "{host}": f"<@{g['host_id']}>" if g.get("host_id") else "",
@@ -904,10 +910,34 @@ def _giveaway_render_design(g, gid, guild, ended=False, winner_ids=None):
         comps = design
 
     built = [b for b in (_build_v2(c, guild) for c in comps) if b]
+
+    # Bind any user-placed Counter buttons to THIS giveaway and disable them once
+    # it's ended. If the design has none, append the default Enter/Reroll row.
+    def _bind_counter(node):
+        found = False
+        if isinstance(node, dict):
+            if node.get("type") == 2 and str(node.get("custom_id", "")).startswith("gw:__COUNTER__"):
+                node["custom_id"] = f"gw:{gid}"
+                if ended:
+                    node["disabled"] = True
+                found = True
+            for v in node.get("components", []) or []:
+                found = _bind_counter(v) or found
+        return found
+
+    has_counter = False
+    for c in built:
+        has_counter = _bind_counter(c) or has_counter
+
     ping = str(giveaway_config.get("ping") or "").strip()
     if ping:
         built.insert(0, {"type": 10, "content": _render_guild_text(ping, guild)})
-    built.append(_giveaway_action_row(gid, ended))
+    if has_counter:
+        # User designed their own entry button; only add a Reroll control on end.
+        if ended:
+            built.append({"type": 1, "components": [{"type": 2, "style": 2, "custom_id": f"gwreroll:{gid}", "label": "Reroll"}]})
+    else:
+        built.append(_giveaway_action_row(gid, ended))
     return built
 
 
@@ -2129,6 +2159,10 @@ def build_button(btn, guild):
             del data["label"]
         return data
 
+    if btn.get("counter"):
+        # Giveaway "Counter" (enter) button. The real custom_id (gw:<gid>) is
+        # patched in per-giveaway by _giveaway_render_design.
+        return _btn({"type": 2, "label": (label[:80] or "Enter"), "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": "gw:__COUNTER__"})
     if btn.get("__verify"):
         return _btn({"type": 2, "label": (label[:80] or "Verify"), "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": "roblox_verify"})
     if btn.get("__ticket_open"):
