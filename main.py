@@ -754,6 +754,35 @@ def _existing_ticket_for(guild, user_id):
     return None
 
 
+# How many open tickets a member may have per section (category) at once.
+MAX_TICKETS_PER_SECTION = 2
+
+
+def _user_ticket_count_for(guild, user_id, cat_name, fallback_cat_channel):
+    """Count a member's open tickets in one section.
+    - cat_name given → match channels whose Discord category name == cat_name
+      (so all Ticket/Form types that share a category name count together).
+    - no cat_name → match channels in the fallback (global) category / uncategorized.
+    """
+    uid = str(user_id)
+    target_name = (cat_name or "").strip().lower()
+    fb_id = fallback_cat_channel.id if fallback_cat_channel else None
+    count = 0
+    for ch in guild.text_channels:
+        topic = ch.topic or ""
+        if not (topic.startswith("ticket|") and topic.split("|")[1] == uid):
+            continue
+        if target_name:
+            ch_name = ch.category.name.strip().lower() if ch.category else ""
+            if ch_name == target_name:
+                count += 1
+        else:
+            ch_id = ch.category.id if ch.category else None
+            if ch_id == fb_id:
+                count += 1
+    return count
+
+
 def _clean_label(s):
     """Strip markdown emphasis so a {Question: **Server Name:**} token shows a
     clean 'Server Name:' label in the modal instead of literal asterisks."""
@@ -823,11 +852,16 @@ async def open_ticket_form(interaction, key):
 
     guild = interaction.guild
     if guild and ticket_config.get("one_per_user", True):
-        existing = _existing_ticket_for(guild, interaction.user.id)
-        if existing:
+        cat_name = ticket_categories.get(key)
+        fb = None
+        if not cat_name:
+            cid = ticket_config.get("category_id") or ""
+            if cid:
+                fb = guild.get_channel(int(cid))
+        if _user_ticket_count_for(guild, interaction.user.id, cat_name, fb) >= MAX_TICKETS_PER_SECTION:
             try:
                 await interaction.response.send_message(
-                    embed=error_embed("Ticket already open", f"You already have an open ticket: {existing.mention}"),
+                    embed=error_embed("Limit reached", f"You already have {MAX_TICKETS_PER_SECTION} open tickets in this section. Please close one before opening another."),
                     ephemeral=True,
                 )
             except Exception:
@@ -935,13 +969,6 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
     if not already_responded:
         await interaction.response.defer(ephemeral=True)
 
-    if ticket_config.get("one_per_user", True):
-        for ch in guild.text_channels:
-            topic = ch.topic or ""
-            if topic.startswith("ticket|") and topic.split("|")[1] == str(interaction.user.id):
-                await interaction.followup.send(embed=error_embed("Ticket already open", f"You already have an open ticket: {ch.mention}"), ephemeral=True)
-                return
-
     # Per-Ticket/Form category (by name, created on demand) wins; otherwise fall
     # back to the globally configured category id.
     category_channel = None
@@ -951,6 +978,13 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
         cat_id = ticket_config.get("category_id") or ""
         if cat_id:
             category_channel = guild.get_channel(int(cat_id))
+
+    # Limit: up to MAX_TICKETS_PER_SECTION open tickets per section (category).
+    if ticket_config.get("one_per_user", True):
+        open_count = _user_ticket_count_for(guild, interaction.user.id, category_name_override, category_channel)
+        if open_count >= MAX_TICKETS_PER_SECTION:
+            await interaction.followup.send(embed=error_embed("Limit reached", f"You already have {MAX_TICKETS_PER_SECTION} open tickets in this section. Please close one before opening another."), ephemeral=True)
+            return
 
     support_roles = []
     for rid in ticket_config.get("support_role_ids", []):
