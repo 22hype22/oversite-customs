@@ -682,7 +682,7 @@ async def create_payment(method, item, price):
     try:
         async with httpx.AsyncClient() as client:
             r = await client.post(
-                f"{SUPABASE_FN_URL}/payment-create",
+                f"{SUPABASE_FN_URL}/payments-create",
                 headers=_fn_headers(),
                 json={"method": method, "item": item, "price": price},
                 timeout=30,
