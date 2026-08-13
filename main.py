@@ -144,7 +144,8 @@ _credits_memory = {}
 # Roblox OAuth verification config (from the dashboard "Verification" block).
 roblox_config = {
     "channel_id": "",
-    "verified_role_id": "",
+    "verified_role_ids": [],
+    "remove_role_ids": [],
     "set_nickname": True,
     "log_channel_id": "",
     "client_id": "",
@@ -1713,7 +1714,13 @@ async def apply_config(feature, cfg, post_panel=False):
         print(f"[Config] invite — channel {invite_config['channel_id']} components {len(invite_config['components'])} embeds {len(invite_config['embeds'])}")
     elif feature in ("roblox-verify", "verification"):
         roblox_config["channel_id"] = str(cfg.get("channel_id") or "")
-        roblox_config["verified_role_id"] = str(cfg.get("verified_role_id") or "")
+        # Roles to add — new multi shape, with legacy single verified_role_id fallback.
+        add_ids = cfg.get("verified_role_ids")
+        if not isinstance(add_ids, list):
+            add_ids = [cfg.get("verified_role_id")] if cfg.get("verified_role_id") else []
+        roblox_config["verified_role_ids"] = [str(r) for r in add_ids if r]
+        rem_ids = cfg.get("remove_role_ids")
+        roblox_config["remove_role_ids"] = [str(r) for r in rem_ids if r] if isinstance(rem_ids, list) else []
         roblox_config["set_nickname"] = bool(cfg.get("set_nickname", True))
         roblox_config["log_channel_id"] = str(cfg.get("log_channel_id") or "")
         roblox_config["client_id"] = str(cfg.get("roblox_client_id") or "")
@@ -1722,7 +1729,7 @@ async def apply_config(feature, cfg, post_panel=False):
         roblox_config["components"] = comps if isinstance(comps, list) else []
         roblox_config["button_label"] = str(cfg.get("verify_button_label") or "Verify")
         roblox_config["button_style"] = str(cfg.get("verify_button_style") or "primary")
-        print(f"[Config] roblox-verify — channel {roblox_config['channel_id']} role {roblox_config['verified_role_id']} nick {roblox_config['set_nickname']} components {len(roblox_config['components'])}")
+        print(f"[Config] roblox-verify — channel {roblox_config['channel_id']} add_roles {roblox_config['verified_role_ids']} remove_roles {roblox_config['remove_role_ids']} nick {roblox_config['set_nickname']} components {len(roblox_config['components'])}")
         # Post the panel when this came from a save/apply (deliberate action),
         # but NOT on boot — that avoids the surprise repost on every restart.
         # _replace_panel dedupes so a re-post replaces the old panel.
@@ -1978,29 +1985,36 @@ async def apply_roblox_verification(payload):
             notes.append(f"• Couldn't set nickname — {e}")
             print(f"[Verify] nickname change failed: {e}")
 
-    # Verified role
-    role_id = str(roblox_config.get("verified_role_id") or "").strip()
-    if not role_id:
-        notes.append("• No Verified role is set in the dashboard — open the Verification block, pick a role, and Save.")
-        print("[Verify] no verified_role_id configured")
-    else:
-        role = guild.get_role(int(role_id))
-        if not role:
-            notes.append("• The Verified role no longer exists in this server — pick a new one in the dashboard.")
-            print(f"[Verify] role {role_id} not found in guild")
-        else:
-            try:
-                await member.add_roles(role, reason="Roblox verified")
-                print(f"[Verify] gave {member} the {role.name} role")
-            except discord.Forbidden:
-                notes.append(
-                    f"• Couldn't give the **{role.name}** role — my role must sit **above** it in Server Settings → Roles, "
-                    "and I need the **Manage Roles** permission."
-                )
-                print(f"[Verify] role assign forbidden (hierarchy/perms) for {role.name}")
-            except Exception as e:
-                notes.append(f"• Couldn't give the **{role.name}** role — {e}")
-                print(f"[Verify] role assign failed: {e}")
+    # Roles: add the configured verify roles, remove the configured ones.
+    add_ids = roblox_config.get("verified_role_ids") or []
+    remove_ids = roblox_config.get("remove_role_ids") or []
+    if not add_ids:
+        notes.append("• No 'Roles to add on verify' is set in the dashboard — open the Verification block, pick one or more roles, and Save.")
+        print("[Verify] no verified_role_ids configured")
+
+    add_roles = [r for r in (guild.get_role(int(x)) for x in add_ids if str(x).isdigit()) if r]
+    if add_roles:
+        try:
+            await member.add_roles(*add_roles, reason="Roblox verified")
+            print(f"[Verify] added {[r.name for r in add_roles]} to {member}")
+        except discord.Forbidden:
+            notes.append("• Couldn't add one or more verify roles — my role must sit **above** them in Server Settings → Roles, and I need **Manage Roles**.")
+            print("[Verify] add roles forbidden (hierarchy/perms)")
+        except Exception as e:
+            notes.append(f"• Couldn't add verify roles — {e}")
+            print(f"[Verify] add roles failed: {e}")
+
+    remove_roles = [r for r in (guild.get_role(int(x)) for x in remove_ids if str(x).isdigit()) if r and r in member.roles]
+    if remove_roles:
+        try:
+            await member.remove_roles(*remove_roles, reason="Roblox verified")
+            print(f"[Verify] removed {[r.name for r in remove_roles]} from {member}")
+        except discord.Forbidden:
+            notes.append("• Couldn't remove one or more roles — my role must sit **above** them in Server Settings → Roles, and I need **Manage Roles**.")
+            print("[Verify] remove roles forbidden (hierarchy/perms)")
+        except Exception as e:
+            notes.append(f"• Couldn't remove roles — {e}")
+            print(f"[Verify] remove roles failed: {e}")
 
     # Report the outcome to the log channel so the owner can see it in Discord.
     log_id = str(roblox_config.get("log_channel_id") or "").strip()
