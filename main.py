@@ -1230,6 +1230,35 @@ def _toggle_claim_in_components(comps, claimed):
                 c["custom_id"], c["label"], c["style"] = "ticket_claim", "Claim", 3
 
 
+def _has_claim_button(components):
+    for c in (components or []):
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") == 2 and c.get("custom_id") in ("ticket_claim", "ticket_unclaim"):
+            return True
+        if isinstance(c.get("components"), list) and _has_claim_button(c["components"]):
+            return True
+    return False
+
+
+async def _find_claim_message(channel):
+    """Find the ticket's opening message (the one carrying the Claim button) so a
+    -claim/-unclaim text command can toggle it just like the button does."""
+    try:
+        async for m in channel.history(limit=15, oldest_first=True):
+            if not (m.author and m.author.id == bot.user.id):
+                continue
+            try:
+                raw = await bot.http.get_message(channel.id, m.id)
+            except Exception:
+                continue
+            if _has_claim_button(raw.get("components", [])):
+                return m
+    except Exception:
+        pass
+    return None
+
+
 async def ticket_claim_toggle(interaction, claimed):
     member = interaction.user
     if not _is_ticket_staff(member, interaction.channel):
@@ -1240,14 +1269,20 @@ async def ticket_claim_toggle(interaction, claimed):
         await interaction.response.send_message(embed=info_embed("Order claimed", f"{member.mention} claimed this order."))
     else:
         await interaction.response.send_message(embed=info_embed("Order unclaimed", f"{member.mention} unclaimed this order."))
-    try:
-        raw = await bot.http.get_message(channel.id, msg.id)
-        comps = raw.get("components", []) or []
-        _toggle_claim_in_components(comps, claimed)
-        route = discord.http.Route("PATCH", "/channels/{channel_id}/messages/{message_id}", channel_id=channel.id, message_id=msg.id)
-        await bot.http.request(route, json={"components": comps, "flags": raw.get("flags", 0)})
-    except Exception as e:
-        print(f"[Tickets] claim toggle failed: {e}")
+    await _do_claim_toggle(channel, member, claimed, msg)
+
+
+async def _do_claim_toggle(channel, member, claimed, msg):
+    # Toggle the Claim/Unclaim button on the ticket message (if we have it).
+    if msg is not None:
+        try:
+            raw = await bot.http.get_message(channel.id, msg.id)
+            comps = raw.get("components", []) or []
+            _toggle_claim_in_components(comps, claimed)
+            route = discord.http.Route("PATCH", "/channels/{channel_id}/messages/{message_id}", channel_id=channel.id, message_id=msg.id)
+            await bot.http.request(route, json={"components": comps, "flags": raw.get("flags", 0)})
+        except Exception as e:
+            print(f"[Tickets] claim toggle failed: {e}")
     # Rename + reorder: on claim, go green + claimer and jump to the TOP of the
     # category (saving the old slot in the topic). On unclaim, go back to red +
     # opener-firstword and drop back to where it was.
@@ -1279,6 +1314,56 @@ async def ticket_claim_toggle(interaction, claimed):
                     print(f"[Tickets] restore-position failed: {e}")
     except Exception as e:
         print(f"[Tickets] rename/reorder failed: {e}")
+
+
+# ---- Text commands: -claim / -unclaim / -close (mirror the buttons) ----
+async def _cmd_claim(message, claimed):
+    channel = message.channel
+    member = message.author
+    if not _is_ticket_staff(member, channel):
+        await channel.send(embed=error_embed("No permission", "Only staff can claim orders."), delete_after=10)
+        return
+    msg = await _find_claim_message(channel)
+    verb = "claimed" if claimed else "unclaimed"
+    await channel.send(embed=info_embed(f"Order {verb}", f"{member.mention} {verb} this order."))
+    await _do_claim_toggle(channel, member, claimed, msg)
+
+
+async def _cmd_close(message, reason=""):
+    channel = message.channel
+    topic = getattr(channel, "topic", "") or ""
+    opener_id = topic.split("|")[1] if len(topic.split("|")) > 1 else ""
+    member = message.author
+    if not (_is_ticket_staff(member, channel) or str(member.id) == opener_id):
+        await channel.send(embed=error_embed("No permission", "Only staff or the opener can close this."), delete_after=10)
+        return
+    await channel.send(embed=info_embed("Closing order", "Saving transcript and closing…"))
+    await _do_close(channel, message.guild, member, (reason or "").strip())
+
+
+@bot.event
+async def on_message(message):
+    # Ticket text commands work only inside a ticket channel; everything else
+    # falls through to the normal command processor.
+    if not message.author.bot and message.guild:
+        parts = (message.content or "").strip().split(maxsplit=1)
+        cmd = parts[0].lower() if parts else ""
+        if cmd in ("-claim", "-unclaim", "-close"):
+            topic = getattr(message.channel, "topic", "") or ""
+            if topic.startswith("ticket|"):
+                if cmd == "-close":
+                    await _cmd_close(message, parts[1] if len(parts) > 1 else "")
+                else:
+                    try:
+                        await message.delete()
+                    except Exception:
+                        pass
+                    await _cmd_claim(message, cmd == "-claim")
+                return
+            else:
+                await message.channel.send(embed=error_embed("Not a ticket", "This command only works inside a ticket channel."), delete_after=10)
+                return
+    await bot.process_commands(message)
 
 
 # Preferred: a single form (modal) with the Instant/Manual dropdown inside it.
