@@ -69,7 +69,7 @@ ticket_config = {
     "panel_channel_id": "",
     "panel_components": [],
     "types": [],
-    "panel_ref": None,
+    "panel_refs": {},  # channel_id -> last panel message id (one panel kept per channel)
 }
 
 # Registry mapping a clicked Ticket/Ephemeral component back to the message the
@@ -1178,22 +1178,34 @@ async def close_ticket(interaction):
         await interaction.response.send_message(embed=error_embed("Not a ticket", "This channel isn't a ticket."), ephemeral=True)
         return
     opener_id = topic.split("|")[1] if len(topic.split("|")) > 1 else ""
-    is_support = has_any_role(interaction.user, ticket_config.get("support_role_ids", []))
     is_opener = str(interaction.user.id) == opener_id
-    if not (is_support or is_opener or interaction.user.guild_permissions.manage_channels):
+    if not (_is_ticket_staff(interaction.user, channel) or is_opener):
         await interaction.response.send_message(embed=error_embed("No permission", "Only staff or the opener can close this."), ephemeral=True)
         return
     await interaction.response.send_message(embed=info_embed("Closing order", "Saving transcript and closing\u2026"))
     await _do_close(channel, interaction.guild, interaction.user)
 
 
-def _is_ticket_staff(member):
+def _is_ticket_staff(member, channel=None):
     try:
         if member.guild_permissions.manage_channels:
             return True
     except Exception:
         pass
-    return has_any_role(member, ticket_config.get("support_role_ids", []))
+    # Global support roles (see & manage ALL tickets), if any are configured.
+    if has_any_role(member, ticket_config.get("support_role_ids", [])):
+        return True
+    # Per-ticket: any role granted view access to THIS channel is staff for it,
+    # so a section's Access roles can claim/close their own tickets.
+    if channel is not None:
+        member_role_ids = {r.id for r in getattr(member, "roles", [])}
+        try:
+            for target, ow in channel.overwrites.items():
+                if isinstance(target, discord.Role) and not target.is_default() and ow.view_channel and target.id in member_role_ids:
+                    return True
+        except Exception:
+            pass
+    return False
 
 
 def _toggle_claim_in_components(comps, claimed):
@@ -1212,7 +1224,7 @@ def _toggle_claim_in_components(comps, claimed):
 
 async def ticket_claim_toggle(interaction, claimed):
     member = interaction.user
-    if not _is_ticket_staff(member):
+    if not _is_ticket_staff(member, interaction.channel):
         await interaction.response.send_message(embed=error_embed("No permission", "Only staff can claim orders."), ephemeral=True)
         return
     channel, msg = interaction.channel, interaction.message
@@ -1895,18 +1907,24 @@ async def post_verify_panel():
 
 
 async def _replace_ticket_panel(new_channel_id, new_message_id):
-    """Record the freshly-posted ticket panel and delete the previous one, so a
-    re-post replaces it instead of stacking duplicates."""
-    old = ticket_config.get("panel_ref")
-    ticket_config["panel_ref"] = (
-        {"channel_id": str(new_channel_id), "message_id": str(new_message_id)}
-        if new_message_id and new_message_id is not True else None
-    )
-    if old and old.get("message_id"):
+    """Record the freshly-posted ticket panel per channel. Re-posting to the SAME
+    channel replaces that channel's previous panel (so re-saving doesn't stack
+    duplicates), but panels in other channels are left alone — post as many as
+    you like, one per channel."""
+    refs = ticket_config.get("panel_refs")
+    if not isinstance(refs, dict):
+        refs = {}
+        ticket_config["panel_refs"] = refs
+    ch_key = str(new_channel_id)
+    old_mid = refs.get(ch_key)
+    if new_message_id and new_message_id is not True:
+        refs[ch_key] = str(new_message_id)
+    # Only delete the previous panel in THIS channel.
+    if old_mid:
         try:
-            ch = await resolve_channel(old.get("channel_id"))
+            ch = await resolve_channel(ch_key)
             if ch:
-                msg = await ch.fetch_message(int(old["message_id"]))
+                msg = await ch.fetch_message(int(old_mid))
                 await msg.delete()
         except Exception:
             pass
