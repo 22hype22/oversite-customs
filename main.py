@@ -677,6 +677,73 @@ async def log_credit_action(guild, text):
 bot.tree.add_command(credits_group)
 
 
+async def create_payment(method, item, price):
+    """Call the payment-create edge function (holds the Roblox cookie + Stripe key)."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{SUPABASE_FN_URL}/payment-create",
+                headers=_fn_headers(),
+                json={"method": method, "item": item, "price": price},
+                timeout=30,
+            )
+            try:
+                return r.json()
+            except Exception:
+                return {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+class PaymentModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="Create Payment", timeout=300)
+        self.method = discord.ui.Select(min_values=1, max_values=1, options=[
+            discord.SelectOption(label="Stripe (USD)", value="stripe", default=True),
+            discord.SelectOption(label="Gamepass (Robux)", value="gamepass"),
+            discord.SelectOption(label="Shirt (Robux)", value="shirt"),
+        ])
+        self.item = discord.ui.Select(min_values=1, max_values=1, options=[
+            discord.SelectOption(label=str(i), value=str(i), default=(i == 1)) for i in range(1, 7)
+        ])
+        self.price = discord.ui.TextInput(
+            style=discord.TextStyle.short, required=True, max_length=12,
+            placeholder="e.g. 500 (Robux) or 25 (USD)",
+        )
+        self.add_item(discord.ui.Label(text="Method", component=self.method))
+        self.add_item(discord.ui.Label(text="Item # (gamepass / shirt only)", component=self.item))
+        self.add_item(discord.ui.Label(text="Price — USD for Stripe, Robux for gamepass/shirt", component=self.price))
+
+    async def on_submit(self, interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        method = self.method.values[0] if self.method.values else "stripe"
+        try:
+            item = int(self.item.values[0]) if self.item.values else 1
+        except Exception:
+            item = 1
+        try:
+            price = float(str(self.price.value or "").replace("$", "").replace(",", "").strip())
+        except Exception:
+            price = 0
+        result = await create_payment(method, item, price)
+        if isinstance(result, dict) and result.get("ok") and result.get("url"):
+            await interaction.followup.send(
+                embed=success_embed("Payment ready", f"**{result.get('label', 'Payment')}**\n{result['url']}"),
+                ephemeral=True,
+            )
+        else:
+            err = (result or {}).get("error") if isinstance(result, dict) else str(result)
+            await interaction.followup.send(embed=error_embed("Payment failed", err or "Unknown error"), ephemeral=True)
+
+
+@bot.tree.command(name="payment", description="Create a payment — Stripe, gamepass, or shirt")
+async def payment_cmd(interaction: discord.Interaction):
+    if not (interaction.user.guild_permissions.manage_guild or has_any_role(interaction.user, ticket_config.get("support_role_ids", []))):
+        await interaction.response.send_message(embed=error_embed("No permission", "Only staff can create payments."), ephemeral=True)
+        return
+    await interaction.response.send_modal(PaymentModal())
+
+
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     # Form submits arrive as modal_submit interactions (not component). Handle
