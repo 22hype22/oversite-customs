@@ -416,6 +416,19 @@ def _resolve_emoji_shortcodes(text, guild):
     return re.sub(r"\x00(\d+)\x00", lambda m: saved[int(m.group(1))], resolved)
 
 
+def _resolve_role_mentions(text, guild):
+    """Turn a plain '@Role Name' typed in the dashboard into a real <@&id> role
+    mention so it actually pings. Matches against the guild's real role names,
+    longest first (so 'Livery Designer' wins over 'Livery')."""
+    if not text or "@" not in text or not guild:
+        return text
+    for role in sorted(guild.roles, key=lambda r: len(r.name), reverse=True):
+        if role.is_default() or not role.name:
+            continue
+        text = re.sub(r"@" + re.escape(role.name), f"<@&{role.id}>", text, flags=re.IGNORECASE)
+    return text
+
+
 def _sub_placeholders(text, member):
     if not isinstance(text, str):
         return text
@@ -444,7 +457,7 @@ def _sub_placeholders(text, member):
     }
     for token, value in repl.items():
         text = text.replace(token, value)
-    return _resolve_emoji_shortcodes(text, member.guild)
+    return _resolve_emoji_shortcodes(_resolve_role_mentions(text, member.guild), member.guild)
 
 
 def _render_guild_text(text, guild):
@@ -474,7 +487,7 @@ def _render_guild_text(text, guild):
         }
         for token, value in repl.items():
             text = text.replace(token, value)
-    return _resolve_emoji_shortcodes(text, guild)
+    return _resolve_emoji_shortcodes(_resolve_role_mentions(text, guild), guild)
 
 
 _INVITE_TEXT_KEYS = {"text", "content", "label", "placeholder", "title", "description", "name", "value"}
