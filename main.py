@@ -688,10 +688,17 @@ async def create_payment(method, item, price):
                 timeout=30,
             )
             try:
-                return r.json()
+                data = r.json()
             except Exception:
-                return {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
+                data = None
+            preview = (json.dumps(data) if data is not None else (r.text or ""))[:400]
+            print(f"[Payment] {method} item={item} price={price} -> HTTP {r.status_code}: {preview}")
+            if isinstance(data, dict) and (data.get("ok") or data.get("error")):
+                return data
+            # Unexpected shape (e.g. 404 not deployed, gateway error) — surface it.
+            return {"error": f"HTTP {r.status_code}: {preview or 'empty response'}"}
     except Exception as e:
+        print(f"[Payment] request failed: {e!r}")
         return {"error": str(e)}
 
 
