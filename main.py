@@ -6,6 +6,9 @@ import hashlib
 import signal
 import asyncio
 import datetime
+import time
+import random
+import secrets
 
 import discord
 from discord import app_commands
@@ -82,6 +85,26 @@ form_msgs = {}     # key -> open_components (Form buttons/options — collect {Q
 form_titles = {}   # key -> modal title (the button/option label)
 ticket_categories = {}  # key -> category name a Ticket/Form drops its channels into
 ticket_access = {}      # key -> comma-separated role names that can see a Ticket/Form's channels
+
+# ---- Giveaways ----
+# Look designed in the dashboard "Giveaway" block (feature "customs-giveaway").
+# Every field is optional — the bot has sensible defaults so /giveaway works with
+# no config at all.
+giveaway_config = {
+    "title": "🎉 GIVEAWAY 🎉",
+    "color": ACCENT,
+    "button_label": "🎉 Enter",
+    "host_line": "",          # extra line under the prize (rules, host note, etc.)
+    "ping": "",               # optional role/text pinged with the giveaway post
+    "default_winners": 1,
+    "default_duration": "1d",
+    "manager_role_ids": [],   # roles (besides Manage Server) allowed to run /giveaway
+}
+# Live giveaways this process is tracking. Keyed by a short giveaway id (gid) that
+# also lives in the Enter button's custom_id, so entries route back here.
+# gid -> {message_id, channel_id, guild_id, prize, winners, end_ts, host_id,
+#         entrants:set[str], ended:bool}
+active_giveaways = {}
 
 def _msg_key(open_components, label=""):
     raw = json.dumps(open_components or [], sort_keys=True) + "|" + (label or "")
@@ -757,6 +780,285 @@ async def payment_cmd(interaction: discord.Interaction):
             pass
 
 
+# ============================ Giveaways ============================
+
+_DUR_RE = re.compile(r"^(\d+)\s*(mo|m|h|d|w|y)$")
+_DUR_MULT = {"m": 60, "h": 3600, "d": 86400, "w": 604800, "mo": 2592000, "y": 31536000}
+
+
+def _parse_duration_seconds(text):
+    """'10m' '2h' '1d' '1w' '1mo' '1y' -> seconds. 0 if invalid."""
+    if not text:
+        return 0
+    m = _DUR_RE.match(str(text).strip().lower())
+    if not m:
+        return 0
+    n = int(m.group(1))
+    if n <= 0:
+        return 0
+    return n * _DUR_MULT.get(m.group(2), 0)
+
+
+def _giveaway_can_manage(member):
+    try:
+        if member.guild_permissions.manage_guild:
+            return True
+    except Exception:
+        pass
+    return has_any_role(member, giveaway_config.get("manager_role_ids", []))
+
+
+def _giveaway_button(gid, disabled=False):
+    label = str(giveaway_config.get("button_label") or "🎉 Enter")
+    label, emoji = _extract_button_emoji(label)
+    btn = {"type": 2, "style": 1, "custom_id": f"gw:{gid}", "disabled": bool(disabled)}
+    if label:
+        btn["label"] = label[:80]
+    if emoji:
+        btn["emoji"] = emoji
+    return btn
+
+
+def build_giveaway_embed(g, ended=False, winner_ids=None):
+    prize = g["prize"]
+    end_ts = int(g["end_ts"])
+    entries = len(g["entrants"])
+    winners = int(g["winners"])
+    color = giveaway_config.get("color", ACCENT)
+    try:
+        color = int(color)
+    except Exception:
+        color = ACCENT
+
+    title = str(giveaway_config.get("title") or "🎉 GIVEAWAY 🎉")
+    lines = [f"### {prize}"]
+    host_line = str(giveaway_config.get("host_line") or "").strip()
+    if host_line:
+        lines.append(host_line)
+    lines.append("")
+
+    if not ended:
+        lines.append(f"Click **{str(giveaway_config.get('button_label') or 'Enter').strip()}** below to join!")
+        lines.append(f"Ends: <t:{end_ts}:R>  •  <t:{end_ts}:f>")
+    else:
+        title = "🎉 GIVEAWAY ENDED 🎉"
+        if winner_ids:
+            mentions = ", ".join(f"<@{w}>" for w in winner_ids)
+            lines.append(f"**Winner{'s' if len(winner_ids) != 1 else ''}:** {mentions}")
+        else:
+            lines.append("**No valid entries — no winner drawn.**")
+        lines.append(f"Ended: <t:{end_ts}:f>")
+
+    lines.append(f"Winners: **{winners}**  •  Entries: **{entries}**")
+    if g.get("host_id"):
+        lines.append(f"Hosted by <@{g['host_id']}>")
+
+    embed = discord.Embed(title=title, description="\n".join(lines), color=color)
+    return embed
+
+
+async def _giveaway_send(channel, g, gid):
+    embed = build_giveaway_embed(g)
+    payload = {
+        "embeds": [embed.to_dict()],
+        "components": [{"type": 1, "components": [_giveaway_button(gid)]}],
+        "allowed_mentions": {"parse": ["roles", "users"]},
+    }
+    ping = str(giveaway_config.get("ping") or "").strip()
+    if ping:
+        payload["content"] = _render_guild_text(ping, getattr(channel, "guild", None))
+    route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
+    resp = await bot.http.request(route, json=payload)
+    return str(resp["id"]) if isinstance(resp, dict) and resp.get("id") else None
+
+
+async def _giveaway_edit(g, embed, components):
+    try:
+        route = discord.http.Route(
+            "PATCH", "/channels/{channel_id}/messages/{message_id}",
+            channel_id=int(g["channel_id"]), message_id=int(g["message_id"]),
+        )
+        await bot.http.request(route, json={"embeds": [embed.to_dict()], "components": components})
+    except Exception as e:
+        print(f"[Giveaway] edit failed: {e}")
+
+
+async def _giveaway_refresh_count(gid):
+    g = active_giveaways.get(gid)
+    if not g or g.get("ended"):
+        return
+    embed = build_giveaway_embed(g)
+    await _giveaway_edit(g, embed, [{"type": 1, "components": [_giveaway_button(gid)]}])
+
+
+def _pick_winners(entrants, count):
+    pool = [e for e in entrants]
+    if not pool:
+        return []
+    return random.sample(pool, min(count, len(pool)))
+
+
+async def start_giveaway(channel, prize, winners, seconds, host_id, guild_id):
+    gid = secrets.token_hex(6)
+    end_ts = int(time.time()) + seconds
+    g = {
+        "message_id": None, "channel_id": str(channel.id), "guild_id": str(guild_id or ""),
+        "prize": prize, "winners": max(1, int(winners)), "end_ts": end_ts,
+        "host_id": str(host_id or ""), "entrants": set(), "ended": False,
+    }
+    active_giveaways[gid] = g
+    mid = await _giveaway_send(channel, g, gid)
+    if not mid:
+        active_giveaways.pop(gid, None)
+        return None
+    g["message_id"] = mid
+    asyncio.create_task(_giveaway_timer(gid, seconds))
+    return gid
+
+
+async def _giveaway_timer(gid, seconds):
+    try:
+        await asyncio.sleep(max(1, seconds))
+    except asyncio.CancelledError:
+        return
+    await end_giveaway(gid)
+
+
+async def end_giveaway(gid, actor_id=None):
+    g = active_giveaways.get(gid)
+    if not g or g.get("ended"):
+        return None
+    g["ended"] = True
+    winner_ids = _pick_winners(g["entrants"], g["winners"])
+    g["last_winners"] = winner_ids
+    embed = build_giveaway_embed(g, ended=True, winner_ids=winner_ids)
+    ended_components = [{
+        "type": 1,
+        "components": [
+            _giveaway_button(gid, disabled=True),
+            {"type": 2, "style": 2, "custom_id": f"gwreroll:{gid}", "label": "Reroll"},
+        ],
+    }]
+    await _giveaway_edit(g, embed, ended_components)
+
+    channel = await resolve_channel(g["channel_id"])
+    if channel:
+        jump = f"https://discord.com/channels/{g['guild_id']}/{g['channel_id']}/{g['message_id']}"
+        if winner_ids:
+            mentions = ", ".join(f"<@{w}>" for w in winner_ids)
+            text = f"🎉 Congratulations {mentions}! You won **{g['prize']}**.\n{jump}"
+        else:
+            text = f"No one entered the giveaway for **{g['prize']}**, so no winner was drawn.\n{jump}"
+        try:
+            await channel.send(text, allowed_mentions=discord.AllowedMentions(users=True))
+        except Exception as e:
+            print(f"[Giveaway] announce failed: {e}")
+    return winner_ids
+
+
+class GiveawayModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="Start Giveaway", timeout=300)
+        self.prize = discord.ui.TextInput(
+            label="Prize", style=discord.TextStyle.short, required=True, max_length=200,
+            placeholder="Discord Nitro, $20 gift card, 1000 Robux…",
+        )
+        self.winners = discord.ui.TextInput(
+            label="Winner(s)", style=discord.TextStyle.short, required=False, max_length=3,
+            default=str(giveaway_config.get("default_winners", 1)),
+            placeholder="How many winners (e.g. 1)",
+        )
+        self.length = discord.ui.TextInput(
+            label="Length", style=discord.TextStyle.short, required=True, max_length=8,
+            default=str(giveaway_config.get("default_duration", "1d")),
+            placeholder="10m, 2h, 1d, 1w, 1mo",
+        )
+        self.add_item(self.prize)
+        self.add_item(self.winners)
+        self.add_item(self.length)
+
+    async def on_submit(self, interaction):
+        prize = str(self.prize.value or "").strip()
+        try:
+            winners = int(str(self.winners.value or "1").strip() or "1")
+        except Exception:
+            winners = 1
+        winners = max(1, min(winners, 50))
+        seconds = _parse_duration_seconds(self.length.value)
+        if not prize:
+            await interaction.response.send_message(embed=error_embed("Prize required", "Enter what you're giving away."), ephemeral=True)
+            return
+        if not seconds:
+            await interaction.response.send_message(embed=error_embed("Invalid length", "Use a format like 10m, 2h, 1d, 1w, or 1mo."), ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        gid = await start_giveaway(
+            interaction.channel, prize, winners, seconds,
+            host_id=interaction.user.id, guild_id=getattr(interaction.guild, "id", None),
+        )
+        if gid:
+            await interaction.followup.send(embed=success_embed("Giveaway started", f"**{prize}** — {winners} winner(s), ends <t:{int(time.time()) + seconds}:R>."), ephemeral=True)
+        else:
+            await interaction.followup.send(embed=error_embed("Couldn't post", "I couldn't post the giveaway here. Check my permissions in this channel."), ephemeral=True)
+
+
+@bot.tree.command(name="giveaway", description="Start a giveaway — prize, winners, and length")
+async def giveaway_cmd(interaction: discord.Interaction):
+    if not _giveaway_can_manage(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "Only staff can start giveaways."), ephemeral=True)
+        return
+    try:
+        await interaction.response.send_modal(GiveawayModal())
+    except Exception as e:
+        print(f"[Giveaway] modal open failed: {e!r}")
+        try:
+            await interaction.response.send_message(embed=error_embed("Couldn't open form", str(e)[:300]), ephemeral=True)
+        except Exception:
+            pass
+
+
+async def giveaway_enter(interaction, gid):
+    g = active_giveaways.get(gid)
+    if not g:
+        await interaction.response.send_message(embed=error_embed("Giveaway unavailable", "This giveaway is no longer active (the bot may have restarted)."), ephemeral=True)
+        return
+    if g.get("ended"):
+        await interaction.response.send_message(embed=error_embed("Giveaway ended", "This giveaway has already ended."), ephemeral=True)
+        return
+    uid = str(interaction.user.id)
+    if uid in g["entrants"]:
+        g["entrants"].discard(uid)
+        msg = "You've **left** the giveaway."
+    else:
+        g["entrants"].add(uid)
+        msg = "You're **entered**! 🎉 Click again to leave."
+    await interaction.response.send_message(msg, ephemeral=True)
+    await _giveaway_refresh_count(gid)
+
+
+async def giveaway_reroll(interaction, gid):
+    g = active_giveaways.get(gid)
+    if not g:
+        await interaction.response.send_message(embed=error_embed("Giveaway unavailable", "That giveaway is no longer tracked (the bot may have restarted)."), ephemeral=True)
+        return
+    if not _giveaway_can_manage(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "Only staff can reroll."), ephemeral=True)
+        return
+    winners = _pick_winners(g["entrants"], g["winners"])
+    if not winners:
+        await interaction.response.send_message(embed=error_embed("No entries", "There are no entries to reroll from."), ephemeral=True)
+        return
+    g["last_winners"] = winners
+    await interaction.response.defer()
+    mentions = ", ".join(f"<@{w}>" for w in winners)
+    channel = await resolve_channel(g["channel_id"])
+    if channel:
+        try:
+            await channel.send(f"🎉 Reroll! New winner{'s' if len(winners) != 1 else ''} for **{g['prize']}**: {mentions}", allowed_mentions=discord.AllowedMentions(users=True))
+        except Exception:
+            pass
+
+
 @bot.event
 async def on_interaction(interaction: discord.Interaction):
     # Form submits arrive as modal_submit interactions (not component). Handle
@@ -816,6 +1118,10 @@ async def on_interaction(interaction: discord.Interaction):
         await close_ticket(interaction)
     elif cid == "roblox_verify":
         await start_roblox_verify(interaction)
+    elif cid.startswith("gw:"):
+        await giveaway_enter(interaction, cid.split(":", 1)[1])
+    elif cid.startswith("gwreroll:"):
+        await giveaway_reroll(interaction, cid.split(":", 1)[1])
 
 
 def _ticket_topic(opener_id, category, base=""):
@@ -1949,6 +2255,30 @@ async def apply_config(feature, cfg, post_panel=False):
         if cfg.get("log_channel_id"):
             credits_config["log_channel_id"] = str(cfg["log_channel_id"])
         print(f"[Config] credits — managers {credits_config['manager_role_ids']}")
+    elif feature in ("giveaway", "customs-giveaway"):
+        if cfg.get("title") is not None:
+            giveaway_config["title"] = str(cfg.get("title") or "🎉 GIVEAWAY 🎉")
+        if cfg.get("color") is not None:
+            try:
+                giveaway_config["color"] = int(cfg["color"])
+            except Exception:
+                pass
+        if cfg.get("button_label") is not None:
+            giveaway_config["button_label"] = str(cfg.get("button_label") or "🎉 Enter")
+        if cfg.get("host_line") is not None:
+            giveaway_config["host_line"] = str(cfg.get("host_line") or "")
+        if cfg.get("ping") is not None:
+            giveaway_config["ping"] = str(cfg.get("ping") or "")
+        if cfg.get("default_winners") is not None:
+            try:
+                giveaway_config["default_winners"] = max(1, int(cfg["default_winners"]))
+            except Exception:
+                pass
+        if cfg.get("default_duration"):
+            giveaway_config["default_duration"] = str(cfg["default_duration"])
+        if cfg.get("manager_role_ids") is not None:
+            giveaway_config["manager_role_ids"] = [str(x) for x in cfg["manager_role_ids"] if x]
+        print(f"[Config] giveaway — title {giveaway_config['title']!r} button {giveaway_config['button_label']!r} managers {giveaway_config['manager_role_ids']}")
     elif feature == "invite":
         if cfg.get("channel_id"):
             invite_config["channel_id"] = str(cfg["channel_id"])
