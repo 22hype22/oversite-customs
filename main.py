@@ -80,6 +80,7 @@ eph_msgs = {}      # key -> open_components (Ephemeral buttons/options)
 form_msgs = {}     # key -> open_components (Form buttons/options — collect {Question:} answers first)
 form_titles = {}   # key -> modal title (the button/option label)
 ticket_categories = {}  # key -> category name a Ticket/Form drops its channels into
+ticket_access = {}      # key -> comma-separated role names that can see a Ticket/Form's channels
 
 def _msg_key(open_components, label=""):
     raw = json.dumps(open_components or [], sort_keys=True) + "|" + (label or "")
@@ -94,7 +95,7 @@ def _comp_key(x):
     return _msg_key(x.get("open_components"), x.get("label", ""))
 
 def _register_ticket_components(comps):
-    ticket_msgs.clear(); eph_msgs.clear(); form_msgs.clear(); form_titles.clear(); ticket_categories.clear()
+    ticket_msgs.clear(); eph_msgs.clear(); form_msgs.clear(); form_titles.clear(); ticket_categories.clear(); ticket_access.clear()
 
     def _reg(x):
         oc = x.get("open_components") or []
@@ -102,11 +103,13 @@ def _register_ticket_components(comps):
             k = _comp_key(x)
             ticket_msgs[k] = oc
             ticket_categories[k] = (x.get("category_name") or "").strip()
+            ticket_access[k] = (x.get("access_roles") or "").strip()
         elif "form" in x:
             k = _comp_key(x)
             form_msgs[k] = oc
             form_titles[k] = x.get("label") or "Application"
             ticket_categories[k] = (x.get("category_name") or "").strip()
+            ticket_access[k] = (x.get("access_roles") or "").strip()
         elif "ephemeral" in x:
             eph_msgs[_comp_key(x)] = oc
         # A Ticket/Ephemeral message can itself contain more Ticket/Ephemeral
@@ -685,7 +688,7 @@ async def on_interaction(interaction: discord.Interaction):
             v = values[0]
             if v.startswith("ticket_msg:"):
                 mk = v.split(":", 1)[1]
-                await open_ticket(interaction, v, open_comps_override=ticket_msgs.get(mk), category_name_override=ticket_categories.get(mk))
+                await open_ticket(interaction, v, open_comps_override=ticket_msgs.get(mk), category_name_override=ticket_categories.get(mk), access_names_override=ticket_access.get(mk))
             elif v.startswith("ticket_form:"):
                 await open_ticket_form(interaction, v.split(":", 1)[1])
             elif v.startswith("eph:"):
@@ -699,7 +702,7 @@ async def on_interaction(interaction: discord.Interaction):
                 await open_ticket(interaction, v)
     elif cid.startswith("ticket_msg:"):
         mk = cid.split(":", 1)[1]
-        await open_ticket(interaction, cid, open_comps_override=ticket_msgs.get(mk), category_name_override=ticket_categories.get(mk))
+        await open_ticket(interaction, cid, open_comps_override=ticket_msgs.get(mk), category_name_override=ticket_categories.get(mk), access_names_override=ticket_access.get(mk))
     elif cid.startswith("ticket_form:"):
         await open_ticket_form(interaction, cid.split(":", 1)[1])
     elif cid.startswith("eph:"):
@@ -928,7 +931,7 @@ async def handle_ticket_form_submit(interaction, key):
         mapping = {lbl: (vals.get(f"q{i}") or "").strip() for i, lbl in enumerate(labels)}
         substituted = _apply_answers(open_comps, mapping)
         await open_ticket(interaction, f"ticket_form:{key}", open_comps_override=substituted,
-                          category_name_override=ticket_categories.get(key), already_responded=True)
+                          category_name_override=ticket_categories.get(key), access_names_override=ticket_access.get(key), already_responded=True)
     except Exception as e:
         import traceback
         print(f"[Ticket] form submit failed: {e}\n{traceback.format_exc()}")
@@ -976,7 +979,23 @@ async def _get_or_create_category(guild, name):
             return None
 
 
-async def open_ticket(interaction, category, open_comps_override=None, category_name_override=None, already_responded=False):
+def _resolve_role_names(guild, names_csv):
+    """Turn a comma-separated list of role names into role objects (case-insensitive)."""
+    if not names_csv or not guild:
+        return []
+    wanted = [n.strip().lower() for n in str(names_csv).split(",") if n.strip()]
+    if not wanted:
+        return []
+    out = []
+    for role in guild.roles:
+        if role.is_default():
+            continue
+        if role.name.strip().lower() in wanted and role not in out:
+            out.append(role)
+    return out
+
+
+async def open_ticket(interaction, category, open_comps_override=None, category_name_override=None, access_names_override=None, already_responded=False):
     guild = interaction.guild
     if not guild:
         return
@@ -1005,6 +1024,9 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
         role = guild.get_role(int(rid))
         if role:
             support_roles.append(role)
+    # Per-Ticket/Form access roles (by name) — who can SEE this ticket. Kept
+    # separate from support_roles so they grant visibility without being pinged.
+    access_roles = _resolve_role_names(guild, access_names_override)
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -1012,6 +1034,8 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
         guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True, manage_messages=True),
     }
     for role in support_roles:
+        overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
+    for role in access_roles:
         overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
     tdef = next((t for t in ticket_config.get("types", []) if t.get("id") == category), None)
