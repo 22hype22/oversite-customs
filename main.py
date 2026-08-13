@@ -722,7 +722,7 @@ class PaymentModal(discord.ui.Modal):
         self.add_item(discord.ui.Label(text="Price", description="USD for Stripe, Robux for gamepass/shirt.", component=self.price))
 
     async def on_submit(self, interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.response.defer(thinking=True)
         method = self.method.values[0] if self.method.values else "stripe"
         try:
             item = int(self.item.values[0]) if self.item.values else 1
@@ -736,11 +736,10 @@ class PaymentModal(discord.ui.Modal):
         if isinstance(result, dict) and result.get("ok") and result.get("url"):
             await interaction.followup.send(
                 embed=success_embed("Payment ready", f"**{result.get('label', 'Payment')}**\n{result['url']}"),
-                ephemeral=True,
             )
         else:
             err = (result or {}).get("error") if isinstance(result, dict) else str(result)
-            await interaction.followup.send(embed=error_embed("Payment failed", err or "Unknown error"), ephemeral=True)
+            await interaction.followup.send(embed=error_embed("Payment failed", err or "Unknown error"))
 
 
 @bot.tree.command(name="payment", description="Create a payment — Stripe, gamepass, or shirt")
