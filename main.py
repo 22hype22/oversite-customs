@@ -711,8 +711,8 @@ class PaymentModal(discord.ui.Modal):
             placeholder="e.g. 500 (Robux) or 25 (USD)",
         )
         self.add_item(discord.ui.Label(text="Method", component=self.method))
-        self.add_item(discord.ui.Label(text="Item # (gamepass / shirt only)", component=self.item))
-        self.add_item(discord.ui.Label(text="Price — USD for Stripe, Robux for gamepass/shirt", component=self.price))
+        self.add_item(discord.ui.Label(text="Item #", description="Which of your 6 gamepasses/shirts (ignored for Stripe).", component=self.item))
+        self.add_item(discord.ui.Label(text="Price", description="USD for Stripe, Robux for gamepass/shirt.", component=self.price))
 
     async def on_submit(self, interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -741,7 +741,14 @@ async def payment_cmd(interaction: discord.Interaction):
     if not (interaction.user.guild_permissions.manage_guild or has_any_role(interaction.user, ticket_config.get("support_role_ids", []))):
         await interaction.response.send_message(embed=error_embed("No permission", "Only staff can create payments."), ephemeral=True)
         return
-    await interaction.response.send_modal(PaymentModal())
+    try:
+        await interaction.response.send_modal(PaymentModal())
+    except Exception as e:
+        print(f"[Payment] modal open failed: {e!r}")
+        try:
+            await interaction.response.send_message(embed=error_embed("Couldn't open form", str(e)[:300]), ephemeral=True)
+        except Exception:
+            pass
 
 
 @bot.event
