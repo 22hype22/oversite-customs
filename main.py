@@ -1070,13 +1070,10 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
         await interaction.followup.send(embed=error_embed("Couldn't open ticket", str(e)), ephemeral=True)
         return
 
-    ping = ""
-    if ticket_config.get("ping_support", True) and support_roles:
-        ping = " ".join(r.mention for r in support_roles)
-
-    # Only ping support roles (when enabled). The opener isn't pinged — they
-    # already have access and get an ephemeral link to the channel.
-    content = ping or None
+    # No auto-pings. Support roles get channel access (above) but are never
+    # pinged automatically — the ticket shows ONLY the designed message. To ping
+    # someone, write @role directly into the ticket/form design.
+    content = None
 
     # (ticket type + opening components resolved above for the channel name)
     sent_rich = False
@@ -1741,9 +1738,14 @@ async def apply_config(feature, cfg, post_panel=False):
                 "channel_id": str(cfg.get("panel_channel_id") or ""),
                 "components": pc if isinstance(pc, list) else [],
             })
+        # The dashboard sends panel_channel_id = the panel currently being edited.
+        # We register ALL panels (so every panel's buttons keep working) but only
+        # (re)post that one on save.
+        edited_ch = str(cfg.get("panel_channel_id") or (panels[0]["channel_id"] if panels else ""))
+        edited_panel = next((p for p in panels if p["channel_id"] == edited_ch), (panels[0] if panels else {"components": []}))
         ticket_config["panels"] = panels
-        ticket_config["panel_channel_id"] = panels[0]["channel_id"]
-        ticket_config["panel_components"] = panels[0]["components"]
+        ticket_config["panel_channel_id"] = edited_ch
+        ticket_config["panel_components"] = edited_panel.get("components", [])
         _register_ticket_components([p["components"] for p in panels])
         # Ticket types (each with its own button + opening message).
         raw_types = cfg.get("ticket_types")
@@ -1770,9 +1772,10 @@ async def apply_config(feature, cfg, post_panel=False):
                 "open_components": oc if isinstance(oc, list) else [],
             }]
         print(f"[Config] tickets — category {ticket_config['category_id']} roles {ticket_config['support_role_ids']} panel_ch {ticket_config['panel_channel_id']} panel {len(ticket_config['panel_components'])} types {len(ticket_config['types'])}")
-        # Post/refresh the ticket panel on a save/apply (not on boot).
+        # Post/refresh ONLY the panel being edited on a save (not on boot, and
+        # not the other panels — those stay put).
         if post_panel:
-            await post_ticket_panel()
+            await post_ticket_panel(only_channel_id=edited_ch or None)
     elif feature == "credits":
         if cfg.get("manager_role_ids") is not None:
             credits_config["manager_role_ids"] = [str(x) for x in cfg["manager_role_ids"] if x]
@@ -1959,13 +1962,17 @@ async def _replace_ticket_panel(new_channel_id, new_message_id):
             pass
 
 
-async def post_ticket_panel():
-    """(Re)post EVERY configured ticket panel to its channel, so all of a
-    server's panels stay live — not just the most recent one."""
+async def post_ticket_panel(only_channel_id=None):
+    """(Re)post ticket panels. With only_channel_id set (a save while editing one
+    panel), post JUST that panel and leave the others untouched. Without it,
+    post every configured panel."""
     panels = ticket_config.get("panels")
     if not isinstance(panels, list) or not panels:
         panels = [{"channel_id": ticket_config.get("panel_channel_id"), "components": ticket_config.get("panel_components") or []}]
+    target = str(only_channel_id) if only_channel_id else None
     for p in panels:
+        if target and str(p.get("channel_id")) != target:
+            continue
         ch = await resolve_channel(p.get("channel_id"))
         if not ch:
             continue
@@ -2216,11 +2223,13 @@ async def poll_roblox_apply():
             r = await client.get(
                 url,
                 headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
-                timeout=10,
+                timeout=20,
             )
         if r.status_code != 200:
             return
         rows = r.json()
+    except httpx.TransportError:
+        return  # transient network blip (timeout/connection) — retried next cycle
     except Exception as e:
         print(f"[Verify] roblox_apply poll failed: {e}")
         return
@@ -2592,10 +2601,12 @@ async def claim_shutdown_command():
             f"&status=eq.pending&created_at=gte.{BOT_START_TIME}&order=created_at.desc&select=id&limit=1"
         )
         async with httpx.AsyncClient() as client:
-            r = await client.get(url, headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=5)
+            r = await client.get(url, headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=15)
             data = r.json()
             if data and isinstance(data, list):
                 return data[0]
+    except httpx.TransportError:
+        pass  # transient network blip (timeout/connection) — retried next cycle
     except Exception as e:
         print(f"[Shutdown] claim error: {e!r}")
     return None
