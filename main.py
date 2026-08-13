@@ -1044,6 +1044,8 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
 
 async def show_ephemeral(interaction, key):
     comps = eph_msgs.get(key)
+    print(f"[Tickets] show_ephemeral key={key!r} registered={key in eph_msgs} len={len(comps) if comps else 0} "
+          f"all_eph={{{', '.join(f'{k}:{len(v or [])}' for k, v in eph_msgs.items())}}}")
     try:
         await interaction.response.defer(ephemeral=True)
     except Exception:
