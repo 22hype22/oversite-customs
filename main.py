@@ -1907,27 +1907,15 @@ async def post_verify_panel():
 
 
 async def _replace_ticket_panel(new_channel_id, new_message_id):
-    """Record the freshly-posted ticket panel per channel. Re-posting to the SAME
-    channel replaces that channel's previous panel (so re-saving doesn't stack
-    duplicates), but panels in other channels are left alone — post as many as
-    you like, one per channel."""
+    """Record the freshly-posted ticket panel. Panels are NEVER auto-deleted —
+    post as many as you like (same channel or different). Remove any you don't
+    want by hand."""
     refs = ticket_config.get("panel_refs")
     if not isinstance(refs, dict):
         refs = {}
         ticket_config["panel_refs"] = refs
-    ch_key = str(new_channel_id)
-    old_mid = refs.get(ch_key)
     if new_message_id and new_message_id is not True:
-        refs[ch_key] = str(new_message_id)
-    # Only delete the previous panel in THIS channel.
-    if old_mid:
-        try:
-            ch = await resolve_channel(ch_key)
-            if ch:
-                msg = await ch.fetch_message(int(old_mid))
-                await msg.delete()
-        except Exception:
-            pass
+        refs[str(new_channel_id)] = str(new_message_id)
 
 
 async def post_ticket_panel():
