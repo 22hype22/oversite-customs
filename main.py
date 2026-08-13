@@ -68,6 +68,7 @@ ticket_config = {
     #   {id, name, button_label, button_style, open_components:[...]}, ... ]
     "panel_channel_id": "",
     "panel_components": [],
+    "panels": [],  # [{channel_id, components}, ...] — every panel, all registered/posted
     "types": [],
     "panel_refs": {},  # channel_id -> last panel message id (one panel kept per channel)
 }
@@ -94,7 +95,11 @@ def _comp_key(x):
         return str(cid)[:64]
     return _msg_key(x.get("open_components"), x.get("label", ""))
 
-def _register_ticket_components(comps):
+def _register_ticket_components(panels):
+    """Register the interactive components (Ticket/Form/Ephemeral) from EVERY
+    panel so all posted panels keep working — not just the most recent one.
+    `panels` is a list of component-trees (one per panel). A single tree is also
+    accepted for backward compatibility."""
     ticket_msgs.clear(); eph_msgs.clear(); form_msgs.clear(); form_titles.clear(); ticket_categories.clear(); ticket_access.clear()
 
     def _reg(x):
@@ -139,7 +144,13 @@ def _register_ticket_components(comps):
                 if isinstance(b, dict):
                     _reg(b)
 
-    walk(comps, 0)
+    # Accept a single tree (list of items) or a list of trees (one per panel).
+    trees = panels or []
+    if trees and isinstance(trees[0], dict):
+        trees = [trees]
+    for tree in trees:
+        if isinstance(tree, list):
+            walk(tree, 0)
     print(f"[Tickets] registry: {len(ticket_msgs)} ticket + {len(form_msgs)} form + {len(eph_msgs)} ephemeral messages")
     print(f"[Tickets] registry built: tickets={{{', '.join(f'{k}:{len(v)}' for k,v in ticket_msgs.items())}}} eph={{{', '.join(f'{k}:{len(v)}' for k,v in eph_msgs.items())}}}")
 credits_config = {"manager_role_ids": CREDIT_MANAGER_ROLE_IDS, "currency_name": "credits", "log_channel_id": ""}
@@ -1710,11 +1721,30 @@ async def apply_config(feature, cfg, post_panel=False):
             ticket_config["ping_support"] = bool(cfg["ping_support"])
         if "one_per_user" in cfg:
             ticket_config["one_per_user"] = bool(cfg["one_per_user"])
-        if cfg.get("panel_channel_id"):
-            ticket_config["panel_channel_id"] = str(cfg["panel_channel_id"])
-        pc = cfg.get("panel_components")
-        ticket_config["panel_components"] = pc if isinstance(pc, list) else []
-        _register_ticket_components(ticket_config["panel_components"])
+        # Multi-panel: cfg.panels = [{channel_id, components}, ...]. Falls back to
+        # the single panel_channel_id + panel_components for older configs. ALL
+        # panels are registered so every posted panel keeps working.
+        raw_panels = cfg.get("panels")
+        panels = []
+        if isinstance(raw_panels, list) and raw_panels:
+            for p in raw_panels:
+                if not isinstance(p, dict):
+                    continue
+                comps = p.get("components")
+                panels.append({
+                    "channel_id": str(p.get("channel_id") or ""),
+                    "components": comps if isinstance(comps, list) else [],
+                })
+        if not panels:
+            pc = cfg.get("panel_components")
+            panels.append({
+                "channel_id": str(cfg.get("panel_channel_id") or ""),
+                "components": pc if isinstance(pc, list) else [],
+            })
+        ticket_config["panels"] = panels
+        ticket_config["panel_channel_id"] = panels[0]["channel_id"]
+        ticket_config["panel_components"] = panels[0]["components"]
+        _register_ticket_components([p["components"] for p in panels])
         # Ticket types (each with its own button + opening message).
         raw_types = cfg.get("ticket_types")
         if isinstance(raw_types, list) and raw_types:
@@ -1907,54 +1937,42 @@ async def post_verify_panel():
 
 
 async def _replace_ticket_panel(new_channel_id, new_message_id):
-    """Record the freshly-posted ticket panel. Panels are NEVER auto-deleted —
-    post as many as you like (same channel or different). Remove any you don't
-    want by hand."""
+    """Record the freshly-posted ticket panel per channel. Every save re-posts
+    all panels, so we replace the previous message IN THE SAME channel (no
+    duplicate stacking) while panels in other channels are untouched — you keep
+    as many panels as you have channels."""
     refs = ticket_config.get("panel_refs")
     if not isinstance(refs, dict):
         refs = {}
         ticket_config["panel_refs"] = refs
+    ch_key = str(new_channel_id)
+    old_mid = refs.get(ch_key)
     if new_message_id and new_message_id is not True:
-        refs[str(new_channel_id)] = str(new_message_id)
+        refs[ch_key] = str(new_message_id)
+    if old_mid:
+        try:
+            ch = await resolve_channel(ch_key)
+            if ch:
+                msg = await ch.fetch_message(int(old_mid))
+                await msg.delete()
+        except Exception:
+            pass
 
 
 async def post_ticket_panel():
-    """(Re)post the ticket panel — the owner's designed message plus an Open
-    Ticket button — to the configured panel channel. Mirrors the verify panel."""
-    ch = await resolve_channel(ticket_config.get("panel_channel_id"))
-    if not ch:
-        return
-    types = ticket_config.get("types") or []
-    if not types:
-        types = [{"id": "support", "name": "Support", "button_label": "Open Ticket", "button_style": "primary"}]
-    # One Open button per ticket type, chunked into rows of 5 (Discord's limit).
-    open_rows = []
-    current = []
-    for t in types:
-        current.append({
-            "label": t.get("button_label") or "Open Ticket",
-            "style": t.get("button_style") or "primary",
-            "__ticket_open": True,
-            "category": t.get("id") or "support",
-        })
-        if len(current) == 5:
-            open_rows.append({"type": "buttonRow", "buttons": current})
-            current = []
-    if current:
-        open_rows.append({"type": "buttonRow", "buttons": current})
-    comps = ticket_config.get("panel_components") or []
+    """(Re)post EVERY configured ticket panel to its channel, so all of a
+    server's panels stay live — not just the most recent one."""
+    panels = ticket_config.get("panels")
+    if not isinstance(panels, list) or not panels:
+        panels = [{"channel_id": ticket_config.get("panel_channel_id"), "components": ticket_config.get("panel_components") or []}]
+    for p in panels:
+        ch = await resolve_channel(p.get("channel_id"))
+        if not ch:
+            continue
+        await _post_one_panel(ch, p.get("components") or [])
 
-    def _with_button(source):
-        panel = [dict(c) for c in source]
-        container_idxs = [i for i, c in enumerate(panel) if c.get("type") == "container"]
-        if container_idxs:
-            i = container_idxs[-1]
-            panel[i] = dict(panel[i])
-            panel[i]["children"] = list(panel[i].get("children") or []) + open_rows
-        else:
-            panel.extend(open_rows)
-        return panel
 
+async def _post_one_panel(ch, comps):
     if comps:
         try:
             mid = await send_v2_message(ch, comps)
@@ -1975,8 +1993,9 @@ async def post_ticket_panel():
             except Exception as e:
                 print(f"[Tickets] stripped panel error: {e}")
 
-    # Default panel (no custom design, or the custom one wouldn't send) — a
-    # button per type on a classic embed.
+    # Fallback: a classic embed with an Open Ticket button per type — used only
+    # when a panel has no custom design (or the custom one wouldn't send).
+    types = ticket_config.get("types") or [{"id": "support", "name": "Support", "button_label": "Open Ticket", "button_style": "primary"}]
     embed = discord.Embed(
         title="Support Tickets",
         description="Need help? Pick an option below and our team will be with you.",
