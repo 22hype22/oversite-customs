@@ -99,6 +99,7 @@ giveaway_config = {
     "default_winners": 1,
     "default_duration": "1d",
     "manager_role_ids": [],   # roles (besides Manage Server) allowed to run /giveaway
+    "components": [],         # optional V2 design (dashboard "Giveaway" builder)
 }
 # Live giveaways this process is tracking. Keyed by a short giveaway id (gid) that
 # also lives in the Enter button's custom_id, so entries route back here.
@@ -857,28 +858,94 @@ def build_giveaway_embed(g, ended=False, winner_ids=None):
     return embed
 
 
-async def _giveaway_send(channel, g, gid):
-    embed = build_giveaway_embed(g)
-    payload = {
-        "embeds": [embed.to_dict()],
-        "components": [{"type": 1, "components": [_giveaway_button(gid)]}],
-        "allowed_mentions": {"parse": ["roles", "users"]},
+def _giveaway_action_row(gid, ended=False):
+    row = {"type": 1, "components": [_giveaway_button(gid, disabled=ended)]}
+    if ended:
+        row["components"].append({"type": 2, "style": 2, "custom_id": f"gwreroll:{gid}", "label": "Reroll"})
+    return row
+
+
+def _giveaway_tokens(g, ended, winner_ids):
+    end_ts = int(g["end_ts"])
+    if winner_ids:
+        wl = ", ".join(f"<@{w}>" for w in winner_ids)
+    elif ended:
+        wl = "No winners"
+    else:
+        wl = "TBD"
+    return {
+        "{prize}": g["prize"],
+        "{winners}": str(int(g["winners"])),
+        "{entries}": str(len(g["entrants"])),
+        "{end}": f"<t:{end_ts}:R>",
+        "{end_full}": f"<t:{end_ts}:F>",
+        "{host}": f"<@{g['host_id']}>" if g.get("host_id") else "",
+        "{winner_list}": wl,
+        "{button}": str(giveaway_config.get("button_label") or "Enter"),
     }
+
+
+def _giveaway_render_design(g, gid, guild, ended=False, winner_ids=None):
+    """Render the dashboard-designed giveaway layout (with tokens filled in) plus
+    the Enter/Reroll action row. Returns None if no design is configured."""
+    design = giveaway_config.get("components") or []
+    if not design:
+        return None
+
+    def _js(x):
+        return json.dumps(str(x))[1:-1]
+
+    raw = json.dumps(design)
+    for tok, val in _giveaway_tokens(g, ended, winner_ids).items():
+        raw = raw.replace(tok, _js(val))
+    try:
+        comps = json.loads(raw)
+    except Exception:
+        comps = design
+
+    built = [b for b in (_build_v2(c, guild) for c in comps) if b]
     ping = str(giveaway_config.get("ping") or "").strip()
     if ping:
-        payload["content"] = _render_guild_text(ping, getattr(channel, "guild", None))
+        built.insert(0, {"type": 10, "content": _render_guild_text(ping, guild)})
+    built.append(_giveaway_action_row(gid, ended))
+    return built
+
+
+def _giveaway_payload(g, gid, guild, ended=False, winner_ids=None, for_edit=False):
+    """Build the message payload for a giveaway. Uses the designed V2 layout when
+    one exists, otherwise the built-in embed."""
+    design = _giveaway_render_design(g, gid, guild, ended, winner_ids)
+    if design is not None:
+        payload = {"components": design}
+        if not for_edit:
+            payload["flags"] = 1 << 15  # Components V2
+            payload["allowed_mentions"] = {"parse": ["roles", "users"]}
+        return payload
+    embed = build_giveaway_embed(g, ended=ended, winner_ids=winner_ids)
+    payload = {"embeds": [embed.to_dict()], "components": [_giveaway_action_row(gid, ended)]}
+    if not for_edit:
+        payload["allowed_mentions"] = {"parse": ["roles", "users"]}
+        ping = str(giveaway_config.get("ping") or "").strip()
+        if ping:
+            payload["content"] = _render_guild_text(ping, guild)
+    return payload
+
+
+async def _giveaway_send(channel, g, gid):
+    guild = getattr(channel, "guild", None)
+    payload = _giveaway_payload(g, gid, guild, ended=False)
     route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
     resp = await bot.http.request(route, json=payload)
     return str(resp["id"]) if isinstance(resp, dict) and resp.get("id") else None
 
 
-async def _giveaway_edit(g, embed, components):
+async def _giveaway_patch(g, payload):
     try:
         route = discord.http.Route(
             "PATCH", "/channels/{channel_id}/messages/{message_id}",
             channel_id=int(g["channel_id"]), message_id=int(g["message_id"]),
         )
-        await bot.http.request(route, json={"embeds": [embed.to_dict()], "components": components})
+        await bot.http.request(route, json=payload)
     except Exception as e:
         print(f"[Giveaway] edit failed: {e}")
 
@@ -887,8 +954,9 @@ async def _giveaway_refresh_count(gid):
     g = active_giveaways.get(gid)
     if not g or g.get("ended"):
         return
-    embed = build_giveaway_embed(g)
-    await _giveaway_edit(g, embed, [{"type": 1, "components": [_giveaway_button(gid)]}])
+    channel = await resolve_channel(g["channel_id"])
+    guild = getattr(channel, "guild", None) if channel else None
+    await _giveaway_patch(g, _giveaway_payload(g, gid, guild, ended=False, for_edit=True))
 
 
 def _pick_winners(entrants, count):
@@ -931,17 +999,10 @@ async def end_giveaway(gid, actor_id=None):
     g["ended"] = True
     winner_ids = _pick_winners(g["entrants"], g["winners"])
     g["last_winners"] = winner_ids
-    embed = build_giveaway_embed(g, ended=True, winner_ids=winner_ids)
-    ended_components = [{
-        "type": 1,
-        "components": [
-            _giveaway_button(gid, disabled=True),
-            {"type": 2, "style": 2, "custom_id": f"gwreroll:{gid}", "label": "Reroll"},
-        ],
-    }]
-    await _giveaway_edit(g, embed, ended_components)
-
     channel = await resolve_channel(g["channel_id"])
+    guild = getattr(channel, "guild", None) if channel else None
+    await _giveaway_patch(g, _giveaway_payload(g, gid, guild, ended=True, winner_ids=winner_ids, for_edit=True))
+
     if channel:
         jump = f"https://discord.com/channels/{g['guild_id']}/{g['channel_id']}/{g['message_id']}"
         if winner_ids:
@@ -1894,104 +1955,107 @@ def _strip_galleries(items):
     return out
 
 
+def _build_v2(comp, guild):
+    """Convert one dashboard V2 item into a raw Discord Components-V2 object.
+    Module-level so both send_v2_message and the giveaway renderer can use it."""
+    ctype = comp.get("type", "")
+    if ctype in ("text", "text_display"):
+        text = comp.get("text") or comp.get("content", "")
+        title = comp.get("title", "")
+        if title:
+            text = f"**{title}**\n{text}" if text else f"**{title}**"
+        return {"type": 10, "content": _render_guild_text(text, guild)} if text else None
+    if ctype == "container":
+        accent = comp.get("accentColor") or comp.get("accent_color", "")
+        try:
+            accent_int = int(str(accent).lstrip("#"), 16) if accent else None
+        except Exception:
+            accent_int = None
+        children = [_build_v2(c, guild) for c in comp.get("children", [])]
+        children = [c for c in children if c]
+        if not children:
+            return None
+        obj = {"type": 17, "components": children}
+        if accent_int is not None:
+            obj["accent_color"] = accent_int
+        return obj
+    if ctype == "separator":
+        spacing = comp.get("spacing", "small")
+        return {"type": 14, "divider": comp.get("divider", True), "spacing": 2 if spacing == "large" else 1}
+    if ctype in ("gallery", "media_gallery", "media"):
+        urls = comp.get("images") or comp.get("image_urls", [])
+        items = [{"media": {"url": u}} for u in urls if u and str(u).startswith("http")]
+        return {"type": 12, "items": items} if items else None
+    if ctype == "section":
+        text = comp.get("text") or comp.get("content", "")
+        title = comp.get("title", "")
+        if title:
+            text = f"**{title}**\n{text}" if text else f"**{title}**"
+        if not text:
+            return None
+        text = _render_guild_text(text, guild)
+        thumb = comp.get("thumbnailUrl") or comp.get("thumbnail_url")
+        button = comp.get("button")
+        accessory = None
+        if thumb and str(thumb).startswith("http"):
+            accessory = {"type": 11, "media": {"url": thumb}}
+        elif isinstance(button, dict) and button.get("label"):
+            accessory = build_button(button, guild)
+        # A Components V2 Section (type 9) REQUIRES an accessory (thumbnail or
+        # button). If the design has neither, Discord rejects the whole
+        # message, so render the text as a plain text display instead.
+        if accessory is None:
+            return {"type": 10, "content": text}
+        return {"type": 9, "components": [{"type": 10, "content": text}], "accessory": accessory}
+    if ctype in ("buttonRow", "button_row", "buttons", "action_row"):
+        buttons = [build_button(b, guild) for b in comp.get("buttons", [])]
+        buttons = [b for b in buttons if b]
+        return {"type": 1, "components": buttons} if buttons else None
+    if ctype in ("select_menu", "select"):
+        placeholder = comp.get("placeholder", "Select an option")
+        options = []
+        has_category = False
+        for opt in comp.get("options", []):
+            label = opt.get("label", "Option")
+            category = opt.get("category", "")
+            channel_id = opt.get("channel_id", "")
+            url = opt.get("url", "")
+            if "ticket" in opt:
+                has_category = True
+                value = f"ticket_msg:{_comp_key(opt)}"
+            elif "form" in opt:
+                has_category = True
+                value = f"ticket_form:{_comp_key(opt)}"
+            elif "ephemeral" in opt:
+                has_category = True
+                value = f"eph:{_comp_key(opt)}"
+            elif category:
+                has_category = True
+                value = category
+            elif channel_id:
+                value = f"ch:{channel_id}"
+            elif url:
+                value = f"url:{url}"[:100]
+            else:
+                value = label[:100]
+            opt_label, opt_emoji = _extract_button_emoji(label)
+            o = {"label": (opt_label or label)[:100], "value": value[:100]}
+            if opt_emoji:
+                o["emoji"] = opt_emoji
+            if opt.get("description"):
+                o["description"] = opt["description"][:100]
+            options.append(o)
+        if not options:
+            return None
+        custom_id = "ticket_select" if has_category else f"select_{placeholder[:20]}"
+        return {"type": 1, "components": [{"type": 3, "custom_id": custom_id, "placeholder": placeholder[:150], "options": options}]}
+    return None
+
+
 async def send_v2_message(channel, components_v2, content=None, interaction=None, ephemeral=False, allowed_mentions=None):
     _guild = getattr(channel, "guild", None)
 
-    def build(comp):
-        ctype = comp.get("type", "")
-        if ctype in ("text", "text_display"):
-            text = comp.get("text") or comp.get("content", "")
-            title = comp.get("title", "")
-            if title:
-                text = f"**{title}**\n{text}" if text else f"**{title}**"
-            return {"type": 10, "content": _render_guild_text(text, _guild)} if text else None
-        if ctype == "container":
-            accent = comp.get("accentColor") or comp.get("accent_color", "")
-            try:
-                accent_int = int(str(accent).lstrip("#"), 16) if accent else None
-            except Exception:
-                accent_int = None
-            children = [build(c) for c in comp.get("children", [])]
-            children = [c for c in children if c]
-            if not children:
-                return None
-            obj = {"type": 17, "components": children}
-            if accent_int is not None:
-                obj["accent_color"] = accent_int
-            return obj
-        if ctype == "separator":
-            spacing = comp.get("spacing", "small")
-            return {"type": 14, "divider": comp.get("divider", True), "spacing": 2 if spacing == "large" else 1}
-        if ctype in ("gallery", "media_gallery", "media"):
-            urls = comp.get("images") or comp.get("image_urls", [])
-            items = [{"media": {"url": u}} for u in urls if u and str(u).startswith("http")]
-            return {"type": 12, "items": items} if items else None
-        if ctype == "section":
-            text = comp.get("text") or comp.get("content", "")
-            title = comp.get("title", "")
-            if title:
-                text = f"**{title}**\n{text}" if text else f"**{title}**"
-            if not text:
-                return None
-            text = _render_guild_text(text, _guild)
-            thumb = comp.get("thumbnailUrl") or comp.get("thumbnail_url")
-            button = comp.get("button")
-            accessory = None
-            if thumb and str(thumb).startswith("http"):
-                accessory = {"type": 11, "media": {"url": thumb}}
-            elif isinstance(button, dict) and button.get("label"):
-                accessory = build_button(button, _guild)
-            # A Components V2 Section (type 9) REQUIRES an accessory (thumbnail or
-            # button). If the design has neither, Discord rejects the whole
-            # message, so render the text as a plain text display instead.
-            if accessory is None:
-                return {"type": 10, "content": text}
-            return {"type": 9, "components": [{"type": 10, "content": text}], "accessory": accessory}
-        if ctype in ("buttonRow", "button_row", "buttons", "action_row"):
-            buttons = [build_button(b, getattr(channel, "guild", None)) for b in comp.get("buttons", [])]
-            buttons = [b for b in buttons if b]
-            return {"type": 1, "components": buttons} if buttons else None
-        if ctype in ("select_menu", "select"):
-            placeholder = comp.get("placeholder", "Select an option")
-            options = []
-            has_category = False
-            for opt in comp.get("options", []):
-                label = opt.get("label", "Option")
-                category = opt.get("category", "")
-                channel_id = opt.get("channel_id", "")
-                url = opt.get("url", "")
-                if "ticket" in opt:
-                    has_category = True
-                    value = f"ticket_msg:{_comp_key(opt)}"
-                elif "form" in opt:
-                    has_category = True
-                    value = f"ticket_form:{_comp_key(opt)}"
-                elif "ephemeral" in opt:
-                    has_category = True
-                    value = f"eph:{_comp_key(opt)}"
-                elif category:
-                    has_category = True
-                    value = category
-                elif channel_id:
-                    value = f"ch:{channel_id}"
-                elif url:
-                    value = f"url:{url}"[:100]
-                else:
-                    value = label[:100]
-                opt_label, opt_emoji = _extract_button_emoji(label)
-                o = {"label": (opt_label or label)[:100], "value": value[:100]}
-                if opt_emoji:
-                    o["emoji"] = opt_emoji
-                if opt.get("description"):
-                    o["description"] = opt["description"][:100]
-                options.append(o)
-            if not options:
-                return None
-            custom_id = "ticket_select" if has_category else f"select_{placeholder[:20]}"
-            return {"type": 1, "components": [{"type": 3, "custom_id": custom_id, "placeholder": placeholder[:150], "options": options}]}
-        return None
-
-    built = [b for b in (build(c) for c in components_v2) if b]
+    built = [b for b in (_build_v2(c, _guild) for c in components_v2) if b]
     if not built:
         return False
     # These component types are all valid at the top level of a Components V2
@@ -2278,7 +2342,9 @@ async def apply_config(feature, cfg, post_panel=False):
             giveaway_config["default_duration"] = str(cfg["default_duration"])
         if cfg.get("manager_role_ids") is not None:
             giveaway_config["manager_role_ids"] = [str(x) for x in cfg["manager_role_ids"] if x]
-        print(f"[Config] giveaway — title {giveaway_config['title']!r} button {giveaway_config['button_label']!r} managers {giveaway_config['manager_role_ids']}")
+        comps = cfg.get("components")
+        giveaway_config["components"] = comps if isinstance(comps, list) else []
+        print(f"[Config] giveaway — title {giveaway_config['title']!r} button {giveaway_config['button_label']!r} managers {giveaway_config['manager_role_ids']} design {len(giveaway_config['components'])}")
     elif feature == "invite":
         if cfg.get("channel_id"):
             invite_config["channel_id"] = str(cfg["channel_id"])
