@@ -199,8 +199,10 @@ def _render_order_tokens(text, guild):
         emoji = (emoji or "").strip()
         if status_only:
             return f"{emoji} {lbl}".strip()
-        # Default token = ICON ONLY (falls back to the word if no emoji is set).
-        return emoji or lbl
+        # Default token = 'Name — <emoji>' (no Open/Closed word). Falls back to
+        # the word only if no emoji is configured.
+        name = svc.get("name") or ""
+        return f"{name} — {emoji}" if emoji else f"{name} — {lbl}"
 
     return _ORDER_TOKEN_RE.sub(_sub, text)
 
@@ -1754,8 +1756,8 @@ async def show_order_status(interaction):
         name = svc.get("name") or ""
         emoji, lbl = _order_status_for(guild, svc)
         emoji = (emoji or "").strip()
-        # Icon + name (no status word). Falls back to the word if no emoji is set.
-        lines.append(f"{emoji} **{name}**".strip() if emoji else f"**{name}** — {lbl}")
+        # 'Name — <emoji>' (no status word). Falls back to the word if no emoji.
+        lines.append(f"**{name}** — {emoji}" if emoji else f"**{name}** — {lbl}")
 
     title = order_status_config.get("title") or "Order Status"
     desc = "\n".join(lines) if lines else "No services are configured yet."
