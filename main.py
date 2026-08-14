@@ -2164,7 +2164,16 @@ async def on_interaction(interaction: discord.Interaction):
     if interaction.type == discord.InteractionType.modal_submit:
         cid = (interaction.data or {}).get("custom_id", "")
         if cid.startswith("ticketform:"):
-            await handle_ticket_form_submit(interaction, cid.split(":", 1)[1])
+            payload = cid.split(":", 1)[1]
+            if "|" in payload:
+                fkey, pg = payload.rsplit("|", 1)
+                try:
+                    pg = int(pg)
+                except Exception:
+                    pg = 0
+            else:
+                fkey, pg = payload, 0
+            await handle_ticket_form_submit(interaction, fkey, pg)
         elif cid == "giveawayform":
             await handle_giveaway_form_submit(interaction)
         elif cid.startswith("robuxstockform:"):
@@ -2217,6 +2226,14 @@ async def on_interaction(interaction: discord.Interaction):
         await open_ticket(interaction, cid, open_comps_override=ticket_msgs.get(mk), category_name_override=ticket_categories.get(mk), access_names_override=ticket_access.get(mk))
     elif cid.startswith("ticket_form:"):
         await open_ticket_form(interaction, cid.split(":", 1)[1])
+    elif cid.startswith("formcont:"):
+        payload = cid.split(":", 1)[1]
+        fkey, pg = (payload.rsplit("|", 1) + ["0"])[:2] if "|" in payload else (payload, "0")
+        try:
+            pg = int(pg)
+        except Exception:
+            pg = 0
+        await _open_form_page(interaction, fkey, pg)
     elif cid.startswith("eph:"):
         await show_ephemeral(interaction, cid.split(":", 1)[1])
     elif cid.startswith("ticket_cat:"):
@@ -2374,15 +2391,55 @@ def _clean_label(s):
     return re.sub(r"[*_`~]", "", s or "").strip()
 
 
-def _parse_questions(open_comps):
-    """Ordered, de-duplicated list of {Question: LABEL} labels in a design (max 5)."""
+def _parse_questions(open_comps, limit=5):
+    """Ordered, de-duplicated list of {Question: LABEL} labels in a design.
+    Discord modals hold 5 fields each; ticket forms page across two modals so
+    they allow up to 10 (limit=10). Other callers keep the single-modal 5."""
     raw = json.dumps(open_comps or [])
     seen = []
     for m in _QUESTION_RE.finditer(raw):
         lbl = (m.group(1) or "").strip()
         if lbl and lbl not in seen:
             seen.append(lbl)
-    return seen[:5]
+    return seen[:limit]
+
+
+# In-progress ticket-form answers between paged modals, keyed by (user_id, key).
+_pending_form_answers = {}
+FORM_PAGE_SIZE = 5
+FORM_MAX_QUESTIONS = 10
+
+
+async def _open_form_page(interaction, key, page):
+    """Open the modal for one page (5 questions) of a ticket form. Called as the
+    response to the Form button (page 0) or a 'Continue' button (later pages)."""
+    open_comps = form_msgs.get(key) or []
+    questions = _parse_questions(open_comps, limit=FORM_MAX_QUESTIONS)
+    start = page * FORM_PAGE_SIZE
+    page_qs = questions[start:start + FORM_PAGE_SIZE]
+    if not page_qs:
+        return
+    total_pages = (len(questions) + FORM_PAGE_SIZE - 1) // FORM_PAGE_SIZE
+    components = []
+    for j, q in enumerate(page_qs):
+        idx = start + j
+        components.append({
+            "type": 18,  # Label — carries the field label
+            "label": (_clean_label(q) or q)[:45],
+            "component": {
+                "type": 4, "custom_id": f"q{idx}", "style": _form_input_style(q),
+                "required": True, "max_length": 1000,
+            },
+        })
+    title = (form_titles.get(key) or "Application")
+    if total_pages > 1:
+        title = f"{title} ({page + 1}/{total_pages})"
+    data = {"title": title[:45], "custom_id": f"ticketform:{key}|{page}", "components": components}
+    route = discord.http.Route(
+        "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+        interaction_id=interaction.id, interaction_token=interaction.token,
+    )
+    await bot.http.request(route, json={"type": 9, "data": data})
 
 
 def _form_input_style(label):
@@ -2429,7 +2486,7 @@ async def open_ticket_form(interaction, key):
     """A Form button/option: pop a modal to collect {Question:} answers, then
     open the ticket with those answers filled into the designed message."""
     open_comps = form_msgs.get(key) or []
-    questions = _parse_questions(open_comps)
+    questions = _parse_questions(open_comps, limit=FORM_MAX_QUESTIONS)
     if not questions:
         # No questions defined — behave exactly like a Ticket button.
         await open_ticket(interaction, f"ticket_form:{key}", open_comps_override=open_comps)
@@ -2453,30 +2510,11 @@ async def open_ticket_form(interaction, key):
                 pass
             return
 
-    components = []
-    for i, q in enumerate(questions):
-        components.append({
-            "type": 18,  # Label — carries the field label
-            "label": (_clean_label(q) or q)[:45],
-            "component": {
-                "type": 4,  # text input (no own label when inside a Label)
-                "custom_id": f"q{i}",
-                "style": _form_input_style(q),
-                "required": True,
-                "max_length": 1000,
-            },
-        })
-    data = {
-        "title": (form_titles.get(key) or "Application")[:45],
-        "custom_id": f"ticketform:{key}",
-        "components": components,
-    }
+    # Start fresh, then open page 1 of the form (up to 5 questions per page,
+    # continued with a button if there are more — Discord caps a modal at 5).
+    _pending_form_answers.pop((interaction.user.id, key), None)
     try:
-        route = discord.http.Route(
-            "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
-            interaction_id=interaction.id, interaction_token=interaction.token,
-        )
-        await bot.http.request(route, json={"type": 9, "data": data})
+        await _open_form_page(interaction, key, 0)
     except Exception as e:
         print(f"[Ticket] form modal failed: {e}")
         try:
@@ -2485,18 +2523,44 @@ async def open_ticket_form(interaction, key):
             pass
 
 
-async def handle_ticket_form_submit(interaction, key):
-    # Acknowledge the modal IMMEDIATELY (before any work) so Discord never shows
-    # "Something went wrong" — then build the ticket and follow up.
+async def handle_ticket_form_submit(interaction, key, page=0):
+    open_comps = form_msgs.get(key) or []
+    questions = _parse_questions(open_comps, limit=FORM_MAX_QUESTIONS)
+    total_pages = (len(questions) + FORM_PAGE_SIZE - 1) // FORM_PAGE_SIZE
+
+    # Stash this page's answers (keyed to the member so pages accumulate).
+    vals = _collect_modal_values((interaction.data or {}).get("components"))
+    pend = _pending_form_answers.setdefault((interaction.user.id, key), {})
+    start = page * FORM_PAGE_SIZE
+    for j, q in enumerate(questions[start:start + FORM_PAGE_SIZE]):
+        pend[q] = (vals.get(f"q{start + j}") or "").strip()
+
+    # More questions to go — offer a Continue button that opens the next modal
+    # (button -> modal is always allowed, unlike modal -> modal).
+    if page + 1 < total_pages:
+        remaining = len(questions) - (page + 1) * FORM_PAGE_SIZE
+        row = {"type": 1, "components": [{
+            "type": 2, "style": 1, "custom_id": f"formcont:{key}|{page + 1}", "label": "Continue",
+        }]}
+        data = {"flags": 1 << 6,
+                "content": f"Saved — **{remaining}** more question{'s' if remaining != 1 else ''} to go. Tap **Continue**.",
+                "components": [row]}
+        try:
+            route = discord.http.Route(
+                "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+                interaction_id=interaction.id, interaction_token=interaction.token)
+            await bot.http.request(route, json={"type": 4, "data": data})
+        except Exception as e:
+            print(f"[Ticket] form continue prompt failed: {e}")
+        return
+
+    # Last page — acknowledge, then build the ticket with ALL collected answers.
     try:
         await interaction.response.defer(ephemeral=True, thinking=True)
     except Exception as e:
         print(f"[Ticket] form submit defer failed: {e}")
     try:
-        open_comps = form_msgs.get(key) or []
-        labels = _parse_questions(open_comps)
-        vals = _collect_modal_values((interaction.data or {}).get("components"))
-        mapping = {lbl: (vals.get(f"q{i}") or "").strip() for i, lbl in enumerate(labels)}
+        mapping = dict(_pending_form_answers.pop((interaction.user.id, key), {}))
         substituted = _apply_answers(open_comps, mapping)
         await open_ticket(interaction, f"ticket_form:{key}", open_comps_override=substituted,
                           category_name_override=ticket_categories.get(key), access_names_override=ticket_access.get(key), already_responded=True)
