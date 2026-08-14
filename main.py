@@ -165,29 +165,44 @@ def _order_status_for(guild, svc):
     return (order_status_config.get("emoji_open") or "", order_status_config.get("label_open") or "Open")
 
 
+_ORDER_TOKEN_RE = re.compile(r"\{([^{}]+)\}")
+
+
 def _render_order_tokens(text, guild):
     """Replace per-service status tokens anywhere in text. For a service named
-    'Liveries' (slug 'liveries'):
+    'Liveries':
       {liveries}       -> 'Liveries — <emoji> <label>'   (name + live status)
       {liveriesstatus} -> '<emoji> <label>'              (status only)
-    Emojis stay as :shortcodes: here — _render_guild_text resolves them after."""
+    Matching is case- and space-insensitive, so {Liveries}, { Clothing } and
+    {GFX} all resolve. Emojis stay as :shortcodes: — _render_guild_text resolves
+    them after."""
     if not (guild and isinstance(text, str)) or "{" not in text:
         return text
+    by_slug = {}
     for svc in (order_status_config.get("services") or []):
-        slug = _order_slug(svc.get("name"))
-        if not slug:
-            continue
-        tok_status = "{" + slug + "status}"
-        tok_full = "{" + slug + "}"
-        if tok_status not in text and tok_full not in text:
-            continue
+        s = _order_slug(svc.get("name"))
+        if s:
+            by_slug[s] = svc
+    if not by_slug:
+        return text
+
+    def _sub(m):
+        key = _order_slug(m.group(1))  # lowercase, letters+digits only
+        status_only = False
+        svc = by_slug.get(key)
+        if svc is None and key.endswith("status"):
+            svc = by_slug.get(key[:-6])
+            status_only = True
+        if svc is None:
+            return m.group(0)  # not one of ours — leave it exactly as typed
         emoji, lbl = _order_status_for(guild, svc)
-        status_only = f"{emoji} {lbl}".strip()
+        status = f"{emoji} {lbl}".strip()
+        if status_only:
+            return status
         name = svc.get("name") or ""
-        name_status = f"{name} — {status_only}".strip() if status_only else name
-        text = text.replace(tok_status, status_only)
-        text = text.replace(tok_full, name_status)
-    return text
+        return f"{name} — {status}".strip() if status else name
+
+    return _ORDER_TOKEN_RE.sub(_sub, text)
 
 
 def _msg_key(open_components, label=""):
