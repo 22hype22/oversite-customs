@@ -114,6 +114,38 @@ active_giveaways = {}
 # panel via the {stock} token and decremented as members buy.
 robux_locker_config = {"channel_id": "", "components": [], "panel_ref": None, "stock": 0, "last_funds": 0, "rate_per_1k": 0.0}
 
+# ---- Order Status ----
+# Configured in the dashboard "Order Status" block. An "Order Status" button
+# shows a live embed: each service is Open / Oversite+ only / Closed based on how
+# many order tickets are open in that service's category.
+order_status_config = {
+    "title": "Order Status",
+    "limited_at": 8, "closed_at": 10,
+    "emoji_open": "", "label_open": "Open",
+    "emoji_limited": "", "label_limited": "Oversite+ Only",
+    "emoji_closed": "", "label_closed": "Closed",
+    "services": [],  # list of {"name", "category"}
+}
+
+
+def _parse_order_services(raw):
+    """Parse the dashboard textarea (one 'Name = Category' per line) into a list
+    of {name, category}. A line with no '=' uses the name as the category too."""
+    out = []
+    for line in str(raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "=" in line:
+            name, cat = line.split("=", 1)
+            name, cat = name.strip(), cat.strip()
+        else:
+            name, cat = line, line
+        if name:
+            out.append({"name": name, "category": cat or name})
+    return out
+
+
 def _msg_key(open_components, label=""):
     raw = json.dumps(open_components or [], sort_keys=True) + "|" + (label or "")
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
@@ -1636,6 +1668,50 @@ async def handle_notify_click(interaction, ids_csv):
         pass
 
 
+async def show_order_status(interaction):
+    """Order Status button — live embed of each service's open/limited/closed
+    state based on how many order tickets are open in its category."""
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+    guild = interaction.guild
+    if not guild:
+        await interaction.followup.send(embed=error_embed("Unavailable", "This only works inside a server."), ephemeral=True)
+        return
+    limited_at = int(order_status_config.get("limited_at") or 8)
+    closed_at = int(order_status_config.get("closed_at") or 10)
+    services = order_status_config.get("services") or []
+
+    # Emojis are entered as :shortcode: (or a normal emoji) in the dashboard;
+    # resolve them against this guild's custom emojis, same as button labels.
+    e_open = _render_guild_text(order_status_config.get("emoji_open") or "", guild)
+    e_lim = _render_guild_text(order_status_config.get("emoji_limited") or "", guild)
+    e_clo = _render_guild_text(order_status_config.get("emoji_closed") or "", guild)
+    l_open = order_status_config.get("label_open") or "Open"
+    l_lim = order_status_config.get("label_limited") or "Oversite+ Only"
+    l_clo = order_status_config.get("label_closed") or "Closed"
+
+    lines = []
+    for svc in services:
+        name = svc.get("name") or ""
+        cat = svc.get("category") or name
+        count = _open_ticket_count_for_category(guild, cat)
+        if count >= closed_at:
+            emoji, lbl = e_clo, l_clo
+        elif count >= limited_at:
+            emoji, lbl = e_lim, l_lim
+        else:
+            emoji, lbl = e_open, l_open
+        prefix = f"{emoji} " if emoji else ""
+        lines.append(f"{prefix}**{name}** — {lbl}")
+
+    title = order_status_config.get("title") or "Order Status"
+    desc = "\n".join(lines) if lines else "No services are configured yet."
+    e = discord.Embed(title=title, description=desc)
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
 def _parse_gw_cid(raw):
     """Split the Enter button's custom_id payload ('gid' or 'gid|end_ts|winners')."""
     parts = str(raw).split("|")
@@ -1829,6 +1905,8 @@ async def on_interaction(interaction: discord.Interaction):
         await handle_robux_buy_click(interaction)
     elif cid.startswith("notifyrole:"):
         await handle_notify_click(interaction, cid.split(":", 1)[1])
+    elif cid == "orderstatus":
+        await show_order_status(interaction)
 
 
 def _ticket_topic(opener_id, category, base=""):
@@ -1901,6 +1979,23 @@ def _user_ticket_count_for(guild, user_id, cat_name, fallback_cat_channel):
             ch_id = ch.category.id if ch.category else None
             if ch_id == fb_id:
                 count += 1
+    return count
+
+
+def _open_ticket_count_for_category(guild, cat_name):
+    """Count ALL open order tickets in one Discord category (any opener). Used by
+    the Order Status embed to decide open/limited/closed per service."""
+    target = (cat_name or "").strip().lower()
+    if not (guild and target):
+        return 0
+    count = 0
+    for ch in guild.text_channels:
+        topic = ch.topic or ""
+        if not topic.startswith("ticket|"):
+            continue
+        ch_cat = ch.category.name.strip().lower() if ch.category else ""
+        if ch_cat == target:
+            count += 1
     return count
 
 
@@ -2794,6 +2889,9 @@ def build_button(btn, guild):
         ids = ",".join(str(r.id) for r in role_objs)
         cid = f"notifyrole:{ids}"[:100]
         return _btn({"type": 2, "label": (label[:80] or "Notify me"), "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": cid})
+    if btn.get("orderstatus"):
+        # Order Status button — shows a live per-service open/limited/closed embed.
+        return _btn({"type": 2, "label": (label[:80] or "Order Status"), "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": "orderstatus"})
     if btn.get("__verify"):
         return _btn({"type": 2, "label": (label[:80] or "Verify"), "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": "roblox_verify"})
     if btn.get("__ticket_open"):
@@ -3029,6 +3127,24 @@ async def apply_config(feature, cfg, post_panel=False):
         # Post/refresh the panel on a save (deliberate action), not on boot.
         if post_panel:
             await post_robux_locker_panel()
+    elif feature in ("order-status", "customs-order-status"):
+        order_status_config["title"] = str(cfg.get("title") or "Order Status")
+        try:
+            order_status_config["limited_at"] = int(cfg.get("limited_at") or 8)
+        except Exception:
+            order_status_config["limited_at"] = 8
+        try:
+            order_status_config["closed_at"] = int(cfg.get("closed_at") or 10)
+        except Exception:
+            order_status_config["closed_at"] = 10
+        order_status_config["emoji_open"] = str(cfg.get("emoji_open") or "")
+        order_status_config["label_open"] = str(cfg.get("label_open") or "Open")
+        order_status_config["emoji_limited"] = str(cfg.get("emoji_limited") or "")
+        order_status_config["label_limited"] = str(cfg.get("label_limited") or "Oversite+ Only")
+        order_status_config["emoji_closed"] = str(cfg.get("emoji_closed") or "")
+        order_status_config["label_closed"] = str(cfg.get("label_closed") or "Closed")
+        order_status_config["services"] = _parse_order_services(cfg.get("services"))
+        print(f"[Config] order-status — {len(order_status_config['services'])} services limited@{order_status_config['limited_at']} closed@{order_status_config['closed_at']}")
     elif feature == "invite":
         if cfg.get("channel_id"):
             invite_config["channel_id"] = str(cfg["channel_id"])
