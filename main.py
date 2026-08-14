@@ -839,10 +839,19 @@ def _giveaway_can_manage(member):
     return has_any_role(member, giveaway_config.get("manager_role_ids", []))
 
 
-def _giveaway_button(gid, disabled=False):
+def _gw_cid(g, gid):
+    """Enter-button custom_id carrying the giveaway's end time + winner count, so
+    the bot can re-adopt a running giveaway after a redeploy without any storage."""
+    try:
+        return f"gw:{gid}|{int(g['end_ts'])}|{int(g['winners'])}"
+    except Exception:
+        return f"gw:{gid}"
+
+
+def _giveaway_button(g, gid, disabled=False):
     label = str(giveaway_config.get("button_label") or "🎉 Enter")
     label, emoji = _extract_button_emoji(label)
-    btn = {"type": 2, "style": 1, "custom_id": f"gw:{gid}", "disabled": bool(disabled)}
+    btn = {"type": 2, "style": 1, "custom_id": _gw_cid(g, gid), "disabled": bool(disabled)}
     if label:
         btn["label"] = label[:80]
     if emoji:
@@ -888,8 +897,8 @@ def build_giveaway_embed(g, ended=False, winner_ids=None):
     return embed
 
 
-def _giveaway_action_row(gid, ended=False):
-    row = {"type": 1, "components": [_giveaway_button(gid, disabled=ended)]}
+def _giveaway_action_row(g, gid, ended=False):
+    row = {"type": 1, "components": [_giveaway_button(g, gid, disabled=ended)]}
     if ended:
         row["components"].append({"type": 2, "style": 2, "custom_id": f"gwreroll:{gid}", "label": "Reroll"})
     return row
@@ -981,7 +990,7 @@ def _giveaway_render_design(g, gid, guild, ended=False, winner_ids=None):
         found = False
         if isinstance(node, dict):
             if node.get("type") == 2 and str(node.get("custom_id", "")).startswith("gw:__COUNTER__"):
-                node["custom_id"] = f"gw:{gid}"
+                node["custom_id"] = _gw_cid(g, gid)
                 if ended:
                     node["disabled"] = True
                 found = True
@@ -1001,7 +1010,7 @@ def _giveaway_render_design(g, gid, guild, ended=False, winner_ids=None):
         if ended:
             built.append({"type": 1, "components": [{"type": 2, "style": 2, "custom_id": f"gwreroll:{gid}", "label": "Reroll"}]})
     else:
-        built.append(_giveaway_action_row(gid, ended))
+        built.append(_giveaway_action_row(g, gid, ended))
     return built
 
 
@@ -1016,7 +1025,7 @@ def _giveaway_payload(g, gid, guild, ended=False, winner_ids=None, for_edit=Fals
             payload["allowed_mentions"] = {"parse": ["roles", "users"]}
         return payload
     embed = build_giveaway_embed(g, ended=ended, winner_ids=winner_ids)
-    payload = {"embeds": [embed.to_dict()], "components": [_giveaway_action_row(gid, ended)]}
+    payload = {"embeds": [embed.to_dict()], "components": [_giveaway_action_row(g, gid, ended)]}
     if not for_edit:
         payload["allowed_mentions"] = {"parse": ["roles", "users"]}
         ping = str(giveaway_config.get("ping") or "").strip()
@@ -1102,11 +1111,14 @@ async def end_giveaway(gid, actor_id=None):
 
     if channel:
         jump = f"https://discord.com/channels/{g['guild_id']}/{g['channel_id']}/{g['message_id']}"
+        prize = (g.get("prize") or "").strip()
+        won = f"You won **{prize}**" if prize else "You won"
+        for_prize = f" for **{prize}**" if prize else ""
         if winner_ids:
             mentions = ", ".join(f"<@{w}>" for w in winner_ids)
-            text = f"🎉 Congratulations {mentions}! You won **{g['prize']}**.\n{jump}"
+            text = f"🎉 Congratulations {mentions}! {won}.\n{jump}"
         else:
-            text = f"No one entered the giveaway for **{g['prize']}**, so no winner was drawn.\n{jump}"
+            text = f"No one entered the giveaway{for_prize}, so no winner was drawn.\n{jump}"
         try:
             await channel.send(text, allowed_mentions=discord.AllowedMentions(users=True))
         except Exception as e:
@@ -1265,10 +1277,44 @@ async def giveaway_cmd(interaction: discord.Interaction):
             pass
 
 
-async def giveaway_enter(interaction, gid):
+def _parse_gw_cid(raw):
+    """Split the Enter button's custom_id payload ('gid' or 'gid|end_ts|winners')."""
+    parts = str(raw).split("|")
+    gid = parts[0]
+    end_ts = int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else None
+    winners = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+    return gid, end_ts, winners
+
+
+async def _giveaway_adopt(interaction, gid, end_ts, winners):
+    """Rebuild a running giveaway the process lost on restart, from the button's
+    encoded end time/winners + the message it's on, then reschedule its end. This
+    is what makes a live giveaway survive a redeploy without any storage."""
+    if end_ts is None:
+        return None
+    msg = getattr(interaction, "message", None)
+    g = {
+        "message_id": str(msg.id) if msg else None,
+        "channel_id": str(interaction.channel.id),
+        "guild_id": str(getattr(interaction.guild, "id", "") or ""),
+        "prize": "", "winners": max(1, winners or 1), "end_ts": int(end_ts),
+        "length": "", "host_id": "", "entrants": set(), "ended": False, "design": None,
+    }
+    active_giveaways[gid] = g
+    remaining = int(end_ts) - int(time.time())
+    asyncio.create_task(end_giveaway(gid) if remaining <= 0 else _giveaway_timer(gid, remaining))
+    print(f"[Giveaway] re-adopted {gid} after restart (ends in {remaining}s)")
+    return g
+
+
+async def giveaway_enter(interaction, raw):
+    gid, end_ts, winners = _parse_gw_cid(raw)
     g = active_giveaways.get(gid)
     if not g:
-        await interaction.response.send_message(embed=error_embed("Giveaway unavailable", "This giveaway is no longer active (the bot may have restarted)."), ephemeral=True)
+        # Lost on restart — rebuild from the button so it never breaks.
+        g = await _giveaway_adopt(interaction, gid, end_ts, winners)
+    if not g:
+        await interaction.response.send_message(embed=error_embed("Giveaway unavailable", "This giveaway is no longer active."), ephemeral=True)
         return
     if g.get("ended"):
         await interaction.response.send_message(embed=error_embed("Giveaway ended", "This giveaway has already ended."), ephemeral=True)
@@ -1276,10 +1322,10 @@ async def giveaway_enter(interaction, gid):
     uid = str(interaction.user.id)
     if uid in g["entrants"]:
         g["entrants"].discard(uid)
-        msg = "You've **left** the giveaway."
+        msg = "Giveaway Left"
     else:
         g["entrants"].add(uid)
-        msg = "You're **entered**! 🎉 Click again to leave."
+        msg = "Giveaway Entered"
     await interaction.response.send_message(msg, ephemeral=True)
     await _giveaway_refresh_count(gid)
 
@@ -1301,8 +1347,10 @@ async def giveaway_reroll(interaction, gid):
     mentions = ", ".join(f"<@{w}>" for w in winners)
     channel = await resolve_channel(g["channel_id"])
     if channel:
+        prize = (g.get("prize") or "").strip()
+        for_prize = f" for **{prize}**" if prize else ""
         try:
-            await channel.send(f"🎉 Reroll! New winner{'s' if len(winners) != 1 else ''} for **{g['prize']}**: {mentions}", allowed_mentions=discord.AllowedMentions(users=True))
+            await channel.send(f"🎉 Reroll! New winner{'s' if len(winners) != 1 else ''}{for_prize}: {mentions}", allowed_mentions=discord.AllowedMentions(users=True))
         except Exception:
             pass
 
@@ -2940,7 +2988,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
