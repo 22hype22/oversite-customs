@@ -171,8 +171,8 @@ _ORDER_TOKEN_RE = re.compile(r"\{([^{}]+)\}")
 def _render_order_tokens(text, guild):
     """Replace per-service status tokens anywhere in text. For a service named
     'Liveries':
-      {liveries}       -> 'Liveries — <emoji> <label>'   (name + live status)
-      {liveriesstatus} -> '<emoji> <label>'              (status only)
+      {liveries}       -> just the status ICON (e.g. 🟢)
+      {liveriesstatus} -> icon + word (e.g. '🟢 Open')
     Matching is case- and space-insensitive, so {Liveries}, { Clothing } and
     {GFX} all resolve. Emojis stay as :shortcodes: — _render_guild_text resolves
     them after."""
@@ -196,11 +196,11 @@ def _render_order_tokens(text, guild):
         if svc is None:
             return m.group(0)  # not one of ours — leave it exactly as typed
         emoji, lbl = _order_status_for(guild, svc)
-        status = f"{emoji} {lbl}".strip()
+        emoji = (emoji or "").strip()
         if status_only:
-            return status
-        name = svc.get("name") or ""
-        return f"{name} — {status}".strip() if status else name
+            return f"{emoji} {lbl}".strip()
+        # Default token = ICON ONLY (falls back to the word if no emoji is set).
+        return emoji or lbl
 
     return _ORDER_TOKEN_RE.sub(_sub, text)
 
@@ -525,9 +525,17 @@ _FULL_EMOJI_RE = re.compile(r"<a?:[a-zA-Z0-9_]+:\d+>")
 
 
 def _resolve_emoji_shortcodes(text, guild):
-    if ":" not in text or not guild:
+    if ":" not in text:
         return text
-    lookup = {e.name.lower(): e for e in guild.emojis}
+    lookup = {e.name.lower(): e for e in (guild.emojis if guild else [])}
+    # Bots can use custom emojis from ANY server they're in, so fall back to the
+    # bot's full emoji set (e.g. a shared emoji server) for anything not found in
+    # this guild. This is why an :emoji: from another server still renders.
+    try:
+        for e in bot.emojis:
+            lookup.setdefault(e.name.lower(), e)
+    except Exception:
+        pass
     if not lookup:
         return text
 
@@ -1745,14 +1753,20 @@ async def show_order_status(interaction):
     for svc in services:
         name = svc.get("name") or ""
         emoji, lbl = _order_status_for(guild, svc)
-        prefix = f"{emoji} " if emoji else ""
-        lines.append(f"{prefix}**{name}** — {lbl}")
+        emoji = (emoji or "").strip()
+        # Icon + name (no status word). Falls back to the word if no emoji is set.
+        lines.append(f"{emoji} **{name}**".strip() if emoji else f"**{name}** — {lbl}")
 
     title = order_status_config.get("title") or "Order Status"
     desc = "\n".join(lines) if lines else "No services are configured yet."
     # Resolve any :emoji: shortcodes in the assembled text.
     e = discord.Embed(title=_render_guild_text(title, guild), description=_render_guild_text(desc, guild))
     await interaction.followup.send(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="status", description="Show the current order status")
+async def status_cmd(interaction: discord.Interaction):
+    await show_order_status(interaction)
 
 
 def _parse_gw_cid(raw):
