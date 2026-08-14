@@ -1376,6 +1376,21 @@ async def _cmd_reroll(message):
 
 
 @bot.event
+async def on_raw_message_delete(payload):
+    """The giveaway message lives forever on its own — the bot only ever edits it.
+    The one thing that ends a giveaway's tracking is the message being MANUALLY
+    deleted: when that happens, drop the giveaway so nothing tries to edit a gone
+    message and its end timer becomes a no-op."""
+    mid = str(getattr(payload, "message_id", ""))
+    if not mid:
+        return
+    for gid, g in list(active_giveaways.items()):
+        if str(g.get("message_id")) == mid:
+            active_giveaways.pop(gid, None)
+            print(f"[Giveaway] {gid} message {mid} was deleted — dropped from tracking")
+
+
+@bot.event
 async def on_interaction(interaction: discord.Interaction):
     # Form submits arrive as modal_submit interactions (not component). Handle
     # ours here; leave every other modal (Close Order, etc.) to discord.py's own
