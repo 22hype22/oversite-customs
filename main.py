@@ -112,7 +112,7 @@ active_giveaways = {}
 # Panel designed in the dashboard "Robux Locker" block. Members buy Robux from it.
 # `stock` = Available Stock (Robux staff allocated via /robuxlocker); shown on the
 # panel via the {stock} token and decremented as members buy.
-robux_locker_config = {"channel_id": "", "components": [], "panel_ref": None, "stock": 0, "last_funds": 0}
+robux_locker_config = {"channel_id": "", "components": [], "panel_ref": None, "stock": 0, "last_funds": 0, "rate_per_1k": 0.0}
 
 def _msg_key(open_components, label=""):
     raw = json.dumps(open_components or [], sort_keys=True) + "|" + (label or "")
@@ -1350,6 +1350,53 @@ async def robuxlocker_cmd(interaction: discord.Interaction):
         await interaction.followup.send(embed=info_embed("Group funds", f"Available: **{funds:,}** Robux. Run the command again to stock."), ephemeral=True)
 
 
+class RobuxRateModal(discord.ui.Modal):
+    """Set the sell rate — USD charged per 1,000 Robux."""
+    def __init__(self, current=0.0):
+        super().__init__(title="Robux Locker Rate", timeout=300)
+        self.rate = discord.ui.TextInput(
+            style=discord.TextStyle.short, required=True, max_length=12,
+            placeholder="e.g. $7",
+            default=(f"{current:g}" if current else ""),
+        )
+        self.add_item(discord.ui.Label(
+            text="Rate per 1,000 Robux (USD)",
+            description="For every 1,000 Robux, what does a member pay? e.g. $7",
+            component=self.rate,
+        ))
+
+    async def on_submit(self, interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            rate = float(re.sub(r"[^0-9.]", "", str(self.rate.value or "0")) or "0")
+        except Exception:
+            rate = 0.0
+        if rate <= 0:
+            await interaction.followup.send(embed=error_embed("Invalid rate", "Enter a dollar amount above 0, like $7."), ephemeral=True)
+            return
+        res = await _robux_locker_call("set_rate", rate)
+        if not (isinstance(res, dict) and res.get("ok")):
+            err = (res or {}).get("error", "Unknown error")
+            await interaction.followup.send(embed=error_embed("Couldn't save the rate", str(err)[:400]), ephemeral=True)
+            return
+        robux_locker_config["rate_per_1k"] = float(res.get("rate_per_1k") or rate)
+        r = robux_locker_config["rate_per_1k"]
+        await interaction.followup.send(
+            embed=success_embed("Rate saved", f"Members now pay **${r:,.2f}** per **1,000** Robux.\nExample: 1,000 Robux = **${r:,.2f}**, 5,000 = **${r*5:,.2f}**."),
+            ephemeral=True)
+
+
+@bot.tree.command(name="robuxlockerrate", description="Set the Robux sell rate (USD per 1,000 Robux)")
+async def robuxlockerrate_cmd(interaction: discord.Interaction):
+    if not _robux_can_manage(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "Only staff can set the rate."), ephemeral=True)
+        return
+    try:
+        await interaction.response.send_modal(RobuxRateModal(float(robux_locker_config.get("rate_per_1k") or 0)))
+    except Exception as e:
+        print(f"[RobuxLocker] rate modal open failed: {e!r}")
+
+
 async def _open_robux_stock_modal(interaction, funds):
     components = [
         {"type": 18, "label": "Amount (Robux)", "description": f"Available: {funds:,}. Can't exceed this.",
@@ -1411,12 +1458,6 @@ async def _open_robux_buy_modal(interaction):
     components = [
         {"type": 18, "label": "How much Robux?",
          "component": {"type": 4, "custom_id": "amount", "style": 1, "required": True, "max_length": 12, "placeholder": "e.g. 1000"}},
-        {"type": 18, "label": "Payment",
-         "component": {"type": 3, "custom_id": "method", "min_values": 1, "max_values": 1, "options": [
-             {"label": "Stripe (card)", "value": "stripe", "default": True},
-             {"label": "Gamepass (Robux)", "value": "gamepass"},
-             {"label": "Shirt (Robux)", "value": "shirt"},
-         ]}},
     ]
     data = {"title": "Buy Robux", "custom_id": "robuxbuyform", "components": components}
     route = discord.http.Route("POST", "/interactions/{interaction_id}/{interaction_token}/callback",
@@ -1448,13 +1489,25 @@ async def handle_robux_buy_submit(interaction):
     reserved = 0
     try:
         vals = _modal_values((interaction.data or {}).get("components"))
-        method = (vals.get("method") or "stripe").lower()
+        # Robux is sold for money only — you can't pay for Robux with Robux, so
+        # the only method is Stripe (card).
+        method = "stripe"
         try:
             amount = int(re.sub(r"[^0-9]", "", str(vals.get("amount") or "0")) or "0")
         except Exception:
             amount = 0
         if amount <= 0:
             await interaction.followup.send(embed=error_embed("Invalid amount", "Enter a number above 0."), ephemeral=True)
+            return
+        # Price it from the sell rate (USD per 1,000 Robux). No rate = not for
+        # sale yet — staff must run /robuxlockerrate first.
+        rate = float(robux_locker_config.get("rate_per_1k") or 0)
+        if rate <= 0:
+            await interaction.followup.send(embed=error_embed("Not for sale yet", "Pricing isn't set. A staff member needs to run `/robuxlockerrate` first."), ephemeral=True)
+            return
+        price = round(amount / 1000.0 * rate, 2)
+        if price <= 0:
+            await interaction.followup.send(embed=error_embed("Amount too small", "That works out to $0.00 — buy a larger amount."), ephemeral=True)
             return
         # Reserve the stock FIRST — first come, first served. If someone already
         # took it, take_stock returns ok:false and nothing is reserved.
@@ -1468,12 +1521,12 @@ async def handle_robux_buy_submit(interaction):
         reserved = amount
         robux_locker_config["stock"] = int(res.get("stock") or 0)
         await _robux_update_panel()
-        # Build the payment link for what they're paying.
-        pay = await create_payment(method, 1, amount)
+        # Build the Stripe payment link priced from the rate.
+        pay = await create_payment(method, 1, price)
         if isinstance(pay, dict) and pay.get("ok") and pay.get("url"):
             reserved = 0  # committed — don't refund
             await interaction.followup.send(
-                embed=success_embed("You're first in line", f"**{amount:,} Robux** reserved for you.\n**{pay.get('label', 'Payment')}**\n{pay['url']}\n\nComplete payment to claim it — it's first come, first served."),
+                embed=success_embed("You're first in line", f"**{amount:,} Robux** reserved for you — **${price:,.2f}**.\n{pay['url']}\n\nComplete payment to claim it — it's first come, first served."),
                 ephemeral=True)
         else:
             # Payment link failed — release the reservation back to stock.
@@ -2934,7 +2987,11 @@ async def apply_config(feature, cfg, post_panel=False):
         st = await _robux_locker_call("get_stock")
         if isinstance(st, dict) and st.get("ok"):
             robux_locker_config["stock"] = int(st.get("stock") or 0)
-        print(f"[Config] robux-locker — channel {robux_locker_config['channel_id']} design {len(robux_locker_config['components'])} stock {robux_locker_config['stock']}")
+        # Pull the persisted USD-per-1k rate so Buy Robux can price the Stripe link.
+        rt = await _robux_locker_call("get_rate")
+        if isinstance(rt, dict) and rt.get("ok"):
+            robux_locker_config["rate_per_1k"] = float(rt.get("rate_per_1k") or 0)
+        print(f"[Config] robux-locker — channel {robux_locker_config['channel_id']} design {len(robux_locker_config['components'])} stock {robux_locker_config['stock']} rate ${robux_locker_config['rate_per_1k']}/1k")
         # Post/refresh the panel on a save (deliberate action), not on boot.
         if post_panel:
             await post_robux_locker_panel()
@@ -3183,13 +3240,14 @@ async def _robux_update_panel():
 
 
 async def _robux_locker_call(action, amount=0):
-    """POST to the robux-locker edge function (funds / stock ops)."""
+    """POST to the robux-locker edge function (funds / stock / rate ops).
+    `amount` may be fractional (the rate is dollars per 1k, e.g. 7.5)."""
     try:
         async with httpx.AsyncClient() as client:
             r = await client.post(
                 f"{SUPABASE_FN_URL}/robux-locker",
                 headers=_fn_headers(),
-                json={"action": action, "amount": int(amount)},
+                json={"action": action, "amount": amount},
                 timeout=20,
             )
             data = r.json() if r.content else {}
