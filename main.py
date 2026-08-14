@@ -1425,11 +1425,8 @@ async def funds_cmd(interaction: discord.Interaction, period: app_commands.Choic
         e.add_field(name="Pending", value=f"{int(pending):,} R$", inline=True)
     else:
         e.add_field(name="Pending", value="Unavailable", inline=True)
-        e.add_field(
-            name="​",
-            value="To show Pending, give the bot's group role the “View group revenue” permission.",
-            inline=False,
-        )
+        err = str(res.get("summaryError") or "no detail returned")
+        e.add_field(name="​", value=f"Pending couldn't load:\n`{err[:400]}`", inline=False)
     e.set_footer(text="Available = spendable now · Pending = held from recent sales")
     await interaction.followup.send(embed=e, ephemeral=True)
 
