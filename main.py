@@ -135,8 +135,9 @@ pricing_config = {
     "designer_role_ids": [],
     "currency": "$",
     "title": "Pricing",
-    "services": [],   # list of {"name": str, "items": [str, ...]}
-    "values": {},     # { service_name: { item_name: price_str } }
+    "services": [],     # list of {"name": str, "items": [str, ...]}
+    "values": {},       # { service_name: { item_name: {robux, usd} } }
+    "components": [],   # dashboard-designed /pricing layout ({service}, {pricing} tokens)
 }
 
 
@@ -1866,10 +1867,11 @@ def _price_parts(val):
     return "", str(val or "").strip()
 
 
-def _pricing_embed(si, guild=None):
+def _pricing_lines_text(si):
+    """The pricing list for one service as multi-line text (fills {pricing})."""
     services = pricing_config.get("services") or []
     if si < 0 or si >= len(services):
-        return None
+        return ""
     svc = services[si]
     name = svc.get("name") or ""
     items = svc.get("items") or []
@@ -1885,9 +1887,64 @@ def _pricing_embed(si, guild=None):
             parts.append(f"{cur}{usd}")
         price = " · ".join(parts) if parts else "—"
         lines.append(f"**{item}** — {price}")
+    return "\n".join(lines) if lines else "No items listed for this service yet."
+
+
+def _pricing_embed(si, guild=None):
+    services = pricing_config.get("services") or []
+    if si < 0 or si >= len(services):
+        return None
+    name = services[si].get("name") or ""
     title = pricing_config.get("title") or "Pricing"
-    desc = "\n".join(lines) if lines else "No items listed for this service yet."
-    return discord.Embed(title=f"{title} · {name}", description=_render_guild_text(desc, guild))
+    return discord.Embed(title=f"{title} · {name}",
+                         description=_render_guild_text(_pricing_lines_text(si), guild))
+
+
+def _render_pricing_components(si):
+    """The dashboard-designed /pricing layout with {service} and {pricing}
+    substituted for this service. None if no design is saved."""
+    comps = pricing_config.get("components") or []
+    if not comps:
+        return None
+    services = pricing_config.get("services") or []
+    if si < 0 or si >= len(services):
+        return None
+    name = services[si].get("name") or ""
+    raw = json.dumps(comps)
+    raw = raw.replace("{pricing}", json.dumps(_pricing_lines_text(si))[1:-1])
+    raw = raw.replace("{service}", json.dumps(name)[1:-1])
+    try:
+        return json.loads(raw)
+    except Exception:
+        return comps
+
+
+async def handle_pricing_pick(interaction, si):
+    """A member picked a service in /pricing — post that service's pricing
+    PUBLICLY in the channel (designed layout if set, else a simple embed)."""
+    services = pricing_config.get("services") or []
+    if si < 0 or si >= len(services):
+        await _raw_interaction_reply(interaction, 7, content="Pick a service.",
+                                     components=[_pricing_service_select("pricing_svc")])
+        return
+    name = services[si].get("name") or ""
+    channel = interaction.channel
+    posted = False
+    try:
+        comps = _render_pricing_components(si)
+        if comps and channel:
+            posted = bool(await send_v2_message(channel, comps))
+        elif channel:
+            e = _pricing_embed(si, interaction.guild)
+            if e:
+                await channel.send(embed=e)
+                posted = True
+    except Exception as ex:
+        print(f"[Pricing] post failed: {ex}")
+    content = (f"Posted **{name}** pricing below. Pick another to post it too."
+               if posted else "Couldn't post the pricing — please try again.")
+    await _raw_interaction_reply(interaction, 7, content=content,
+                                 components=[_pricing_service_select("pricing_svc")])
 
 
 async def _ensure_pricing_loaded():
@@ -2253,10 +2310,7 @@ async def on_interaction(interaction: discord.Interaction):
             si = int(vals[0]) if vals else -1
         except Exception:
             si = -1
-        e = _pricing_embed(si, interaction.guild)
-        if e is not None:
-            await _raw_interaction_reply(interaction, 7, content="", embeds=[e.to_dict()],
-                                         components=[_pricing_service_select("pricing_svc")])
+        await handle_pricing_pick(interaction, si)
     elif cid == "setprice_svc":
         vals = (interaction.data or {}).get("values") or []
         try:
@@ -3562,11 +3616,13 @@ async def apply_config(feature, cfg, post_panel=False):
         pricing_config["currency"] = str(cfg.get("currency") or "$")
         pricing_config["title"] = str(cfg.get("title") or "Pricing")
         pricing_config["services"] = _parse_pricing_services(cfg.get("services"))
+        comps = cfg.get("components")
+        pricing_config["components"] = comps if isinstance(comps, list) else []
         # Pull the prices designers have set (persisted server-side).
         res = await _pricing_call("get")
         if isinstance(res, dict) and res.get("ok"):
             pricing_config["values"] = res.get("prices") or {}
-        print(f"[Config] pricing — {len(pricing_config['services'])} services, roles {pricing_config['designer_role_ids']}")
+        print(f"[Config] pricing — {len(pricing_config['services'])} services, design {len(pricing_config['components'])}, roles {pricing_config['designer_role_ids']}")
     elif feature == "invite":
         if cfg.get("channel_id"):
             invite_config["channel_id"] = str(cfg["channel_id"])
