@@ -1403,6 +1403,152 @@ async def handle_robux_stock_submit(interaction, funds):
             pass
 
 
+# ---- Robux Locker: member "Buy Robux" flow ----
+
+async def _open_robux_buy_modal(interaction):
+    """A member clicked Buy Robux — ask how much + how they'll pay. Stock is
+    re-checked authoritatively when they submit (first come, first served)."""
+    components = [
+        {"type": 18, "label": "How much Robux?",
+         "component": {"type": 4, "custom_id": "amount", "style": 1, "required": True, "max_length": 12, "placeholder": "e.g. 1000"}},
+        {"type": 18, "label": "Payment",
+         "component": {"type": 3, "custom_id": "method", "min_values": 1, "max_values": 1, "options": [
+             {"label": "Stripe (card)", "value": "stripe", "default": True},
+             {"label": "Gamepass (Robux)", "value": "gamepass"},
+             {"label": "Shirt (Robux)", "value": "shirt"},
+         ]}},
+    ]
+    data = {"title": "Buy Robux", "custom_id": "robuxbuyform", "components": components}
+    route = discord.http.Route("POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+                               interaction_id=interaction.id, interaction_token=interaction.token)
+    await bot.http.request(route, json={"type": 9, "data": data})
+
+
+async def handle_robux_buy_click(interaction):
+    # The button is rendered disabled when stock is 0, but the panel can be
+    # stale — so if we already know stock is 0, refuse fast; otherwise open the
+    # form and let take_stock be the real gate on submit.
+    if int(robux_locker_config.get("stock") or 0) <= 0:
+        try:
+            await interaction.response.send_message(embed=error_embed("Out of stock", "There's no Robux available right now. Check back soon."), ephemeral=True)
+        except Exception:
+            pass
+        return
+    try:
+        await _open_robux_buy_modal(interaction)
+    except Exception as e:
+        print(f"[RobuxLocker] buy modal open failed: {e}")
+
+
+async def handle_robux_buy_submit(interaction):
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+    reserved = 0
+    try:
+        vals = _modal_values((interaction.data or {}).get("components"))
+        method = (vals.get("method") or "stripe").lower()
+        try:
+            amount = int(re.sub(r"[^0-9]", "", str(vals.get("amount") or "0")) or "0")
+        except Exception:
+            amount = 0
+        if amount <= 0:
+            await interaction.followup.send(embed=error_embed("Invalid amount", "Enter a number above 0."), ephemeral=True)
+            return
+        # Reserve the stock FIRST — first come, first served. If someone already
+        # took it, take_stock returns ok:false and nothing is reserved.
+        res = await _robux_locker_call("take_stock", amount)
+        if not (isinstance(res, dict) and res.get("ok")):
+            have = int((res or {}).get("stock") or 0)
+            await interaction.followup.send(
+                embed=error_embed("Not enough left", f"Only **{have:,}** Robux is available right now — someone may have just bought some."),
+                ephemeral=True)
+            return
+        reserved = amount
+        robux_locker_config["stock"] = int(res.get("stock") or 0)
+        await _robux_update_panel()
+        # Build the payment link for what they're paying.
+        pay = await create_payment(method, 1, amount)
+        if isinstance(pay, dict) and pay.get("ok") and pay.get("url"):
+            reserved = 0  # committed — don't refund
+            await interaction.followup.send(
+                embed=success_embed("You're first in line", f"**{amount:,} Robux** reserved for you.\n**{pay.get('label', 'Payment')}**\n{pay['url']}\n\nComplete payment to claim it — it's first come, first served."),
+                ephemeral=True)
+        else:
+            # Payment link failed — release the reservation back to stock.
+            err = (pay or {}).get("error") if isinstance(pay, dict) else str(pay)
+            await _robux_locker_call("add_stock", reserved)
+            reserved = 0
+            robux_locker_config["stock"] = int(robux_locker_config.get("stock") or 0) + amount
+            await _robux_update_panel()
+            await interaction.followup.send(embed=error_embed("Payment failed", str(err or "Unknown error")[:400]), ephemeral=True)
+    except Exception as e:
+        import traceback
+        print(f"[RobuxLocker] buy submit failed: {e}\n{traceback.format_exc()}")
+        if reserved:
+            try:
+                await _robux_locker_call("add_stock", reserved)
+            except Exception:
+                pass
+        try:
+            await interaction.followup.send(embed=error_embed("Something went wrong", "Please try again."), ephemeral=True)
+        except Exception:
+            pass
+
+
+async def handle_notify_click(interaction, ids_csv):
+    """Notification button — toggle the selected role(s) on the clicker."""
+    guild = interaction.guild
+    member = getattr(interaction, "user", None)
+    if not (guild and isinstance(member, discord.Member)):
+        try:
+            await interaction.response.send_message(embed=error_embed("Unavailable", "This only works inside a server."), ephemeral=True)
+        except Exception:
+            pass
+        return
+    roles = []
+    for rid in str(ids_csv).split(","):
+        rid = rid.strip()
+        if rid.isdigit():
+            r = guild.get_role(int(rid))
+            if r:
+                roles.append(r)
+    if not roles:
+        try:
+            await interaction.response.send_message(embed=error_embed("Not set up", "No roles are attached to this button."), ephemeral=True)
+        except Exception:
+            pass
+        return
+    added, removed = [], []
+    try:
+        for r in roles:
+            if r in member.roles:
+                await member.remove_roles(r, reason="Notification button")
+                removed.append(r.mention)
+            else:
+                await member.add_roles(r, reason="Notification button")
+                added.append(r.mention)
+    except discord.Forbidden:
+        try:
+            await interaction.response.send_message(embed=error_embed("Missing permission", "I can't manage that role — make sure my role is above it."), ephemeral=True)
+        except Exception:
+            pass
+        return
+    except Exception as e:
+        print(f"[Notify] toggle failed: {e}")
+    parts = []
+    if added:
+        parts.append("Added " + ", ".join(added))
+    if removed:
+        parts.append("Removed " + ", ".join(removed))
+    msg = " · ".join(parts) if parts else "No changes."
+    try:
+        await interaction.response.send_message(embed=success_embed("Notifications", msg), ephemeral=True)
+    except Exception:
+        pass
+
+
 def _parse_gw_cid(raw):
     """Split the Enter button's custom_id payload ('gid' or 'gid|end_ts|winners')."""
     parts = str(raw).split("|")
@@ -1533,6 +1679,8 @@ async def on_interaction(interaction: discord.Interaction):
             except Exception:
                 funds = 0
             await handle_robux_stock_submit(interaction, funds)
+        elif cid == "robuxbuyform":
+            await handle_robux_buy_submit(interaction)
         return
     if interaction.type != discord.InteractionType.component:
         return
@@ -1590,6 +1738,10 @@ async def on_interaction(interaction: discord.Interaction):
         except Exception:
             funds = 0
         await _open_robux_stock_modal(interaction, funds)
+    elif cid == "robuxbuy":
+        await handle_robux_buy_click(interaction)
+    elif cid.startswith("notifyrole:"):
+        await handle_notify_click(interaction, cid.split(":", 1)[1])
 
 
 def _ticket_topic(opener_id, category, base=""):
@@ -2543,6 +2695,18 @@ def build_button(btn, guild):
         # Giveaway "Counter" (enter) button. The real custom_id (gw:<gid>) is
         # patched in per-giveaway by _giveaway_render_design.
         return _btn({"type": 2, "label": (label[:80] or "Enter"), "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": "gw:__COUNTER__"})
+    if btn.get("buyrobux"):
+        # Robux Locker "Buy Robux" button. Unclickable (disabled) whenever there
+        # is no Available Stock — members can only buy when there's Robux there.
+        out_of_stock = int(robux_locker_config.get("stock") or 0) <= 0
+        return _btn({"type": 2, "label": (label[:80] or "Buy Robux"), "style": BUTTON_STYLE_MAP.get(style_name, 3), "custom_id": "robuxbuy", "disabled": out_of_stock})
+    if "notify_roles" in btn:
+        # Notification button — clicking toggles the selected role(s) on the
+        # member. Role ids are baked into the custom_id so it survives restarts.
+        role_objs = _resolve_role_names(guild, btn.get("notify_roles"))
+        ids = ",".join(str(r.id) for r in role_objs)
+        cid = f"notifyrole:{ids}"[:100]
+        return _btn({"type": 2, "label": (label[:80] or "Notify me"), "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": cid})
     if btn.get("__verify"):
         return _btn({"type": 2, "label": (label[:80] or "Verify"), "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": "roblox_verify"})
     if btn.get("__ticket_open"):
