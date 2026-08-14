@@ -110,7 +110,9 @@ active_giveaways = {}
 
 # ---- Robux Locker ----
 # Panel designed in the dashboard "Robux Locker" block. Members buy Robux from it.
-robux_locker_config = {"channel_id": "", "components": [], "panel_ref": None}
+# `stock` = Available Stock (Robux staff allocated via /robuxlocker); shown on the
+# panel via the {stock} token and decremented as members buy.
+robux_locker_config = {"channel_id": "", "components": [], "panel_ref": None, "stock": 0, "last_funds": 0}
 
 def _msg_key(open_components, label=""):
     raw = json.dumps(open_components or [], sort_keys=True) + "|" + (label or "")
@@ -1282,6 +1284,125 @@ async def giveaway_cmd(interaction: discord.Interaction):
             pass
 
 
+# ============================ Robux Locker (stocking) ============================
+
+
+def _robux_can_manage(member):
+    try:
+        if member.guild_permissions.manage_guild:
+            return True
+    except Exception:
+        pass
+    return has_any_role(member, ticket_config.get("support_role_ids", []))
+
+
+def _modal_values(components):
+    """Flatten a modal_submit tree into {custom_id: value}, handling both text
+    inputs (value) and selects (values[0])."""
+    out = {}
+    for row in components or []:
+        if not isinstance(row, dict):
+            continue
+        inner = row.get("component")
+        cands = [inner] if isinstance(inner, dict) else []
+        cands += [c for c in (row.get("components") or []) if isinstance(c, dict)]
+        for c in cands:
+            cid = c.get("custom_id")
+            if not cid:
+                continue
+            if "values" in c:
+                vals = c.get("values") or []
+                out[cid] = vals[0] if vals else ""
+            else:
+                out[cid] = c.get("value", "") or ""
+    return out
+
+
+@bot.tree.command(name="robuxlocker", description="Stock the Robux Locker from the group's funds")
+async def robuxlocker_cmd(interaction: discord.Interaction):
+    if not _robux_can_manage(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "Only staff can stock the locker."), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    res = await _robux_locker_call("funds")
+    if not (isinstance(res, dict) and res.get("ok")):
+        err = (res or {}).get("error", "Unknown error")
+        await interaction.followup.send(embed=error_embed("Couldn't read group funds", str(err)[:400]), ephemeral=True)
+        return
+    funds = int(res.get("robux") or 0)
+    robux_locker_config["last_funds"] = funds
+    server_name = getattr(interaction.guild, "name", "The group")
+    row = {"type": 1, "components": [{
+        "type": 2, "style": 1, "custom_id": f"robuxstock:{funds}", "label": "Enter amount",
+    }]}
+    # discord.py's followup.send doesn't take raw components, so send the button
+    # via the raw interaction webhook (flags: ephemeral).
+    try:
+        route = discord.http.Route("POST", "/webhooks/{application_id}/{interaction_token}",
+                                   application_id=bot.application_id, interaction_token=interaction.token)
+        await bot.http.request(route, json={
+            "content": f"**{server_name}** has **{funds:,}** Robux available. How many would you like to use?",
+            "components": [row],
+            "flags": 1 << 6,
+        })
+    except Exception as e:
+        print(f"[RobuxLocker] funds prompt failed: {e}")
+        await interaction.followup.send(embed=info_embed("Group funds", f"Available: **{funds:,}** Robux. Run the command again to stock."), ephemeral=True)
+
+
+async def _open_robux_stock_modal(interaction, funds):
+    components = [
+        {"type": 18, "label": "Amount (Robux)", "description": f"Available: {funds:,}. Can't exceed this.",
+         "component": {"type": 4, "custom_id": "amount", "style": 1, "required": True, "max_length": 12, "placeholder": "e.g. 1000"}},
+        {"type": 18, "label": "Confirm",
+         "component": {"type": 3, "custom_id": "confirm", "min_values": 1, "max_values": 1, "options": [
+             {"label": "No — cancel", "value": "no", "default": True},
+             {"label": "Yes — add to Available Stock", "value": "yes"},
+         ]}},
+    ]
+    data = {"title": "Stock the Robux Locker", "custom_id": f"robuxstockform:{funds}", "components": components}
+    route = discord.http.Route("POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+                               interaction_id=interaction.id, interaction_token=interaction.token)
+    await bot.http.request(route, json={"type": 9, "data": data})
+
+
+async def handle_robux_stock_submit(interaction, funds):
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+    try:
+        vals = _modal_values((interaction.data or {}).get("components"))
+        if (vals.get("confirm") or "no") != "yes":
+            await interaction.followup.send(embed=info_embed("Cancelled", "Nothing was added to Available Stock."), ephemeral=True)
+            return
+        try:
+            amount = int(re.sub(r"[^0-9]", "", str(vals.get("amount") or "0")) or "0")
+        except Exception:
+            amount = 0
+        if amount <= 0:
+            await interaction.followup.send(embed=error_embed("Invalid amount", "Enter a number above 0."), ephemeral=True)
+            return
+        if amount > int(funds):
+            await interaction.followup.send(embed=error_embed("Too high", f"You only have **{int(funds):,}** Robux available."), ephemeral=True)
+            return
+        res = await _robux_locker_call("add_stock", amount)
+        if not (isinstance(res, dict) and res.get("ok")):
+            err = (res or {}).get("error", "Unknown error")
+            await interaction.followup.send(embed=error_embed("Couldn't update stock", str(err)[:400]), ephemeral=True)
+            return
+        robux_locker_config["stock"] = int(res.get("stock") or 0)
+        await _robux_update_panel()
+        await interaction.followup.send(embed=success_embed("Stocked", f"Added **{amount:,}** Robux. Available Stock is now **{robux_locker_config['stock']:,}**."), ephemeral=True)
+    except Exception as e:
+        import traceback
+        print(f"[RobuxLocker] stock submit failed: {e}\n{traceback.format_exc()}")
+        try:
+            await interaction.followup.send(embed=error_embed("Something went wrong", "Please try again."), ephemeral=True)
+        except Exception:
+            pass
+
+
 def _parse_gw_cid(raw):
     """Split the Enter button's custom_id payload ('gid' or 'gid|end_ts|winners')."""
     parts = str(raw).split("|")
@@ -1406,6 +1527,12 @@ async def on_interaction(interaction: discord.Interaction):
             await handle_ticket_form_submit(interaction, cid.split(":", 1)[1])
         elif cid == "giveawayform":
             await handle_giveaway_form_submit(interaction)
+        elif cid.startswith("robuxstockform:"):
+            try:
+                funds = int(cid.split(":", 1)[1])
+            except Exception:
+                funds = 0
+            await handle_robux_stock_submit(interaction, funds)
         return
     if interaction.type != discord.InteractionType.component:
         return
@@ -1457,6 +1584,12 @@ async def on_interaction(interaction: discord.Interaction):
         await start_roblox_verify(interaction)
     elif cid.startswith("gw:"):
         await giveaway_enter(interaction, cid.split(":", 1)[1])
+    elif cid.startswith("robuxstock:"):
+        try:
+            funds = int(cid.split(":", 1)[1])
+        except Exception:
+            funds = 0
+        await _open_robux_stock_modal(interaction, funds)
 
 
 def _ticket_topic(opener_id, category, base=""):
@@ -2633,7 +2766,11 @@ async def apply_config(feature, cfg, post_panel=False):
             robux_locker_config["channel_id"] = str(cfg["channel_id"])
         comps = cfg.get("components")
         robux_locker_config["components"] = comps if isinstance(comps, list) else []
-        print(f"[Config] robux-locker — channel {robux_locker_config['channel_id']} design {len(robux_locker_config['components'])}")
+        # Pull the persisted Available Stock so the panel shows the right number.
+        st = await _robux_locker_call("get_stock")
+        if isinstance(st, dict) and st.get("ok"):
+            robux_locker_config["stock"] = int(st.get("stock") or 0)
+        print(f"[Config] robux-locker — channel {robux_locker_config['channel_id']} design {len(robux_locker_config['components'])} stock {robux_locker_config['stock']}")
         # Post/refresh the panel on a save (deliberate action), not on boot.
         if post_panel:
             await post_robux_locker_panel()
@@ -2819,13 +2956,28 @@ async def _replace_robux_panel(new_channel_id, new_message_id):
             pass
 
 
+def _robux_render_components():
+    """The saved design with live tokens filled in: {stock} = Available Stock,
+    {funds} = the group balance last read by /robuxlocker."""
+    comps = robux_locker_config.get("components") or []
+    if not comps:
+        return None
+    raw = json.dumps(comps)
+    raw = raw.replace("{stock}", str(int(robux_locker_config.get("stock") or 0)))
+    raw = raw.replace("{funds}", str(int(robux_locker_config.get("last_funds") or 0)))
+    try:
+        return json.loads(raw)
+    except Exception:
+        return comps
+
+
 async def post_robux_locker_panel():
     """(Re)post the Robux Locker panel from the dashboard design."""
     ch = await resolve_channel(robux_locker_config.get("channel_id"))
     if not ch:
         print("[RobuxLocker] no channel configured")
         return
-    comps = robux_locker_config.get("components") or []
+    comps = _robux_render_components()
     if not comps:
         print("[RobuxLocker] no design saved — nothing to post")
         return
@@ -2836,6 +2988,52 @@ async def post_robux_locker_panel():
             await _replace_robux_panel(ch.id, mid)
     except Exception as e:
         print(f"[RobuxLocker] panel post failed: {e}")
+
+
+async def _robux_update_panel():
+    """Edit the live panel in place so {stock} reflects the current Available
+    Stock (called after /robuxlocker stocks it or a member buys)."""
+    ref = robux_locker_config.get("panel_ref") or {}
+    mid = ref.get("message_id")
+    ch = await resolve_channel(ref.get("channel_id"))
+    if not (mid and ch):
+        return
+    comps = _robux_render_components()
+    if not comps:
+        return
+    guild = getattr(ch, "guild", None)
+    built = [b for b in (_build_v2(c, guild) for c in comps) if b]
+    if not built:
+        return
+    ALLOWED_TOP = {1, 9, 10, 12, 13, 14, 17}
+    if not {c.get("type") for c in built}.issubset(ALLOWED_TOP):
+        built = [{"type": 17, "components": built}]
+    try:
+        route = discord.http.Route(
+            "PATCH", "/channels/{channel_id}/messages/{message_id}",
+            channel_id=int(ch.id), message_id=int(mid),
+        )
+        await bot.http.request(route, json={"components": built})
+    except Exception as e:
+        print(f"[RobuxLocker] panel update failed: {e}")
+
+
+async def _robux_locker_call(action, amount=0):
+    """POST to the robux-locker edge function (funds / stock ops)."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{SUPABASE_FN_URL}/robux-locker",
+                headers=_fn_headers(),
+                json={"action": action, "amount": int(amount)},
+                timeout=20,
+            )
+            data = r.json() if r.content else {}
+            if r.status_code == 200:
+                return data
+            return {"error": data.get("error") or f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"error": str(e)[:200]}
 
 
 async def _replace_ticket_panel(new_channel_id, new_message_id):
