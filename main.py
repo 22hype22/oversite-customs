@@ -127,6 +127,36 @@ order_status_config = {
     "services": [],  # list of {"name", "category"}
 }
 
+# ---- Pricing ----
+# Structure (services + their items) comes from the dashboard "Pricing" block.
+# Designers fill in the actual prices from Discord via /setpricing; members view
+# them via /pricing. Prices persist server-side (pricing edge function).
+pricing_config = {
+    "designer_role_ids": [],
+    "currency": "$",
+    "title": "Pricing",
+    "services": [],   # list of {"name": str, "items": [str, ...]}
+    "values": {},     # { service_name: { item_name: price_str } }
+}
+
+
+def _parse_pricing_services(raw):
+    """Parse 'Service: item1, item2, item3' lines into [{name, items:[...]}]."""
+    out = []
+    for line in str(raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if ":" in line:
+            name, items_str = line.split(":", 1)
+            name = name.strip()
+            items = [i.strip() for i in items_str.split(",") if i.strip()]
+        else:
+            name, items = line, []
+        if name:
+            out.append({"name": name, "items": items})
+    return out
+
 
 def _parse_order_services(raw):
     """Parse the dashboard textarea (one 'Name = Category' per line) into a list
@@ -1771,6 +1801,216 @@ async def status_cmd(interaction: discord.Interaction):
     await show_order_status(interaction)
 
 
+# ===================== Pricing =====================
+
+async def _pricing_call(action, entries=None):
+    """POST to the pricing edge function (get / set price values)."""
+    payload = {"action": action}
+    if entries is not None:
+        payload["entries"] = entries
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{SUPABASE_FN_URL}/pricing",
+                headers=_fn_headers(), json=payload, timeout=20,
+            )
+            data = r.json() if r.content else {}
+            if r.status_code == 200:
+                return data
+            return {"error": data.get("error") or f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
+def _pricing_can_manage(member):
+    try:
+        if member.guild_permissions.manage_guild:
+            return True
+    except Exception:
+        pass
+    return has_any_role(member, pricing_config.get("designer_role_ids", []))
+
+
+async def _raw_interaction_reply(interaction, resp_type, content=None, embeds=None, components=None, ephemeral=True):
+    """Reply to an interaction with raw components/embeds. resp_type 4 = new
+    message (command), 7 = update the existing message (component click)."""
+    data = {}
+    if ephemeral and resp_type == 4:
+        data["flags"] = 1 << 6
+    if content is not None:
+        data["content"] = content
+    if embeds is not None:
+        data["embeds"] = embeds
+    if components is not None:
+        data["components"] = components
+    route = discord.http.Route(
+        "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+        interaction_id=interaction.id, interaction_token=interaction.token,
+    )
+    await bot.http.request(route, json={"type": resp_type, "data": data})
+
+
+def _pricing_service_select(custom_id):
+    services = pricing_config.get("services") or []
+    options = [{"label": s["name"][:100], "value": str(i)} for i, s in enumerate(services[:25])]
+    return {"type": 1, "components": [{
+        "type": 3, "custom_id": custom_id, "placeholder": "Choose a service", "options": options,
+    }]}
+
+
+def _pricing_embed(si, guild=None):
+    services = pricing_config.get("services") or []
+    if si < 0 or si >= len(services):
+        return None
+    svc = services[si]
+    name = svc.get("name") or ""
+    items = svc.get("items") or []
+    cur = pricing_config.get("currency") or "$"
+    vals = (pricing_config.get("values") or {}).get(name, {})
+    lines = []
+    for item in items:
+        p = str(vals.get(item) or "").strip()
+        price = f"{cur}{p}" if p else "—"
+        lines.append(f"**{item}** — {price}")
+    title = pricing_config.get("title") or "Pricing"
+    desc = "\n".join(lines) if lines else "No items listed for this service yet."
+    return discord.Embed(title=f"{title} · {name}", description=_render_guild_text(desc, guild))
+
+
+@bot.tree.command(name="pricing", description="View pricing for a service")
+async def pricing_cmd(interaction: discord.Interaction):
+    services = pricing_config.get("services") or []
+    if not services:
+        await interaction.response.send_message(embed=info_embed("No pricing", "Pricing isn't set up yet."), ephemeral=True)
+        return
+    try:
+        await _raw_interaction_reply(interaction, 4, content="Pick a service to see its pricing:",
+                                     components=[_pricing_service_select("pricing_svc")])
+    except Exception as e:
+        print(f"[Pricing] /pricing failed: {e}")
+
+
+@bot.tree.command(name="setpricing", description="Set prices for a service (designers only)")
+async def setpricing_cmd(interaction: discord.Interaction):
+    if not _pricing_can_manage(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "Only designers can set pricing."), ephemeral=True)
+        return
+    services = pricing_config.get("services") or []
+    if not services:
+        await interaction.response.send_message(embed=info_embed("No services", "Add services in the dashboard Pricing block first."), ephemeral=True)
+        return
+    try:
+        await _raw_interaction_reply(interaction, 4, content="Pick a service to edit its prices:",
+                                     components=[_pricing_service_select("setprice_svc")])
+    except Exception as e:
+        print(f"[Pricing] /setpricing failed: {e}")
+
+
+async def _open_setprice(interaction, si):
+    services = pricing_config.get("services") or []
+    if si < 0 or si >= len(services):
+        return
+    svc = services[si]
+    name = svc.get("name") or ""
+    items = svc.get("items") or []
+    if not items:
+        await _raw_interaction_reply(interaction, 7, content=f"**{name}** has no items to price.", components=[])
+        return
+    vals = (pricing_config.get("values") or {}).get(name, {})
+    if len(items) <= 5:
+        # One modal, a price field per item.
+        components = []
+        for idx, item in enumerate(items[:5]):
+            components.append({"type": 18, "label": item[:45],
+                "component": {"type": 4, "custom_id": f"p{idx}", "style": 1, "required": False,
+                              "max_length": 20, "value": str(vals.get(item) or ""), "placeholder": "e.g. 15 (blank clears)"}})
+        data = {"title": f"{name} prices"[:45], "custom_id": f"setprice_all:{si}", "components": components}
+        route = discord.http.Route("POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+                                   interaction_id=interaction.id, interaction_token=interaction.token)
+        await bot.http.request(route, json={"type": 9, "data": data})
+    else:
+        # Too many for one modal — pick the item first.
+        options = [{"label": it[:100], "value": str(i)} for i, it in enumerate(items[:25])]
+        row = {"type": 1, "components": [{"type": 3, "custom_id": f"setprice_item:{si}",
+                                          "placeholder": "Pick an item", "options": options}]}
+        await _raw_interaction_reply(interaction, 7, content=f"**{name}** — pick an item to price:", components=[row])
+
+
+async def _open_setprice_one(interaction, si, ii):
+    services = pricing_config.get("services") or []
+    if si < 0 or si >= len(services):
+        return
+    svc = services[si]
+    name = svc.get("name") or ""
+    items = svc.get("items") or []
+    if ii < 0 or ii >= len(items):
+        return
+    item = items[ii]
+    vals = (pricing_config.get("values") or {}).get(name, {})
+    components = [{"type": 18, "label": item[:45],
+        "component": {"type": 4, "custom_id": "price", "style": 1, "required": False,
+                      "max_length": 20, "value": str(vals.get(item) or ""), "placeholder": "e.g. 15 (blank clears)"}}]
+    data = {"title": "Set price"[:45], "custom_id": f"setprice_one:{si}:{ii}", "components": components}
+    route = discord.http.Route("POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+                               interaction_id=interaction.id, interaction_token=interaction.token)
+    await bot.http.request(route, json={"type": 9, "data": data})
+
+
+async def _save_pricing_entries(entries):
+    """Persist price entries and update the in-memory cache."""
+    res = await _pricing_call("set", entries)
+    if isinstance(res, dict) and res.get("ok"):
+        pricing_config["values"] = res.get("prices") or pricing_config.get("values") or {}
+        return True, None
+    return False, (res or {}).get("error", "Unknown error")
+
+
+async def handle_setprice_all_submit(interaction, si):
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+    services = pricing_config.get("services") or []
+    if si < 0 or si >= len(services):
+        return
+    svc = services[si]
+    name = svc.get("name") or ""
+    items = svc.get("items") or []
+    vals = _modal_values((interaction.data or {}).get("components"))
+    entries = []
+    for idx, item in enumerate(items[:5]):
+        price = str(vals.get(f"p{idx}") or "").strip()
+        entries.append({"service": name, "item": item, "price": price})
+    ok, err = await _save_pricing_entries(entries)
+    if not ok:
+        await interaction.followup.send(embed=error_embed("Couldn't save", str(err)[:400]), ephemeral=True)
+        return
+    await interaction.followup.send(embed=_pricing_embed(si, interaction.guild), ephemeral=True)
+
+
+async def handle_setprice_one_submit(interaction, si, ii):
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+    services = pricing_config.get("services") or []
+    if si < 0 or si >= len(services):
+        return
+    svc = services[si]
+    name = svc.get("name") or ""
+    items = svc.get("items") or []
+    if ii < 0 or ii >= len(items):
+        return
+    item = items[ii]
+    vals = _modal_values((interaction.data or {}).get("components"))
+    price = str(vals.get("price") or "").strip()
+    ok, err = await _save_pricing_entries([{"service": name, "item": item, "price": price}])
+    if not ok:
+        await interaction.followup.send(embed=error_embed("Couldn't save", str(err)[:400]), ephemeral=True)
+        return
+    await interaction.followup.send(embed=_pricing_embed(si, interaction.guild), ephemeral=True)
+
+
 def _parse_gw_cid(raw):
     """Split the Enter button's custom_id payload ('gid' or 'gid|end_ts|winners')."""
     parts = str(raw).split("|")
@@ -1903,6 +2143,19 @@ async def on_interaction(interaction: discord.Interaction):
             await handle_robux_stock_submit(interaction, funds)
         elif cid == "robuxbuyform":
             await handle_robux_buy_submit(interaction)
+        elif cid.startswith("setprice_all:"):
+            try:
+                si = int(cid.split(":", 1)[1])
+            except Exception:
+                si = -1
+            await handle_setprice_all_submit(interaction, si)
+        elif cid.startswith("setprice_one:"):
+            parts = cid.split(":")
+            try:
+                si, ii = int(parts[1]), int(parts[2])
+            except Exception:
+                si, ii = -1, -1
+            await handle_setprice_one_submit(interaction, si, ii)
         return
     if interaction.type != discord.InteractionType.component:
         return
@@ -1966,6 +2219,31 @@ async def on_interaction(interaction: discord.Interaction):
         await handle_notify_click(interaction, cid.split(":", 1)[1])
     elif cid == "orderstatus":
         await show_order_status(interaction)
+    elif cid == "pricing_svc":
+        vals = (interaction.data or {}).get("values") or []
+        try:
+            si = int(vals[0]) if vals else -1
+        except Exception:
+            si = -1
+        e = _pricing_embed(si, interaction.guild)
+        if e is not None:
+            await _raw_interaction_reply(interaction, 7, content="", embeds=[e.to_dict()],
+                                         components=[_pricing_service_select("pricing_svc")])
+    elif cid == "setprice_svc":
+        vals = (interaction.data or {}).get("values") or []
+        try:
+            si = int(vals[0]) if vals else -1
+        except Exception:
+            si = -1
+        await _open_setprice(interaction, si)
+    elif cid.startswith("setprice_item:"):
+        vals = (interaction.data or {}).get("values") or []
+        try:
+            si = int(cid.split(":", 1)[1])
+            ii = int(vals[0]) if vals else -1
+        except Exception:
+            si, ii = -1, -1
+        await _open_setprice_one(interaction, si, ii)
 
 
 def _ticket_topic(opener_id, category, base=""):
@@ -3204,6 +3482,16 @@ async def apply_config(feature, cfg, post_panel=False):
         order_status_config["label_closed"] = str(cfg.get("label_closed") or "Closed")
         order_status_config["services"] = _parse_order_services(cfg.get("services"))
         print(f"[Config] order-status — {len(order_status_config['services'])} services limited@{order_status_config['limited_at']} closed@{order_status_config['closed_at']}")
+    elif feature in ("pricing", "customs-pricing"):
+        pricing_config["designer_role_ids"] = [str(x) for x in (cfg.get("designer_role_ids") or []) if x]
+        pricing_config["currency"] = str(cfg.get("currency") or "$")
+        pricing_config["title"] = str(cfg.get("title") or "Pricing")
+        pricing_config["services"] = _parse_pricing_services(cfg.get("services"))
+        # Pull the prices designers have set (persisted server-side).
+        res = await _pricing_call("get")
+        if isinstance(res, dict) and res.get("ok"):
+            pricing_config["values"] = res.get("prices") or {}
+        print(f"[Config] pricing — {len(pricing_config['services'])} services, roles {pricing_config['designer_role_ids']}")
     elif feature == "invite":
         if cfg.get("channel_id"):
             invite_config["channel_id"] = str(cfg["channel_id"])
@@ -3715,7 +4003,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-order-status"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-order-status", "customs-pricing"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
