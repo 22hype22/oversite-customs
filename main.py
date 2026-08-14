@@ -1107,22 +1107,10 @@ async def end_giveaway(gid, actor_id=None):
     g["last_winners"] = winner_ids
     channel = await resolve_channel(g["channel_id"])
     guild = getattr(channel, "guild", None) if channel else None
+    # Edit the giveaway message in place to show the winner. No separate
+    # congratulations message is posted — the winner shows on the message itself,
+    # which is never deleted.
     await _giveaway_patch(g, _giveaway_payload(g, gid, guild, ended=True, winner_ids=winner_ids, for_edit=True))
-
-    if channel:
-        jump = f"https://discord.com/channels/{g['guild_id']}/{g['channel_id']}/{g['message_id']}"
-        prize = (g.get("prize") or "").strip()
-        won = f"You won **{prize}**" if prize else "You won"
-        for_prize = f" for **{prize}**" if prize else ""
-        if winner_ids:
-            mentions = ", ".join(f"<@{w}>" for w in winner_ids)
-            text = f"🎉 Congratulations {mentions}! {won}.\n{jump}"
-        else:
-            text = f"No one entered the giveaway{for_prize}, so no winner was drawn.\n{jump}"
-        try:
-            await channel.send(text, allowed_mentions=discord.AllowedMentions(users=True))
-        except Exception as e:
-            print(f"[Giveaway] announce failed: {e}")
     return winner_ids
 
 
