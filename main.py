@@ -1397,6 +1397,75 @@ async def robuxlockerrate_cmd(interaction: discord.Interaction):
         print(f"[RobuxLocker] rate modal open failed: {e!r}")
 
 
+# Human labels for the Roblox group revenue-summary fields.
+_FUNDS_LABELS = [
+    ("recurringRobuxStipend", "Premium Stipend"),
+    ("itemSaleRobux", "Item Sales"),
+    ("purchasesRobux", "Purchases"),
+    ("tradeSystemRobux", "Trades"),
+    ("individualToGroupRobux", "Donations"),
+    ("subscriptionsRobux", "Subscriptions"),
+    ("commissionRobux", "Commission"),
+    ("immersiveAdImpressionsRobux", "Immersive Ads"),
+    ("adImpressionRobux", "Ad Impressions"),
+    ("premiumPayouts", "Premium Payouts"),
+    ("groupPayoutRobux", "Group Payouts"),
+    ("adjustmentRobux", "Adjustments"),
+    ("publishingAdvertisingRobux", "Advertising Spend"),
+]
+
+
+@bot.tree.command(name="funds", description="Group funds — available, pending, and revenue")
+@app_commands.describe(period="Revenue window for the breakdown (default: this month)")
+@app_commands.choices(period=[
+    app_commands.Choice(name="Today", value="Day"),
+    app_commands.Choice(name="This Week", value="Week"),
+    app_commands.Choice(name="This Month", value="Month"),
+    app_commands.Choice(name="This Year", value="Year"),
+])
+async def funds_cmd(interaction: discord.Interaction, period: app_commands.Choice[str] = None):
+    if not _robux_can_manage(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "Only staff can view group funds."), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    tf = period.value if period else "Month"
+    tf_label = period.name if period else "This Month"
+    res = await _robux_locker_call("funds_detail", time_frame=tf)
+    if not (isinstance(res, dict) and res.get("ok")):
+        err = (res or {}).get("error", "Unknown error")
+        await interaction.followup.send(embed=error_embed("Couldn't read funds", str(err)[:400]), ephemeral=True)
+        return
+    available = int(res.get("available") or 0)
+    pending = res.get("pending")
+    summary = res.get("summary") if isinstance(res.get("summary"), dict) else {}
+
+    e = discord.Embed(title="💰 Group Funds", color=ACCENT)
+    e.add_field(name="Available", value=f"**{available:,}** R$", inline=True)
+    if pending is not None:
+        e.add_field(name="Pending", value=f"**{int(pending):,}** R$", inline=True)
+        e.add_field(name="Total", value=f"**{available + int(pending):,}** R$", inline=True)
+
+    if summary:
+        def _v(k):
+            try:
+                return int(round(float(summary.get(k) or 0)))
+            except Exception:
+                return 0
+        lines = []
+        for key, label in _FUNDS_LABELS:
+            val = _v(key)
+            if val:
+                sign = "+" if val > 0 else "−"
+                lines.append(f"{label}: {sign}{abs(val):,} R$")
+        if lines:
+            e.add_field(name=f"Revenue — {tf_label}", value="\n".join(lines), inline=False)
+    elif res.get("summaryError"):
+        e.add_field(name="Revenue", value="_Couldn't load the breakdown (needs the “View group revenue” permission)._", inline=False)
+
+    e.set_footer(text="Available = spendable now · Pending = held from recent sales")
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
 async def _open_robux_stock_modal(interaction, funds):
     components = [
         {"type": 18, "label": "Amount (Robux)", "description": f"Available: {funds:,}. Can't exceed this.",
@@ -3239,15 +3308,18 @@ async def _robux_update_panel():
         print(f"[RobuxLocker] panel update failed: {e}")
 
 
-async def _robux_locker_call(action, amount=0):
+async def _robux_locker_call(action, amount=0, time_frame=None):
     """POST to the robux-locker edge function (funds / stock / rate ops).
     `amount` may be fractional (the rate is dollars per 1k, e.g. 7.5)."""
+    payload = {"action": action, "amount": amount}
+    if time_frame:
+        payload["timeFrame"] = time_frame
     try:
         async with httpx.AsyncClient() as client:
             r = await client.post(
                 f"{SUPABASE_FN_URL}/robux-locker",
                 headers=_fn_headers(),
-                json={"action": action, "amount": amount},
+                json=payload,
                 timeout=20,
             )
             data = r.json() if r.content else {}
