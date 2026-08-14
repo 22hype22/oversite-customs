@@ -99,7 +99,8 @@ giveaway_config = {
     "default_winners": 1,
     "default_duration": "1d",
     "manager_role_ids": [],   # roles (besides Manage Server) allowed to run /giveaway
-    "components": [],         # optional V2 design (dashboard "Giveaway" builder)
+    "components": [],         # optional V2 design shown while the giveaway runs
+    "ended_components": [],   # optional V2 design shown once the giveaway ends
 }
 # Live giveaways this process is tracking. Keyed by a short giveaway id (gid) that
 # also lives in the Enter button's custom_id, so entries route back here.
@@ -788,10 +789,15 @@ _DUR_MULT = {"m": 60, "h": 3600, "d": 86400, "w": 604800, "mo": 2592000, "y": 31
 
 
 def _parse_duration_seconds(text):
-    """'10m' '2h' '1d' '1w' '1mo' '1y' -> seconds. 0 if invalid."""
+    """'10m' '2h' '1d' '1w' '1mo' '1y' -> seconds. A bare number means DAYS
+    (so '1' = 1 day). 0 if invalid."""
     if not text:
         return 0
-    m = _DUR_RE.match(str(text).strip().lower())
+    s = str(text).strip().lower()
+    if s.isdigit():
+        n = int(s)
+        return n * 86400 if n > 0 else 0
+    m = _DUR_RE.match(s)
     if not m:
         return 0
     n = int(m.group(1))
@@ -910,9 +916,16 @@ def _giveaway_tidy_text(nodes):
 
 
 def _giveaway_render_design(g, gid, guild, ended=False, winner_ids=None):
-    """Render the dashboard-designed giveaway layout (with tokens filled in) plus
-    the Enter/Reroll action row. Returns None if no design is configured."""
-    design = g.get("design") or giveaway_config.get("components") or []
+    """Render a giveaway layout with tokens filled in. While running (or when no
+    dedicated ended design exists) uses the running design + Enter button. When
+    ended AND a separate ended design is configured, uses that + a Reroll button.
+    Returns None if no design is configured."""
+    running_design = g.get("design") or giveaway_config.get("components") or []
+    ended_design = giveaway_config.get("ended_components") or []
+    # Only swap to the ended design if the running message was also a V2 design —
+    # otherwise the posted message is an embed and can't be edited into V2.
+    use_ended_design = bool(ended and ended_design and running_design)
+    design = ended_design if use_ended_design else running_design
     if not design:
         return None
 
@@ -933,6 +946,11 @@ def _giveaway_render_design(g, gid, guild, ended=False, winner_ids=None):
     built = [b for b in (_build_v2(c, guild) for c in comps) if b]
     _giveaway_tidy_text(built)
 
+    if use_ended_design:
+        # Dedicated ended message: no entry button; just a Reroll control.
+        built.append({"type": 1, "components": [{"type": 2, "style": 2, "custom_id": f"gwreroll:{gid}", "label": "Reroll"}]})
+        return built
+
     # Bind any user-placed Counter buttons to THIS giveaway and disable them once
     # it's ended. If the design has none, append the default Enter/Reroll row.
     def _bind_counter(node):
@@ -952,7 +970,7 @@ def _giveaway_render_design(g, gid, guild, ended=False, winner_ids=None):
         has_counter = _bind_counter(c) or has_counter
 
     ping = str(giveaway_config.get("ping") or "").strip()
-    if ping:
+    if ping and not ended:
         built.insert(0, {"type": 10, "content": _render_guild_text(ping, guild)})
     if has_counter:
         # User designed their own entry button; only add a Reroll control on end.
@@ -2495,7 +2513,9 @@ async def apply_config(feature, cfg, post_panel=False):
             giveaway_config["manager_role_ids"] = [str(x) for x in cfg["manager_role_ids"] if x]
         comps = cfg.get("components")
         giveaway_config["components"] = comps if isinstance(comps, list) else []
-        print(f"[Config] giveaway — title {giveaway_config['title']!r} button {giveaway_config['button_label']!r} managers {giveaway_config['manager_role_ids']} design {len(giveaway_config['components'])}")
+        ended = cfg.get("ended_components")
+        giveaway_config["ended_components"] = ended if isinstance(ended, list) else []
+        print(f"[Config] giveaway — managers {giveaway_config['manager_role_ids']} design {len(giveaway_config['components'])} ended {len(giveaway_config['ended_components'])}")
     elif feature == "invite":
         if cfg.get("channel_id"):
             invite_config["channel_id"] = str(cfg["channel_id"])
