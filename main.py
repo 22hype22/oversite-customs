@@ -1867,8 +1867,9 @@ def _price_parts(val):
     return "", str(val or "").strip()
 
 
-def _pricing_lines_text(si):
-    """The pricing list for one service as multi-line text (fills {pricing})."""
+def _pricing_lines_text(si, guild=None):
+    """Fills {pricing}: for one service, each DESIGNER's block — their @mention
+    then their priced items — ordered by who joined the server first."""
     services = pricing_config.get("services") or []
     if si < 0 or si >= len(services):
         return ""
@@ -1876,18 +1877,34 @@ def _pricing_lines_text(si):
     name = svc.get("name") or ""
     items = svc.get("items") or []
     cur = pricing_config.get("currency") or "$"
-    vals = (pricing_config.get("values") or {}).get(name, {})
-    lines = []
-    for item in items:
-        robux, usd = _price_parts(vals.get(item))
-        parts = []
-        if robux:
-            parts.append(f"R$ {robux}")
-        if usd:
-            parts.append(f"{cur}{usd}")
-        price = " · ".join(parts) if parts else "—"
-        lines.append(f"**{item}** — {price}")
-    return "\n".join(lines) if lines else "No items listed for this service yet."
+    by_user = (pricing_config.get("values") or {}).get(name, {})  # {user_id: {item: {robux,usd}}}
+    if not isinstance(by_user, dict) or not by_user:
+        return "No pricing set yet."
+
+    def _join_key(uid):
+        # Earliest server join first; members not found go last.
+        m = guild.get_member(int(uid)) if (guild and str(uid).isdigit()) else None
+        joined = getattr(m, "joined_at", None) if m else None
+        return (0, joined.timestamp()) if joined else (1, str(uid))
+
+    blocks = []
+    for uid in sorted(by_user.keys(), key=_join_key):
+        item_map = by_user.get(uid) or {}
+        if not isinstance(item_map, dict):
+            continue
+        lines = []
+        for item in items:
+            robux, usd = _price_parts(item_map.get(item))
+            parts = []
+            if robux:
+                parts.append(f"R$ {robux}")
+            if usd:
+                parts.append(f"{cur}{usd}")
+            if parts:  # only items this designer actually priced
+                lines.append(f"{item} — {' · '.join(parts)}")
+        if lines:
+            blocks.append(f"<@{uid}>\n" + "\n".join(lines))
+    return "\n\n".join(blocks) if blocks else "No pricing set yet."
 
 
 def _pricing_embed(si, guild=None):
@@ -1897,10 +1914,10 @@ def _pricing_embed(si, guild=None):
     name = services[si].get("name") or ""
     title = pricing_config.get("title") or "Pricing"
     return discord.Embed(title=f"{title} · {name}",
-                         description=_render_guild_text(_pricing_lines_text(si), guild))
+                         description=_render_guild_text(_pricing_lines_text(si, guild), guild))
 
 
-def _render_pricing_components(si):
+def _render_pricing_components(si, guild=None):
     """The dashboard-designed /pricing layout with {service} and {pricing}
     substituted for this service. None if no design is saved."""
     comps = pricing_config.get("components") or []
@@ -1911,7 +1928,7 @@ def _render_pricing_components(si):
         return None
     name = services[si].get("name") or ""
     raw = json.dumps(comps)
-    raw = raw.replace("{pricing}", json.dumps(_pricing_lines_text(si))[1:-1])
+    raw = raw.replace("{pricing}", json.dumps(_pricing_lines_text(si, guild))[1:-1])
     raw = raw.replace("{service}", json.dumps(name)[1:-1])
     try:
         return json.loads(raw)
@@ -1929,15 +1946,17 @@ async def handle_pricing_pick(interaction, si):
         return
     name = services[si].get("name") or ""
     channel = interaction.channel
+    guild = interaction.guild
     posted = False
     try:
-        comps = _render_pricing_components(si)
+        comps = _render_pricing_components(si, guild)
         if comps and channel:
-            posted = bool(await send_v2_message(channel, comps))
+            # Render designer @mentions as names WITHOUT pinging everyone listed.
+            posted = bool(await send_v2_message(channel, comps, allowed_mentions={"parse": []}))
         elif channel:
-            e = _pricing_embed(si, interaction.guild)
+            e = _pricing_embed(si, guild)
             if e:
-                await channel.send(embed=e)
+                await channel.send(embed=e, allowed_mentions=discord.AllowedMentions.none())
                 posted = True
     except Exception as ex:
         print(f"[Pricing] post failed: {ex}")
@@ -2036,8 +2055,9 @@ async def _open_setprice_one(interaction, si, ii):
     if ii < 0 or ii >= len(items):
         return
     item = items[ii]
-    vals = (pricing_config.get("values") or {}).get(name, {})
-    robux, usd = _price_parts(vals.get(item))
+    uid = str(interaction.user.id)
+    mine = ((pricing_config.get("values") or {}).get(name, {}) or {}).get(uid, {})
+    robux, usd = _price_parts(mine.get(item))
     components = [
         {"type": 18, "label": f"{item[:30]} — Robux",
          "component": {"type": 4, "custom_id": "robux", "style": 1, "required": False,
@@ -2078,7 +2098,10 @@ async def handle_setprice_one_submit(interaction, si, ii):
     vals = _modal_values((interaction.data or {}).get("components"))
     robux = str(vals.get("robux") or "").strip()
     usd = str(vals.get("usd") or "").strip()
-    ok, err = await _save_pricing_entries([{"service": name, "item": item, "robux": robux, "usd": usd}])
+    # Saved under the DESIGNER who ran /setpricing — each person has their own.
+    ok, err = await _save_pricing_entries([{
+        "service": name, "user": str(interaction.user.id), "item": item, "robux": robux, "usd": usd,
+    }])
     if not ok:
         await interaction.followup.send(embed=error_embed("Couldn't save", str(err)[:400]), ephemeral=True)
         return
