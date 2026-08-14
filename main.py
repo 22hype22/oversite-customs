@@ -1877,15 +1877,44 @@ def _pricing_embed(si, guild=None):
     return discord.Embed(title=f"{title} · {name}", description=_render_guild_text(desc, guild))
 
 
-@bot.tree.command(name="pricing", description="View pricing for a service")
-async def pricing_cmd(interaction: discord.Interaction):
-    services = pricing_config.get("services") or []
-    if not services:
-        await interaction.response.send_message(embed=info_embed("No pricing", "Pricing isn't set up yet."), ephemeral=True)
+async def _ensure_pricing_loaded():
+    """Lazy-load the pricing config if boot didn't pick it up (e.g. it was saved
+    after the bot started). Makes /pricing and /setpricing self-healing."""
+    if pricing_config.get("services"):
         return
     try:
-        await _raw_interaction_reply(interaction, 4, content="Pick a service to see its pricing:",
-                                     components=[_pricing_service_select("pricing_svc")])
+        cfg = await fetch_config("customs-pricing")
+        if cfg:
+            await apply_config("customs-pricing", cfg)
+            print(f"[Pricing] lazy-loaded — {len(pricing_config.get('services') or [])} services")
+    except Exception as e:
+        print(f"[Pricing] lazy load failed: {e}")
+
+
+async def _edit_original_select(interaction, prompt, custom_id):
+    """Edit the deferred ephemeral response into a service-select prompt."""
+    route = discord.http.Route(
+        "PATCH", "/webhooks/{application_id}/{interaction_token}/messages/@original",
+        application_id=bot.application_id, interaction_token=interaction.token,
+    )
+    await bot.http.request(route, json={
+        "content": prompt,
+        "components": [_pricing_service_select(custom_id)],
+    })
+
+
+@bot.tree.command(name="pricing", description="View pricing for a service")
+async def pricing_cmd(interaction: discord.Interaction):
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+    await _ensure_pricing_loaded()
+    if not (pricing_config.get("services") or []):
+        await interaction.followup.send(embed=info_embed("No pricing", "Pricing isn't set up yet."), ephemeral=True)
+        return
+    try:
+        await _edit_original_select(interaction, "Pick a service to see its pricing:", "pricing_svc")
     except Exception as e:
         print(f"[Pricing] /pricing failed: {e}")
 
@@ -1895,13 +1924,16 @@ async def setpricing_cmd(interaction: discord.Interaction):
     if not _pricing_can_manage(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "Only designers can set pricing."), ephemeral=True)
         return
-    services = pricing_config.get("services") or []
-    if not services:
-        await interaction.response.send_message(embed=info_embed("No services", "Add services in the dashboard Pricing block first."), ephemeral=True)
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+    await _ensure_pricing_loaded()
+    if not (pricing_config.get("services") or []):
+        await interaction.followup.send(embed=info_embed("No services", "Add services in the dashboard Pricing block first, then Save."), ephemeral=True)
         return
     try:
-        await _raw_interaction_reply(interaction, 4, content="Pick a service to edit its prices:",
-                                     components=[_pricing_service_select("setprice_svc")])
+        await _edit_original_select(interaction, "Pick a service to edit its prices:", "setprice_svc")
     except Exception as e:
         print(f"[Pricing] /setpricing failed: {e}")
 
