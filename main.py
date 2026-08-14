@@ -2094,10 +2094,26 @@ def _parse_gw_cid(raw):
     return gid, end_ts, winners
 
 
+async def _gw_entries_call(action, gid, uid=None):
+    """Persist/read giveaway entrants server-side so entries survive redeploys."""
+    payload = {"action": action, "gid": str(gid)}
+    if uid is not None:
+        payload["uid"] = str(uid)
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{SUPABASE_FN_URL}/giveaway-entries",
+                headers=_fn_headers(), json=payload, timeout=15,
+            )
+            return r.json() if r.content else {}
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
 async def _giveaway_adopt(interaction, gid, end_ts, winners):
     """Rebuild a running giveaway the process lost on restart, from the button's
-    encoded end time/winners + the message it's on, then reschedule its end. This
-    is what makes a live giveaway survive a redeploy without any storage."""
+    encoded end time/winners + the message it's on, then reschedule its end.
+    Entrants are reloaded from storage so nobody's entry is ever dropped."""
     if end_ts is None:
         return None
     msg = getattr(interaction, "message", None)
@@ -2109,9 +2125,16 @@ async def _giveaway_adopt(interaction, gid, end_ts, winners):
         "length": "", "host_id": "", "entrants": set(), "ended": False, "design": None,
     }
     active_giveaways[gid] = g
+    # Restore the persisted entrant list from before the restart.
+    try:
+        res = await _gw_entries_call("get", gid)
+        if isinstance(res, dict) and res.get("ok"):
+            g["entrants"] = set(str(u) for u in (res.get("entrants") or []))
+    except Exception as e:
+        print(f"[Giveaway] entrant restore failed for {gid}: {e}")
     remaining = int(end_ts) - int(time.time())
     asyncio.create_task(end_giveaway(gid) if remaining <= 0 else _giveaway_timer(gid, remaining))
-    print(f"[Giveaway] re-adopted {gid} after restart (ends in {remaining}s)")
+    print(f"[Giveaway] re-adopted {gid} after restart ({len(g['entrants'])} entrants, ends in {remaining}s)")
     return g
 
 
@@ -2130,11 +2153,13 @@ async def giveaway_enter(interaction, raw):
     uid = str(interaction.user.id)
     if uid in g["entrants"]:
         g["entrants"].discard(uid)
-        msg = "Giveaway Left"
+        msg, entry_action = "Giveaway Left", "remove"
     else:
         g["entrants"].add(uid)
-        msg = "Giveaway Entered"
+        msg, entry_action = "Giveaway Entered", "add"
     await interaction.response.send_message(msg, ephemeral=True)
+    # Persist the entry so it survives a redeploy, then refresh the live count.
+    await _gw_entries_call(entry_action, gid, uid)
     await _giveaway_refresh_count(gid)
 
 
