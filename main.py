@@ -1967,17 +1967,22 @@ async def handle_pricing_pick(interaction, si):
 
 
 async def _ensure_pricing_loaded():
-    """Lazy-load the pricing config if boot didn't pick it up (e.g. it was saved
-    after the bot started). Makes /pricing and /setpricing self-healing."""
-    if pricing_config.get("services"):
-        return
+    """Make /pricing and /setpricing self-healing. If the structure wasn't picked
+    up on boot, load it; either way ALWAYS refresh the prices from the database so
+    a redeploy (or a boot-time hiccup) can never show stale/blank pricing."""
     try:
-        cfg = await fetch_config("customs-pricing")
-        if cfg:
-            await apply_config("customs-pricing", cfg)
-            print(f"[Pricing] lazy-loaded — {len(pricing_config.get('services') or [])} services")
+        if not pricing_config.get("services"):
+            cfg = await fetch_config("customs-pricing")
+            if cfg:
+                await apply_config("customs-pricing", cfg)
+                print(f"[Pricing] lazy-loaded — {len(pricing_config.get('services') or [])} services")
+                return  # apply_config already refreshed values from the DB
+        # Structure present — just pull the latest prices from the DB.
+        res = await _pricing_call("get")
+        if isinstance(res, dict) and res.get("ok"):
+            pricing_config["values"] = res.get("prices") or {}
     except Exception as e:
-        print(f"[Pricing] lazy load failed: {e}")
+        print(f"[Pricing] refresh failed: {e}")
 
 
 async def _edit_original_select(interaction, prompt, custom_id):
