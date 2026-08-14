@@ -1858,6 +1858,14 @@ def _pricing_service_select(custom_id):
     }]}
 
 
+def _price_parts(val):
+    """Return (robux, usd) strings for a stored item value. New values are
+    {robux, usd}; a legacy plain string is treated as the USD price."""
+    if isinstance(val, dict):
+        return str(val.get("robux") or "").strip(), str(val.get("usd") or "").strip()
+    return "", str(val or "").strip()
+
+
 def _pricing_embed(si, guild=None):
     services = pricing_config.get("services") or []
     if si < 0 or si >= len(services):
@@ -1869,8 +1877,13 @@ def _pricing_embed(si, guild=None):
     vals = (pricing_config.get("values") or {}).get(name, {})
     lines = []
     for item in items:
-        p = str(vals.get(item) or "").strip()
-        price = f"{cur}{p}" if p else "—"
+        robux, usd = _price_parts(vals.get(item))
+        parts = []
+        if robux:
+            parts.append(f"R$ {robux}")
+        if usd:
+            parts.append(f"{cur}{usd}")
+        price = " · ".join(parts) if parts else "—"
         lines.append(f"**{item}** — {price}")
     title = pricing_config.get("title") or "Pricing"
     desc = "\n".join(lines) if lines else "No items listed for this service yet."
@@ -1948,24 +1961,12 @@ async def _open_setprice(interaction, si):
     if not items:
         await _raw_interaction_reply(interaction, 7, content=f"**{name}** has no items to price.", components=[])
         return
-    vals = (pricing_config.get("values") or {}).get(name, {})
-    if len(items) <= 5:
-        # One modal, a price field per item.
-        components = []
-        for idx, item in enumerate(items[:5]):
-            components.append({"type": 18, "label": item[:45],
-                "component": {"type": 4, "custom_id": f"p{idx}", "style": 1, "required": False,
-                              "max_length": 20, "value": str(vals.get(item) or ""), "placeholder": "e.g. 15 (blank clears)"}})
-        data = {"title": f"{name} prices"[:45], "custom_id": f"setprice_all:{si}", "components": components}
-        route = discord.http.Route("POST", "/interactions/{interaction_id}/{interaction_token}/callback",
-                                   interaction_id=interaction.id, interaction_token=interaction.token)
-        await bot.http.request(route, json={"type": 9, "data": data})
-    else:
-        # Too many for one modal — pick the item first.
-        options = [{"label": it[:100], "value": str(i)} for i, it in enumerate(items[:25])]
-        row = {"type": 1, "components": [{"type": 3, "custom_id": f"setprice_item:{si}",
-                                          "placeholder": "Pick an item", "options": options}]}
-        await _raw_interaction_reply(interaction, 7, content=f"**{name}** — pick an item to price:", components=[row])
+    # Each item takes a Robux + USD field, so always pick the item first, then
+    # a 2-field modal for that item.
+    options = [{"label": it[:100], "value": str(i)} for i, it in enumerate(items[:25])]
+    row = {"type": 1, "components": [{"type": 3, "custom_id": f"setprice_item:{si}",
+                                      "placeholder": "Pick an item to price", "options": options}]}
+    await _raw_interaction_reply(interaction, 7, content=f"**{name}** — pick an item:", components=[row])
 
 
 async def _open_setprice_one(interaction, si, ii):
@@ -1979,10 +1980,16 @@ async def _open_setprice_one(interaction, si, ii):
         return
     item = items[ii]
     vals = (pricing_config.get("values") or {}).get(name, {})
-    components = [{"type": 18, "label": item[:45],
-        "component": {"type": 4, "custom_id": "price", "style": 1, "required": False,
-                      "max_length": 20, "value": str(vals.get(item) or ""), "placeholder": "e.g. 15 (blank clears)"}}]
-    data = {"title": "Set price"[:45], "custom_id": f"setprice_one:{si}:{ii}", "components": components}
+    robux, usd = _price_parts(vals.get(item))
+    components = [
+        {"type": 18, "label": f"{item[:30]} — Robux",
+         "component": {"type": 4, "custom_id": "robux", "style": 1, "required": False,
+                       "max_length": 20, "value": robux, "placeholder": "e.g. 1500 (blank = none)"}},
+        {"type": 18, "label": f"{item[:30]} — USD",
+         "component": {"type": 4, "custom_id": "usd", "style": 1, "required": False,
+                       "max_length": 20, "value": usd, "placeholder": "e.g. 15 (blank = none)"}},
+    ]
+    data = {"title": f"{item} price"[:45], "custom_id": f"setprice_one:{si}:{ii}", "components": components}
     route = discord.http.Route("POST", "/interactions/{interaction_id}/{interaction_token}/callback",
                                interaction_id=interaction.id, interaction_token=interaction.token)
     await bot.http.request(route, json={"type": 9, "data": data})
@@ -1995,29 +2002,6 @@ async def _save_pricing_entries(entries):
         pricing_config["values"] = res.get("prices") or pricing_config.get("values") or {}
         return True, None
     return False, (res or {}).get("error", "Unknown error")
-
-
-async def handle_setprice_all_submit(interaction, si):
-    try:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-    except Exception:
-        pass
-    services = pricing_config.get("services") or []
-    if si < 0 or si >= len(services):
-        return
-    svc = services[si]
-    name = svc.get("name") or ""
-    items = svc.get("items") or []
-    vals = _modal_values((interaction.data or {}).get("components"))
-    entries = []
-    for idx, item in enumerate(items[:5]):
-        price = str(vals.get(f"p{idx}") or "").strip()
-        entries.append({"service": name, "item": item, "price": price})
-    ok, err = await _save_pricing_entries(entries)
-    if not ok:
-        await interaction.followup.send(embed=error_embed("Couldn't save", str(err)[:400]), ephemeral=True)
-        return
-    await interaction.followup.send(embed=_pricing_embed(si, interaction.guild), ephemeral=True)
 
 
 async def handle_setprice_one_submit(interaction, si, ii):
@@ -2035,8 +2019,9 @@ async def handle_setprice_one_submit(interaction, si, ii):
         return
     item = items[ii]
     vals = _modal_values((interaction.data or {}).get("components"))
-    price = str(vals.get("price") or "").strip()
-    ok, err = await _save_pricing_entries([{"service": name, "item": item, "price": price}])
+    robux = str(vals.get("robux") or "").strip()
+    usd = str(vals.get("usd") or "").strip()
+    ok, err = await _save_pricing_entries([{"service": name, "item": item, "robux": robux, "usd": usd}])
     if not ok:
         await interaction.followup.send(embed=error_embed("Couldn't save", str(err)[:400]), ephemeral=True)
         return
@@ -2184,12 +2169,6 @@ async def on_interaction(interaction: discord.Interaction):
             await handle_robux_stock_submit(interaction, funds)
         elif cid == "robuxbuyform":
             await handle_robux_buy_submit(interaction)
-        elif cid.startswith("setprice_all:"):
-            try:
-                si = int(cid.split(":", 1)[1])
-            except Exception:
-                si = -1
-            await handle_setprice_all_submit(interaction, si)
         elif cid.startswith("setprice_one:"):
             parts = cid.split(":")
             try:
