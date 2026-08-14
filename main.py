@@ -898,10 +898,7 @@ def build_giveaway_embed(g, ended=False, winner_ids=None):
 
 
 def _giveaway_action_row(g, gid, ended=False):
-    row = {"type": 1, "components": [_giveaway_button(g, gid, disabled=ended)]}
-    if ended:
-        row["components"].append({"type": 2, "style": 2, "custom_id": f"gwreroll:{gid}", "label": "Reroll"})
-    return row
+    return {"type": 1, "components": [_giveaway_button(g, gid, disabled=ended)]}
 
 
 def _giveaway_tokens(g, ended, winner_ids):
@@ -980,12 +977,16 @@ def _giveaway_render_design(g, gid, guild, ended=False, winner_ids=None):
     _giveaway_tidy_text(built)
 
     if use_ended_design:
-        # Dedicated ended message: no entry button; just a Reroll control.
-        built.append({"type": 1, "components": [{"type": 2, "style": 2, "custom_id": f"gwreroll:{gid}", "label": "Reroll"}]})
+        # Dedicated ended message: winner text only, no buttons. Staff reroll via
+        # the -reroll command. Never allow an empty payload — a blank edit would
+        # make the message look "deleted" — so fall back to a minimal winner line.
+        if not built:
+            wl = ", ".join(f"<@{w}>" for w in (winner_ids or [])) or "No winners"
+            built = [{"type": 10, "content": f"**Giveaway ended.** Winner: {wl}"}]
         return built
 
     # Bind any user-placed Counter buttons to THIS giveaway and disable them once
-    # it's ended. If the design has none, append the default Enter/Reroll row.
+    # it's ended. If the design has none, append the default Enter row.
     def _bind_counter(node):
         found = False
         if isinstance(node, dict):
@@ -1005,13 +1006,23 @@ def _giveaway_render_design(g, gid, guild, ended=False, winner_ids=None):
     ping = str(giveaway_config.get("ping") or "").strip()
     if ping and not ended:
         built.insert(0, {"type": 10, "content": _render_guild_text(ping, guild)})
-    if has_counter:
-        # User designed their own entry button; only add a Reroll control on end.
-        if ended:
-            built.append({"type": 1, "components": [{"type": 2, "style": 2, "custom_id": f"gwreroll:{gid}", "label": "Reroll"}]})
-    else:
+    if not has_counter:
+        # No user-placed entry button — add the default Enter row (disabled on end).
         built.append(_giveaway_action_row(g, gid, ended))
     return built
+
+
+def _giveaway_render_guard(built, g, gid, ended, winner_ids):
+    """Never return an empty/whitespace-only render — a blank edit makes the
+    posted giveaway look deleted. Guarantees at least one visible component."""
+    real = [c for c in (built or []) if isinstance(c, dict)]
+    if real:
+        return built
+    if ended:
+        wl = ", ".join(f"<@{w}>" for w in (winner_ids or [])) or "No winners"
+        return [{"type": 10, "content": f"**Giveaway ended.** Winner: {wl}"}]
+    return [{"type": 10, "content": "**Giveaway** — click below to enter!"},
+            _giveaway_action_row(g, gid, False)]
 
 
 def _giveaway_payload(g, gid, guild, ended=False, winner_ids=None, for_edit=False):
@@ -1019,6 +1030,7 @@ def _giveaway_payload(g, gid, guild, ended=False, winner_ids=None, for_edit=Fals
     one exists, otherwise the built-in embed."""
     design = _giveaway_render_design(g, gid, guild, ended, winner_ids)
     if design is not None:
+        design = _giveaway_render_guard(design, g, gid, ended, winner_ids)
         payload = {"components": design}
         if not for_edit:
             payload["flags"] = 1 << 15  # Components V2
@@ -1111,6 +1123,7 @@ async def end_giveaway(gid, actor_id=None):
     # congratulations message is posted — the winner shows on the message itself,
     # which is never deleted.
     await _giveaway_patch(g, _giveaway_payload(g, gid, guild, ended=True, winner_ids=winner_ids, for_edit=True))
+    print(f"[Giveaway] {gid} ended — message {g.get('message_id')} EDITED to winner state (never deleted)")
     return winner_ids
 
 
@@ -1318,29 +1331,48 @@ async def giveaway_enter(interaction, raw):
     await _giveaway_refresh_count(gid)
 
 
-async def giveaway_reroll(interaction, gid):
-    g = active_giveaways.get(gid)
-    if not g:
-        await interaction.response.send_message(embed=error_embed("Giveaway unavailable", "That giveaway is no longer tracked (the bot may have restarted)."), ephemeral=True)
-        return
-    if not _giveaway_can_manage(interaction.user):
-        await interaction.response.send_message(embed=error_embed("No permission", "Only staff can reroll."), ephemeral=True)
-        return
-    winners = _pick_winners(g["entrants"], g["winners"])
-    if not winners:
-        await interaction.response.send_message(embed=error_embed("No entries", "There are no entries to reroll from."), ephemeral=True)
-        return
-    g["last_winners"] = winners
-    await interaction.response.defer()
-    mentions = ", ".join(f"<@{w}>" for w in winners)
-    channel = await resolve_channel(g["channel_id"])
-    if channel:
-        prize = (g.get("prize") or "").strip()
-        for_prize = f" for **{prize}**" if prize else ""
+async def _cmd_reroll(message):
+    """'-reroll' — draw a new winner for an ended giveaway. Only giveaway managers
+    can use it. Reply to a specific giveaway to reroll that one; otherwise it picks
+    the most recently ended giveaway in the channel. Edits the giveaway message in
+    place (no new message) and reacts to confirm."""
+    async def react(emoji):
         try:
-            await channel.send(f"🎉 Reroll! New winner{'s' if len(winners) != 1 else ''}{for_prize}: {mentions}", allowed_mentions=discord.AllowedMentions(users=True))
+            await message.add_reaction(emoji)
         except Exception:
             pass
+
+    if not _giveaway_can_manage(message.author):
+        return await react("⛔")
+
+    chan_id = str(message.channel.id)
+    ref = getattr(message, "reference", None)
+    ref_mid = str(ref.message_id) if ref and getattr(ref, "message_id", None) else None
+
+    target = None
+    if ref_mid:
+        for gid, g in active_giveaways.items():
+            if str(g.get("channel_id")) == chan_id and str(g.get("message_id")) == ref_mid:
+                target = (gid, g)
+                break
+    if target is None:
+        ended = [(gid, g) for gid, g in active_giveaways.items()
+                 if str(g.get("channel_id")) == chan_id and g.get("ended")]
+        if ended:
+            target = max(ended, key=lambda kv: int(kv[1].get("end_ts") or 0))
+
+    if target is None or not target[1].get("ended"):
+        return await react("❓")
+
+    gid, g = target
+    winners = _pick_winners(g["entrants"], g["winners"])
+    if not winners:
+        return await react("❌")
+
+    g["last_winners"] = winners
+    guild = message.guild
+    await _giveaway_patch(g, _giveaway_payload(g, gid, guild, ended=True, winner_ids=winners, for_edit=True))
+    await react("✅")
 
 
 @bot.event
@@ -1406,8 +1438,6 @@ async def on_interaction(interaction: discord.Interaction):
         await start_roblox_verify(interaction)
     elif cid.startswith("gw:"):
         await giveaway_enter(interaction, cid.split(":", 1)[1])
-    elif cid.startswith("gwreroll:"):
-        await giveaway_reroll(interaction, cid.split(":", 1)[1])
 
 
 def _ticket_topic(opener_id, category, base=""):
@@ -2020,6 +2050,9 @@ async def on_message(message):
     if not message.author.bot and message.guild:
         parts = (message.content or "").strip().split(maxsplit=1)
         cmd = parts[0].lower() if parts else ""
+        if cmd == "-reroll":
+            await _cmd_reroll(message)
+            return
         if cmd in ("-claim", "-unclaim", "-close"):
             topic = getattr(message.channel, "topic", "") or ""
             if topic.startswith("ticket|"):
@@ -2611,6 +2644,16 @@ async def apply_config(feature, cfg, post_panel=False):
             await post_verify_panel()
 
 
+def _is_tracked_giveaway_message(mid):
+    """True if a message id belongs to a giveaway this process is tracking, so no
+    panel-replacement logic can ever delete a giveaway message by mistake."""
+    try:
+        mid = str(mid)
+        return any(str(g.get("message_id")) == mid for g in active_giveaways.values())
+    except Exception:
+        return False
+
+
 async def _replace_panel(new_channel_id, new_message_id):
     """Record the freshly-posted panel and delete the previous one, so posting
     again REPLACES the old panel instead of stacking duplicates."""
@@ -2620,7 +2663,7 @@ async def _replace_panel(new_channel_id, new_message_id):
         if new_message_id and new_message_id is not True
         else None
     )
-    if old and old.get("message_id"):
+    if old and old.get("message_id") and not _is_tracked_giveaway_message(old["message_id"]):
         try:
             ch = await resolve_channel(old.get("channel_id"))
             if ch:
@@ -2744,7 +2787,7 @@ async def _replace_ticket_panel(new_channel_id, new_message_id):
     old_mid = refs.get(ch_key)
     if new_message_id and new_message_id is not True:
         refs[ch_key] = str(new_message_id)
-    if old_mid:
+    if old_mid and not _is_tracked_giveaway_message(old_mid):
         try:
             ch = await resolve_channel(ch_key)
             if ch:
