@@ -108,6 +108,10 @@ giveaway_config = {
 #         entrants:set[str], ended:bool}
 active_giveaways = {}
 
+# ---- Robux Locker ----
+# Panel designed in the dashboard "Robux Locker" block. Members buy Robux from it.
+robux_locker_config = {"channel_id": "", "components": [], "panel_ref": None}
+
 def _msg_key(open_components, label=""):
     raw = json.dumps(open_components or [], sort_keys=True) + "|" + (label or "")
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
@@ -2624,6 +2628,15 @@ async def apply_config(feature, cfg, post_panel=False):
         ended = cfg.get("ended_components")
         giveaway_config["ended_components"] = ended if isinstance(ended, list) else []
         print(f"[Config] giveaway — managers {giveaway_config['manager_role_ids']} design {len(giveaway_config['components'])} ended {len(giveaway_config['ended_components'])}")
+    elif feature in ("robux-locker", "customs-robux-locker"):
+        if cfg.get("channel_id"):
+            robux_locker_config["channel_id"] = str(cfg["channel_id"])
+        comps = cfg.get("components")
+        robux_locker_config["components"] = comps if isinstance(comps, list) else []
+        print(f"[Config] robux-locker — channel {robux_locker_config['channel_id']} design {len(robux_locker_config['components'])}")
+        # Post/refresh the panel on a save (deliberate action), not on boot.
+        if post_panel:
+            await post_robux_locker_panel()
     elif feature == "invite":
         if cfg.get("channel_id"):
             invite_config["channel_id"] = str(cfg["channel_id"])
@@ -2787,6 +2800,42 @@ async def post_verify_panel():
         await _replace_panel(ch.id, msg.id)
     except Exception as e:
         print(f"[Verify] panel post failed: {e}")
+
+
+async def _replace_robux_panel(new_channel_id, new_message_id):
+    """Replace the previous Robux Locker panel so a re-save doesn't stack duplicates."""
+    old = robux_locker_config.get("panel_ref")
+    robux_locker_config["panel_ref"] = (
+        {"channel_id": str(new_channel_id), "message_id": str(new_message_id)}
+        if new_message_id and new_message_id is not True else None
+    )
+    if old and old.get("message_id") and not _is_tracked_giveaway_message(old["message_id"]):
+        try:
+            ch = await resolve_channel(old.get("channel_id"))
+            if ch:
+                msg = await ch.fetch_message(int(old["message_id"]))
+                await msg.delete()
+        except Exception:
+            pass
+
+
+async def post_robux_locker_panel():
+    """(Re)post the Robux Locker panel from the dashboard design."""
+    ch = await resolve_channel(robux_locker_config.get("channel_id"))
+    if not ch:
+        print("[RobuxLocker] no channel configured")
+        return
+    comps = robux_locker_config.get("components") or []
+    if not comps:
+        print("[RobuxLocker] no design saved — nothing to post")
+        return
+    try:
+        mid = await send_v2_message(ch, comps)
+        if mid:
+            print("[RobuxLocker] panel posted")
+            await _replace_robux_panel(ch.id, mid)
+    except Exception as e:
+        print(f"[RobuxLocker] panel post failed: {e}")
 
 
 async def _replace_ticket_panel(new_channel_id, new_message_id):
@@ -3034,7 +3083,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
