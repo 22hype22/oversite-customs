@@ -881,6 +881,7 @@ def _giveaway_tokens(g, ended, winner_ids):
     return {
         "{prize}": g["prize"],
         "{winners}": str(int(g["winners"])),
+        "{length}": str(g.get("length") or ""),
         "{entries}": str(len(g["entrants"])),
         "{participants}": participants,
         "{end}": f"<t:{end_ts}:R>",
@@ -891,10 +892,27 @@ def _giveaway_tokens(g, ended, winner_ids):
     }
 
 
+_GW_BLANKLINES_RE = re.compile(r"\n[ \t]*\n[ \t]*(?:\n[ \t]*)+")
+
+
+def _giveaway_tidy_text(nodes):
+    """After stripping {Question:} tokens, text blocks can be left with runs of
+    blank lines. Collapse 3+ newlines to a single blank line and trim edges so
+    the posted giveaway reads cleanly."""
+    for n in nodes or []:
+        if not isinstance(n, dict):
+            continue
+        if n.get("type") == 10 and isinstance(n.get("content"), str):
+            n["content"] = _GW_BLANKLINES_RE.sub("\n\n", n["content"]).strip("\n")
+        for key in ("components", "items"):
+            if isinstance(n.get(key), list):
+                _giveaway_tidy_text(n[key])
+
+
 def _giveaway_render_design(g, gid, guild, ended=False, winner_ids=None):
     """Render the dashboard-designed giveaway layout (with tokens filled in) plus
     the Enter/Reroll action row. Returns None if no design is configured."""
-    design = giveaway_config.get("components") or []
+    design = g.get("design") or giveaway_config.get("components") or []
     if not design:
         return None
 
@@ -904,12 +922,16 @@ def _giveaway_render_design(g, gid, guild, ended=False, winner_ids=None):
     raw = json.dumps(design)
     for tok, val in _giveaway_tokens(g, ended, winner_ids).items():
         raw = raw.replace(tok, _js(val))
+    # {Question: LABEL} is only the QUESTION (it defines the /giveaway form field).
+    # It shows nothing in the posted message — the ANSWER shows via {prize} etc.
+    raw = _QUESTION_RE.sub("", raw)
     try:
         comps = json.loads(raw)
     except Exception:
         comps = design
 
     built = [b for b in (_build_v2(c, guild) for c in comps) if b]
+    _giveaway_tidy_text(built)
 
     # Bind any user-placed Counter buttons to THIS giveaway and disable them once
     # it's ended. If the design has none, append the default Enter/Reroll row.
@@ -996,13 +1018,16 @@ def _pick_winners(entrants, count):
     return random.sample(pool, min(count, len(pool)))
 
 
-async def start_giveaway(channel, prize, winners, seconds, host_id, guild_id):
+async def start_giveaway(channel, prize, winners, seconds, host_id, guild_id, design=None, length=""):
     gid = secrets.token_hex(6)
     end_ts = int(time.time()) + seconds
     g = {
         "message_id": None, "channel_id": str(channel.id), "guild_id": str(guild_id or ""),
-        "prize": prize, "winners": max(1, int(winners)), "end_ts": end_ts,
+        "prize": prize, "winners": max(1, int(winners)), "end_ts": end_ts, "length": length or "",
         "host_id": str(host_id or ""), "entrants": set(), "ended": False,
+        # Optional per-giveaway design override; normally None (uses the shared
+        # dashboard design, with answer tokens filled from this giveaway's values).
+        "design": design if isinstance(design, list) and design else None,
     }
     active_giveaways[gid] = g
     mid = await _giveaway_send(channel, g, gid)
@@ -1047,6 +1072,89 @@ async def end_giveaway(gid, actor_id=None):
     return winner_ids
 
 
+def _giveaway_params_from_answers(labels, mapping):
+    """Work out prize / winner-count / duration (and the raw length text) from the
+    {Question:} answers by matching label keywords. A {Question:} token is only a
+    QUESTION — it defines a form field; the ANSWER shows via {prize}/{winners}/etc."""
+    WINNER_KW = ("winner", "how many")
+    LENGTH_KW = ("length", "duration", "how long")
+    prize, winners, seconds, length_str = "", 1, 0, ""
+    prize_set = False
+    for lbl in labels:
+        ans = (mapping.get(lbl) or "").strip()
+        low = lbl.lower()
+        if any(k in low for k in WINNER_KW):
+            try:
+                winners = max(1, min(int(re.sub(r"[^0-9]", "", ans) or "1"), 50))
+            except Exception:
+                winners = 1
+        elif any(k in low for k in LENGTH_KW):
+            seconds = _parse_duration_seconds(ans)
+            length_str = ans
+        elif "prize" in low and not prize_set:
+            prize, prize_set = ans, True
+    if not prize_set:
+        # No explicit prize question — use the first non-winner/non-length answer.
+        for lbl in labels:
+            low = lbl.lower()
+            if any(k in low for k in WINNER_KW + LENGTH_KW):
+                continue
+            if (mapping.get(lbl) or "").strip():
+                prize = mapping[lbl].strip()
+                break
+    if not seconds:
+        seconds = _parse_duration_seconds(str(giveaway_config.get("default_duration") or "1d")) or 86400
+    return prize, winners, seconds, length_str
+
+
+async def handle_giveaway_form_submit(interaction):
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception as e:
+        print(f"[Giveaway] form submit defer failed: {e}")
+    try:
+        design = giveaway_config.get("components") or []
+        labels = _parse_questions(design)
+        vals = _collect_modal_values((interaction.data or {}).get("components"))
+        mapping = {lbl: (vals.get(f"q{i}") or "").strip() for i, lbl in enumerate(labels)}
+        prize, winners, seconds, length_str = _giveaway_params_from_answers(labels, mapping)
+        gid = await start_giveaway(
+            interaction.channel, prize, winners, seconds,
+            host_id=interaction.user.id, guild_id=getattr(interaction.guild, "id", None),
+            length=length_str,
+        )
+        if gid:
+            await interaction.followup.send(embed=success_embed("Giveaway started", f"Ends <t:{int(time.time()) + seconds}:R> — {winners} winner(s)."), ephemeral=True)
+        else:
+            await interaction.followup.send(embed=error_embed("Couldn't post", "I couldn't post the giveaway here. Check my permissions in this channel."), ephemeral=True)
+    except Exception as e:
+        import traceback
+        print(f"[Giveaway] form submit failed: {e}\n{traceback.format_exc()}")
+        try:
+            await interaction.followup.send(embed=error_embed("Couldn't start giveaway", "Something went wrong. Please try again."), ephemeral=True)
+        except Exception:
+            pass
+
+
+async def _open_giveaway_question_form(interaction, questions):
+    components = []
+    for i, q in enumerate(questions):
+        components.append({
+            "type": 18,  # Label
+            "label": (_clean_label(q) or q)[:45],
+            "component": {
+                "type": 4, "custom_id": f"q{i}", "style": _form_input_style(q),
+                "required": True, "max_length": 1000,
+            },
+        })
+    data = {"title": "Start Giveaway", "custom_id": "giveawayform", "components": components}
+    route = discord.http.Route(
+        "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+        interaction_id=interaction.id, interaction_token=interaction.token,
+    )
+    await bot.http.request(route, json={"type": 9, "data": data})
+
+
 class GiveawayModal(discord.ui.Modal):
     def __init__(self):
         super().__init__(title="Start Giveaway", timeout=300)
@@ -1086,6 +1194,7 @@ class GiveawayModal(discord.ui.Modal):
         gid = await start_giveaway(
             interaction.channel, prize, winners, seconds,
             host_id=interaction.user.id, guild_id=getattr(interaction.guild, "id", None),
+            length=str(self.length.value or "").strip(),
         )
         if gid:
             await interaction.followup.send(embed=success_embed("Giveaway started", f"**{prize}** — {winners} winner(s), ends <t:{int(time.time()) + seconds}:R>."), ephemeral=True)
@@ -1098,8 +1207,14 @@ async def giveaway_cmd(interaction: discord.Interaction):
     if not _giveaway_can_manage(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "Only staff can start giveaways."), ephemeral=True)
         return
+    # If the design defines {Question:} fields, the form is built from those.
+    # Otherwise fall back to the standard Prize / Winner(s) / Length modal.
+    questions = _parse_questions(giveaway_config.get("components") or [])
     try:
-        await interaction.response.send_modal(GiveawayModal())
+        if questions:
+            await _open_giveaway_question_form(interaction, questions)
+        else:
+            await interaction.response.send_modal(GiveawayModal())
     except Exception as e:
         print(f"[Giveaway] modal open failed: {e!r}")
         try:
@@ -1160,6 +1275,8 @@ async def on_interaction(interaction: discord.Interaction):
         cid = (interaction.data or {}).get("custom_id", "")
         if cid.startswith("ticketform:"):
             await handle_ticket_form_submit(interaction, cid.split(":", 1)[1])
+        elif cid == "giveawayform":
+            await handle_giveaway_form_submit(interaction)
         return
     if interaction.type != discord.InteractionType.component:
         return
