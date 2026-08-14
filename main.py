@@ -3713,7 +3713,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-order-status"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
