@@ -468,6 +468,30 @@ def _resolve_role_mentions(text, guild):
     return text
 
 
+_CHANNEL_TOKEN_RE = re.compile(r"#([a-zA-Z0-9_\-]+)")
+
+
+def _resolve_channel_mentions(text, guild):
+    """Turn a plain '#channel-name' typed in the dashboard into a real <#id>
+    channel link. Only replaces names that match an actual channel, so markdown
+    headings ('## Title', '-# subtext') are left alone."""
+    if not text or "#" not in text or not guild:
+        return text
+    by_name = {}
+    for ch in getattr(guild, "channels", []) or []:
+        nm = (getattr(ch, "name", "") or "").lower()
+        if nm:
+            by_name.setdefault(nm, ch.id)
+    if not by_name:
+        return text
+
+    def repl(m):
+        cid = by_name.get(m.group(1).lower())
+        return f"<#{cid}>" if cid else m.group(0)
+
+    return _CHANNEL_TOKEN_RE.sub(repl, text)
+
+
 def _sub_placeholders(text, member):
     if not isinstance(text, str):
         return text
@@ -496,7 +520,7 @@ def _sub_placeholders(text, member):
     }
     for token, value in repl.items():
         text = text.replace(token, value)
-    return _resolve_emoji_shortcodes(_resolve_role_mentions(text, member.guild), member.guild)
+    return _resolve_emoji_shortcodes(_resolve_channel_mentions(_resolve_role_mentions(text, member.guild), member.guild), member.guild)
 
 
 def _render_guild_text(text, guild):
@@ -526,7 +550,7 @@ def _render_guild_text(text, guild):
         }
         for token, value in repl.items():
             text = text.replace(token, value)
-    return _resolve_emoji_shortcodes(_resolve_role_mentions(text, guild), guild)
+    return _resolve_emoji_shortcodes(_resolve_channel_mentions(_resolve_role_mentions(text, guild), guild), guild)
 
 
 _INVITE_TEXT_KEYS = {"text", "content", "label", "placeholder", "title", "description", "name", "value"}
@@ -784,13 +808,13 @@ async def payment_cmd(interaction: discord.Interaction):
 
 # ============================ Giveaways ============================
 
-_DUR_RE = re.compile(r"^(\d+)\s*(mo|m|h|d|w|y)$")
-_DUR_MULT = {"m": 60, "h": 3600, "d": 86400, "w": 604800, "mo": 2592000, "y": 31536000}
+_DUR_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*(mo|s|m|h|d|w|y)$")
+_DUR_MULT = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "mo": 2592000, "y": 31536000}
 
 
 def _parse_duration_seconds(text):
-    """'10m' '2h' '1d' '1w' '1mo' '1y' -> seconds. A bare number means DAYS
-    (so '1' = 1 day). 0 if invalid."""
+    """'30s' '10m' '2h' '1.5d' '1w' '1mo' '1y' -> seconds. Decimals are allowed
+    with a unit; a bare number means DAYS (so '1' = 1 day). 0 if invalid."""
     if not text:
         return 0
     s = str(text).strip().lower()
@@ -800,10 +824,10 @@ def _parse_duration_seconds(text):
     m = _DUR_RE.match(s)
     if not m:
         return 0
-    n = int(m.group(1))
+    n = float(m.group(1))
     if n <= 0:
         return 0
-    return n * _DUR_MULT.get(m.group(2), 0)
+    return int(round(n * _DUR_MULT.get(m.group(2), 0)))
 
 
 def _giveaway_can_manage(member):
@@ -1188,7 +1212,7 @@ class GiveawayModal(discord.ui.Modal):
         self.length = discord.ui.TextInput(
             label="Length", style=discord.TextStyle.short, required=True, max_length=8,
             default=str(giveaway_config.get("default_duration", "1d")),
-            placeholder="10m, 2h, 1d, 1w, 1mo",
+            placeholder="30s, 10m, 2h, 1d, 1w (or just a number = days)",
         )
         self.add_item(self.prize)
         self.add_item(self.winners)
