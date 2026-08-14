@@ -146,6 +146,50 @@ def _parse_order_services(raw):
     return out
 
 
+def _order_slug(name):
+    """Token slug from a service's display name: letters + digits, lowercased.
+    'Liveries' -> 'liveries', 'Bot Design' -> 'botdesign', 'GFX' -> 'gfx'."""
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+
+
+def _order_status_for(guild, svc):
+    """(emoji, label) for one service based on its current open ticket count."""
+    limited_at = int(order_status_config.get("limited_at") or 8)
+    closed_at = int(order_status_config.get("closed_at") or 10)
+    cat = svc.get("category") or svc.get("name") or ""
+    count = _open_ticket_count_for_category(guild, cat)
+    if count >= closed_at:
+        return (order_status_config.get("emoji_closed") or "", order_status_config.get("label_closed") or "Closed")
+    if count >= limited_at:
+        return (order_status_config.get("emoji_limited") or "", order_status_config.get("label_limited") or "Oversite+ Only")
+    return (order_status_config.get("emoji_open") or "", order_status_config.get("label_open") or "Open")
+
+
+def _render_order_tokens(text, guild):
+    """Replace per-service status tokens anywhere in text. For a service named
+    'Liveries' (slug 'liveries'):
+      {liveries}       -> 'Liveries — <emoji> <label>'   (name + live status)
+      {liveriesstatus} -> '<emoji> <label>'              (status only)
+    Emojis stay as :shortcodes: here — _render_guild_text resolves them after."""
+    if not (guild and isinstance(text, str)) or "{" not in text:
+        return text
+    for svc in (order_status_config.get("services") or []):
+        slug = _order_slug(svc.get("name"))
+        if not slug:
+            continue
+        tok_status = "{" + slug + "status}"
+        tok_full = "{" + slug + "}"
+        if tok_status not in text and tok_full not in text:
+            continue
+        emoji, lbl = _order_status_for(guild, svc)
+        status_only = f"{emoji} {lbl}".strip()
+        name = svc.get("name") or ""
+        name_status = f"{name} — {status_only}".strip() if status_only else name
+        text = text.replace(tok_status, status_only)
+        text = text.replace(tok_full, name_status)
+    return text
+
+
 def _msg_key(open_components, label=""):
     raw = json.dumps(open_components or [], sort_keys=True) + "|" + (label or "")
     return hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
@@ -588,6 +632,8 @@ def _render_guild_text(text, guild):
         }
         for token, value in repl.items():
             text = text.replace(token, value)
+        # Custom per-service status tokens ({liveries}, {liveriesstatus}, …).
+        text = _render_order_tokens(text, guild)
     return _resolve_emoji_shortcodes(_resolve_channel_mentions(_resolve_role_mentions(text, guild), guild), guild)
 
 
@@ -1679,36 +1725,18 @@ async def show_order_status(interaction):
     if not guild:
         await interaction.followup.send(embed=error_embed("Unavailable", "This only works inside a server."), ephemeral=True)
         return
-    limited_at = int(order_status_config.get("limited_at") or 8)
-    closed_at = int(order_status_config.get("closed_at") or 10)
     services = order_status_config.get("services") or []
-
-    # Emojis are entered as :shortcode: (or a normal emoji) in the dashboard;
-    # resolve them against this guild's custom emojis, same as button labels.
-    e_open = _render_guild_text(order_status_config.get("emoji_open") or "", guild)
-    e_lim = _render_guild_text(order_status_config.get("emoji_limited") or "", guild)
-    e_clo = _render_guild_text(order_status_config.get("emoji_closed") or "", guild)
-    l_open = order_status_config.get("label_open") or "Open"
-    l_lim = order_status_config.get("label_limited") or "Oversite+ Only"
-    l_clo = order_status_config.get("label_closed") or "Closed"
-
     lines = []
     for svc in services:
         name = svc.get("name") or ""
-        cat = svc.get("category") or name
-        count = _open_ticket_count_for_category(guild, cat)
-        if count >= closed_at:
-            emoji, lbl = e_clo, l_clo
-        elif count >= limited_at:
-            emoji, lbl = e_lim, l_lim
-        else:
-            emoji, lbl = e_open, l_open
+        emoji, lbl = _order_status_for(guild, svc)
         prefix = f"{emoji} " if emoji else ""
         lines.append(f"{prefix}**{name}** — {lbl}")
 
     title = order_status_config.get("title") or "Order Status"
     desc = "\n".join(lines) if lines else "No services are configured yet."
-    e = discord.Embed(title=title, description=desc)
+    # Resolve any :emoji: shortcodes in the assembled text.
+    e = discord.Embed(title=_render_guild_text(title, guild), description=_render_guild_text(desc, guild))
     await interaction.followup.send(embed=e, ephemeral=True)
 
 
