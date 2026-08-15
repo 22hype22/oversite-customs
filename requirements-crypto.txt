@@ -1,0 +1,5 @@
+# Only needed for LIVE trading (signing and sending Solana transactions).
+# Paper mode and every read-only command run on the base requirements —
+# the engine uses httpx, which the bot already depends on, plus stdlib sqlite3.
+solders>=0.21.0
+base58>=2.1.1

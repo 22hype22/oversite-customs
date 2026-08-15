@@ -57,6 +57,24 @@ BUTTON_STYLE_MAP = {
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Crypto trading (optional). Registered here so /crypto exists before the tree
+# syncs; the engine itself only boots if CRYPTO_ENABLED=1. Guarded so a broken
+# or absent crypto package can never stop the shop bot from starting.
+try:
+    from crypto_commands import setup_crypto, shutdown_crypto, start_crypto
+
+    setup_crypto(bot)
+    CRYPTO_AVAILABLE = True
+except Exception as _crypto_import_error:  # pragma: no cover - import guard
+    print(f"[Crypto] not loaded: {_crypto_import_error!r}")
+    CRYPTO_AVAILABLE = False
+
+    async def start_crypto(_bot):
+        return None
+
+    async def shutdown_crypto():
+        return None
+
 welcome_config = {"enabled": True, "channel_id": WELCOME_CHANNEL_ID, "message": ""}
 invite_config = {"channel_id": "", "components": [], "embeds": [], "messages": []}
 ticket_config = {
@@ -409,6 +427,11 @@ async def on_ready():
     if not update_status.is_running():
         update_status.start()
     await refresh_status()
+
+    try:
+        await start_crypto(bot)
+    except Exception as e:
+        print(f"[Startup] crypto start failed: {e}")
 
     try:
         if os.getenv("SKIP_SYNC") == "1":
@@ -4583,6 +4606,12 @@ async def _shutdown():
             loop.cancel()
         except Exception:
             pass
+    # Stop trading before the process goes away — a live engine left mid-tick
+    # would otherwise be killed with an order in flight.
+    try:
+        await shutdown_crypto()
+    except Exception as e:
+        print(f"[Shutdown] crypto stop failed: {e}")
     await bot.close()
 
 

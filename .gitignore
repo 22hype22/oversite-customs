@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+
+# Trade ledgers — local state, never commit (they contain your fill history)
+*.db
+crypto_trades.db
