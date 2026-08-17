@@ -419,6 +419,8 @@ async def on_ready():
 
     if not update_status.is_running():
         update_status.start()
+    if not portfolio_cleanup.is_running():
+        portfolio_cleanup.start()
     await refresh_status()
 
     try:
@@ -1817,7 +1819,63 @@ async def status_cmd(interaction: discord.Interaction):
 
 # ===================== Portfolio =====================
 
-@bot.tree.command(name="portfolio", description="Post the portfolio design to its channel")
+async def _portfolio_posts_call(action, thread_id=None, channel_id=None,
+                                guild_id=None, owner_id=None, owner_name=None):
+    """Persist/read portfolio-post ownership server-side so posts survive
+    redeploys and a daily sweep can delete a post when its owner leaves.
+    Actions: get_all (no thread_id), add, remove."""
+    payload = {"action": action}
+    if thread_id is not None:
+        payload["thread_id"] = str(thread_id)
+    if channel_id is not None:
+        payload["channel_id"] = str(channel_id)
+    if guild_id is not None:
+        payload["guild_id"] = str(guild_id)
+    if owner_id is not None:
+        payload["owner_id"] = str(owner_id)
+    if owner_name is not None:
+        payload["owner_name"] = str(owner_name)
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{SUPABASE_FN_URL}/portfolio-posts",
+                headers=_fn_headers(), json=payload, timeout=15,
+            )
+            data = r.json() if r.content else {}
+            if r.status_code != 200 or (isinstance(data, dict) and data.get("error")):
+                # A 404 here means the 'portfolio-posts' edge function isn't deployed.
+                print(f"[Portfolio] posts {action} -> HTTP {r.status_code}: {str(data)[:200]}")
+            return data
+    except Exception as e:
+        print(f"[Portfolio] posts {action} call failed: {e}")
+        return {"error": str(e)[:200]}
+
+
+async def _portfolio_find_existing(guild_id, owner_id):
+    """Return the thread id of this member's existing portfolio post in this
+    guild, or None. Cleans up records whose thread was already deleted."""
+    res = await _portfolio_posts_call("get_all")
+    if not (isinstance(res, dict) and res.get("ok")):
+        return None
+    for tid, rec in (res.get("posts") or {}).items():
+        if str(rec.get("guild_id")) != str(guild_id) or str(rec.get("owner_id")) != str(owner_id):
+            continue
+        # Make sure the post still exists — if it was deleted, forget it so a
+        # fresh one can be made.
+        try:
+            ch = bot.get_channel(int(tid)) or await bot.fetch_channel(int(tid))
+        except discord.NotFound:
+            ch = None
+        except Exception:
+            return tid  # can't verify right now — treat as existing to be safe
+        if ch is None:
+            await _portfolio_posts_call("remove", thread_id=tid)
+            continue
+        return tid
+    return None
+
+
+@bot.tree.command(name="portfolio", description="Post your portfolio to its channel")
 async def portfolio_cmd(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(embed=error_embed("No permission", "Only staff can post the portfolio."), ephemeral=True)
@@ -1832,9 +1890,29 @@ async def portfolio_cmd(interaction: discord.Interaction):
         await interaction.followup.send(embed=error_embed("No channel", "Pick a channel for the portfolio in the dashboard, then save it."), ephemeral=True)
         return
     _V2_LAST_ERROR["msg"] = ""
-    # Forum channels can't take a plain message — post a new thread (forum post).
+    # Forum channels can't take a plain message — post a new thread (forum post)
+    # named after the member who ran the command, and remember who owns it.
     if isinstance(ch, discord.ForumChannel):
-        mid = await send_v2_forum_post(ch, comps)
+        # One portfolio post per member — if they already have a live one, just
+        # hand them the link instead of making a second.
+        existing = await _portfolio_find_existing(interaction.guild_id, interaction.user.id)
+        if existing:
+            link = f"https://discord.com/channels/{interaction.guild_id}/{existing}"
+            await interaction.followup.send(embed=info_embed("You already have a portfolio", f"Here's yours: {link}"), ephemeral=True)
+            return
+        mid = await send_v2_forum_post(ch, comps, name=interaction.user.name)
+        if mid and mid is not True:
+            await _portfolio_posts_call(
+                "add", thread_id=mid, channel_id=ch.id,
+                guild_id=interaction.guild_id, owner_id=interaction.user.id,
+                owner_name=interaction.user.name,
+            )
+            link = f"https://discord.com/channels/{interaction.guild_id}/{mid}"
+            await interaction.followup.send(embed=success_embed("Posted", f"Your portfolio is up: {link}"), ephemeral=True)
+        else:
+            reason = _V2_LAST_ERROR.get("msg") or "unknown error"
+            await interaction.followup.send(embed=error_embed("Couldn't post", f"Discord rejected the portfolio: {reason}"), ephemeral=True)
+        return
     elif isinstance(ch, discord.CategoryChannel) or not hasattr(ch, "send"):
         await interaction.followup.send(embed=error_embed("Not postable", "The portfolio channel is a category. Pick a text or forum channel in the dashboard, then save it."), ephemeral=True)
         return
@@ -1845,6 +1923,57 @@ async def portfolio_cmd(interaction: discord.Interaction):
     else:
         reason = _V2_LAST_ERROR.get("msg") or "unknown error"
         await interaction.followup.send(embed=error_embed("Couldn't post", f"Discord rejected the portfolio: {reason}"), ephemeral=True)
+
+
+@tasks.loop(hours=24)
+async def portfolio_cleanup():
+    """Once a day, delete any portfolio post whose owner has left the server.
+    Also forgets records whose post was already deleted by hand."""
+    res = await _portfolio_posts_call("get_all")
+    if not (isinstance(res, dict) and res.get("ok")):
+        return
+    posts = res.get("posts") or {}
+    for tid, rec in list(posts.items()):
+        guild_id = rec.get("guild_id")
+        owner_id = rec.get("owner_id")
+        guild = bot.get_guild(int(guild_id)) if guild_id else None
+        if not guild:
+            continue  # bot isn't in that guild right now — can't verify, leave it
+        # Is the post itself still there?
+        try:
+            thread = bot.get_channel(int(tid)) or await bot.fetch_channel(int(tid))
+        except discord.NotFound:
+            thread = None
+        except Exception:
+            continue  # transient error — try again next sweep
+        if thread is None:
+            await _portfolio_posts_call("remove", thread_id=tid)
+            continue
+        # Is the owner still a member?
+        present = None
+        if owner_id:
+            if guild.get_member(int(owner_id)) is not None:
+                present = True
+            else:
+                try:
+                    await guild.fetch_member(int(owner_id))
+                    present = True
+                except discord.NotFound:
+                    present = False
+                except Exception:
+                    present = None  # transient — skip this cycle
+        if present is False:
+            try:
+                await thread.delete()
+                print(f"[Portfolio] deleted post {tid} — owner {owner_id} left")
+            except Exception as e:
+                print(f"[Portfolio] cleanup delete failed for {tid}: {e}")
+            await _portfolio_posts_call("remove", thread_id=tid)
+
+
+@portfolio_cleanup.before_loop
+async def before_portfolio_cleanup():
+    await bot.wait_until_ready()
 
 
 # ===================== Pricing =====================
