@@ -406,6 +406,12 @@ async def on_ready():
     except Exception as e:
         print(f"[Startup] config load failed: {e}")
 
+    # Restore every saved giveaway (entrants + timers) so redeploys never drop them.
+    try:
+        await _gw_restore_all()
+    except Exception as e:
+        print(f"[Startup] giveaway restore failed: {e}")
+
     if not update_status.is_running():
         update_status.start()
     await refresh_status()
@@ -1238,6 +1244,7 @@ async def start_giveaway(channel, prize, winners, seconds, host_id, guild_id, de
         active_giveaways.pop(gid, None)
         return None
     g["message_id"] = mid
+    await _gw_save_state(gid, g)  # persist so it survives a redeploy immediately
     asyncio.create_task(_giveaway_timer(gid, seconds))
     return gid
 
@@ -1263,6 +1270,7 @@ async def end_giveaway(gid, actor_id=None):
     # congratulations message is posted — the winner shows on the message itself,
     # which is never deleted.
     await _giveaway_patch(g, _giveaway_payload(g, gid, guild, ended=True, winner_ids=winner_ids, for_edit=True))
+    await _gw_save_state(gid, g)  # persist the ended state + winners for reroll after a redeploy
     print(f"[Giveaway] {gid} ended — message {g.get('message_id')} EDITED to winner state (never deleted)")
     return winner_ids
 
@@ -2125,11 +2133,18 @@ def _parse_gw_cid(raw):
     return gid, end_ts, winners
 
 
-async def _gw_entries_call(action, gid, uid=None):
-    """Persist/read giveaway entrants server-side so entries survive redeploys."""
-    payload = {"action": action, "gid": str(gid)}
+async def _gw_entries_call(action, gid=None, uid=None, meta=None, entrants=None):
+    """Persist/read giveaway state server-side so giveaways + entries survive
+    redeploys. Supports get_all (no gid), get, set_state, add, remove, clear."""
+    payload = {"action": action}
+    if gid is not None:
+        payload["gid"] = str(gid)
     if uid is not None:
         payload["uid"] = str(uid)
+    if meta is not None:
+        payload["meta"] = meta
+    if entrants is not None:
+        payload["entrants"] = [str(u) for u in entrants]
     try:
         async with httpx.AsyncClient() as client:
             r = await client.post(
@@ -2144,6 +2159,51 @@ async def _gw_entries_call(action, gid, uid=None):
     except Exception as e:
         print(f"[Giveaway] entries {action} call failed: {e}")
         return {"error": str(e)[:200]}
+
+
+def _gw_meta(g):
+    """JSON-safe snapshot of a giveaway's metadata (everything but the entrants set)."""
+    return {k: v for k, v in g.items() if k != "entrants"}
+
+
+async def _gw_save_state(gid, g):
+    """Persist a giveaway's full state (metadata + entrants). Called on create,
+    on end, and on shutdown so the whole giveaway is remembered across redeploys."""
+    try:
+        await _gw_entries_call("set_state", gid=gid, meta=_gw_meta(g),
+                               entrants=list(g.get("entrants") or []))
+    except Exception as e:
+        print(f"[Giveaway] save_state {gid} failed: {e}")
+
+
+async def _gw_restore_all():
+    """On boot, rebuild EVERY saved giveaway into memory with its entrants and
+    re-arm its timer — so giveaways come back fully after a redeploy without
+    waiting for anyone to click."""
+    res = await _gw_entries_call("get_all")
+    if not (isinstance(res, dict) and res.get("ok")):
+        print(f"[Giveaway] restore skipped (is 'giveaway-entries' deployed?): {(res or {}).get('error')}")
+        return
+    gws = res.get("giveaways") or {}
+    now = int(time.time())
+    restored = 0
+    for gid, state in gws.items():
+        meta = (state or {}).get("meta") or {}
+        if not meta.get("channel_id"):
+            continue  # incomplete (legacy entrants-only) — handled lazily on click
+        g = dict(meta)
+        g["entrants"] = set(str(u) for u in ((state or {}).get("entrants") or []))
+        g.setdefault("ended", False)
+        g.setdefault("winners", 1)
+        active_giveaways[gid] = g
+        restored += 1
+        if not g.get("ended"):
+            end_ts = int(g.get("end_ts") or 0)
+            if end_ts:
+                remaining = end_ts - now
+                asyncio.create_task(end_giveaway(gid) if remaining <= 0 else _giveaway_timer(gid, remaining))
+    if restored:
+        print(f"[Giveaway] restored {restored} giveaway(s) from storage")
 
 
 async def _giveaway_adopt(interaction, gid, end_ts, winners):
@@ -4576,6 +4636,18 @@ async def before_sync_identity():
 
 async def _shutdown():
     print("[Shutdown] shutting down")
+    # Flush every active giveaway (entrants + state) BEFORE we exit, so a redeploy
+    # never drops anyone — the boot restore puts them all back.
+    try:
+        pending = list(active_giveaways.items())
+        if pending:
+            await asyncio.wait_for(
+                asyncio.gather(*[_gw_save_state(gid, g) for gid, g in pending], return_exceptions=True),
+                timeout=8,
+            )
+            print(f"[Shutdown] flushed {len(pending)} giveaway(s) to storage")
+    except Exception as e:
+        print(f"[Shutdown] giveaway flush error: {e}")
     if SUPABASE_URL and BOT_ORDER_ID:
         try:
             async with httpx.AsyncClient() as client:
