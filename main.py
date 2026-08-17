@@ -1831,12 +1831,15 @@ async def portfolio_cmd(interaction: discord.Interaction):
     if not ch:
         await interaction.followup.send(embed=error_embed("No channel", "Pick a channel for the portfolio in the dashboard, then save it."), ephemeral=True)
         return
-    # A category can't receive messages — only text channels/threads can.
-    if isinstance(ch, discord.CategoryChannel) or not hasattr(ch, "send"):
-        await interaction.followup.send(embed=error_embed("Not a text channel", "The portfolio channel is a category. Pick a text channel in the dashboard, then save it."), ephemeral=True)
-        return
     _V2_LAST_ERROR["msg"] = ""
-    mid = await send_v2_message(ch, comps)
+    # Forum channels can't take a plain message — post a new thread (forum post).
+    if isinstance(ch, discord.ForumChannel):
+        mid = await send_v2_forum_post(ch, comps)
+    elif isinstance(ch, discord.CategoryChannel) or not hasattr(ch, "send"):
+        await interaction.followup.send(embed=error_embed("Not postable", "The portfolio channel is a category. Pick a text or forum channel in the dashboard, then save it."), ephemeral=True)
+        return
+    else:
+        mid = await send_v2_message(ch, comps)
     if mid:
         await interaction.followup.send(embed=success_embed("Posted", f"Portfolio posted in {ch.mention}."), ephemeral=True)
     else:
@@ -3468,6 +3471,60 @@ async def send_v2_message(channel, components_v2, content=None, interaction=None
         return False
 
 
+def _v2_thread_name(components_v2, default="Portfolio"):
+    """Derive a forum-post title from the first bit of text in the design."""
+    def _first_text(items):
+        for c in items or []:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") in ("text", "text_display"):
+                t = (c.get("title") or c.get("text") or c.get("content") or "").strip()
+                if t:
+                    return t
+            for kids in (c.get("children"), c.get("components")):
+                if isinstance(kids, list):
+                    t = _first_text(kids)
+                    if t:
+                        return t
+        return ""
+    raw = _first_text(components_v2) or default
+    # First line only, strip markdown emphasis, cap at Discord's 100-char limit.
+    line = raw.splitlines()[0].replace("*", "").replace("_", "").replace("#", "").strip()
+    return (line or default)[:100]
+
+
+async def send_v2_forum_post(forum, components_v2, name=None):
+    """Create a forum post (thread) carrying a Components-V2 message. Forum
+    channels can't take a plain message — a thread with a starter message is
+    the only way to post into them. Returns the thread id (truthy) or False."""
+    _guild = getattr(forum, "guild", None)
+    built = [b for b in (_build_v2(c, _guild) for c in components_v2) if b]
+    if not built:
+        return False
+    ALLOWED_TOP = {1, 9, 10, 12, 13, 14, 17}
+    if not {c.get("type") for c in built}.issubset(ALLOWED_TOP):
+        built = [{"type": 17, "components": built}]
+    payload = {
+        "name": name or _v2_thread_name(components_v2),
+        "message": {"components": built, "flags": 1 << 15},
+    }
+    route = discord.http.Route("POST", "/channels/{channel_id}/threads", channel_id=forum.id)
+    try:
+        resp = await bot.http.request(route, json=payload)
+        if isinstance(resp, dict) and resp.get("id"):
+            return str(resp["id"])
+        return True
+    except discord.HTTPException as e:
+        body = getattr(e, "text", "") or ""
+        _V2_LAST_ERROR["msg"] = f"HTTP {getattr(e, 'status', '?')}: {body[:400]}"
+        print(f"[V2] forum post failed: HTTP {getattr(e, 'status', '?')} {body[:600]}")
+        return False
+    except Exception as e:
+        _V2_LAST_ERROR["msg"] = str(e)[:400]
+        print(f"[V2] forum post failed: {e}")
+        return False
+
+
 _BUTTON_EMOJI_RE = re.compile(r"<(a?):([a-zA-Z0-9_]+):(\d+)>")
 
 
@@ -4505,6 +4562,8 @@ async def cache_channels(guild_id):
     for ch in guild.channels:
         if isinstance(ch, discord.TextChannel):
             ctype = "text"
+        elif isinstance(ch, discord.ForumChannel):
+            ctype = "forum"
         elif isinstance(ch, discord.VoiceChannel):
             ctype = "voice"
         elif isinstance(ch, discord.CategoryChannel):
