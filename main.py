@@ -1818,8 +1818,11 @@ async def _pricing_call(action, entries=None):
             data = r.json() if r.content else {}
             if r.status_code == 200:
                 return data
+            # A 404 here means the 'pricing' edge function isn't deployed.
+            print(f"[Pricing] {action} -> HTTP {r.status_code}: {str(data)[:200]}")
             return {"error": data.get("error") or f"HTTP {r.status_code}"}
     except Exception as e:
+        print(f"[Pricing] {action} call failed: {e}")
         return {"error": str(e)[:200]}
 
 
@@ -2133,8 +2136,13 @@ async def _gw_entries_call(action, gid, uid=None):
                 f"{SUPABASE_FN_URL}/giveaway-entries",
                 headers=_fn_headers(), json=payload, timeout=15,
             )
-            return r.json() if r.content else {}
+            data = r.json() if r.content else {}
+            if r.status_code != 200 or (isinstance(data, dict) and data.get("error")):
+                # A 404 here means the 'giveaway-entries' edge function isn't deployed.
+                print(f"[Giveaway] entries {action} -> HTTP {r.status_code}: {str(data)[:200]}")
+            return data
     except Exception as e:
+        print(f"[Giveaway] entries {action} call failed: {e}")
         return {"error": str(e)[:200]}
 
 
@@ -3673,9 +3681,13 @@ async def apply_config(feature, cfg, post_panel=False):
         pricing_config["components"] = comps if isinstance(comps, list) else []
         # Pull the prices designers have set (persisted server-side).
         res = await _pricing_call("get")
+        priced_services = 0
         if isinstance(res, dict) and res.get("ok"):
             pricing_config["values"] = res.get("prices") or {}
-        print(f"[Config] pricing — {len(pricing_config['services'])} services, design {len(pricing_config['components'])}, roles {pricing_config['designer_role_ids']}")
+            priced_services = len(pricing_config["values"])
+        else:
+            print(f"[Pricing] price load FAILED (is the 'pricing' edge function deployed?): {(res or {}).get('error')}")
+        print(f"[Config] pricing — {len(pricing_config['services'])} services, design {len(pricing_config['components'])}, {priced_services} services priced, roles {pricing_config['designer_role_ids']}")
     elif feature == "invite":
         if cfg.get("channel_id"):
             invite_config["channel_id"] = str(cfg["channel_id"])
