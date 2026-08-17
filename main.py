@@ -114,6 +114,11 @@ active_giveaways = {}
 # panel via the {stock} token and decremented as members buy.
 robux_locker_config = {"channel_id": "", "components": [], "panel_ref": None, "stock": 0, "last_funds": 0, "rate_per_1k": 0.0}
 
+# ---- Portfolio ----
+# Post designed in the dashboard "Portfolio" block. Running /portfolio sends the
+# design to the configured channel.
+portfolio_config = {"channel_id": "", "components": []}
+
 # ---- Order Status ----
 # Configured in the dashboard "Order Status" block. An "Order Status" button
 # shows a live embed: each service is Open / Oversite+ only / Closed based on how
@@ -1808,6 +1813,29 @@ async def show_order_status(interaction):
 @bot.tree.command(name="status", description="Show the current order status")
 async def status_cmd(interaction: discord.Interaction):
     await show_order_status(interaction)
+
+
+# ===================== Portfolio =====================
+
+@bot.tree.command(name="portfolio", description="Post the portfolio design to its channel")
+async def portfolio_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(embed=error_embed("No permission", "Only staff can post the portfolio."), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    comps = portfolio_config.get("components") or []
+    if not comps:
+        await interaction.followup.send(embed=error_embed("Nothing to post", "Design the portfolio in the dashboard first, then save it."), ephemeral=True)
+        return
+    ch = await resolve_channel(portfolio_config.get("channel_id"))
+    if not ch:
+        await interaction.followup.send(embed=error_embed("No channel", "Pick a channel for the portfolio in the dashboard, then save it."), ephemeral=True)
+        return
+    mid = await send_v2_message(ch, comps)
+    if mid:
+        await interaction.followup.send(embed=success_embed("Posted", f"Portfolio posted in {ch.mention}."), ephemeral=True)
+    else:
+        await interaction.followup.send(embed=error_embed("Couldn't post", "Something went wrong sending the portfolio."), ephemeral=True)
 
 
 # ===================== Pricing =====================
@@ -3720,6 +3748,12 @@ async def apply_config(feature, cfg, post_panel=False):
         # Post/refresh the panel on a save (deliberate action), not on boot.
         if post_panel:
             await post_robux_locker_panel()
+    elif feature in ("portfolio", "customs-portfolio"):
+        if cfg.get("channel_id"):
+            portfolio_config["channel_id"] = str(cfg["channel_id"])
+        comps = cfg.get("components")
+        portfolio_config["components"] = comps if isinstance(comps, list) else []
+        print(f"[Config] portfolio — channel {portfolio_config['channel_id']} design {len(portfolio_config['components'])}")
     elif feature in ("order-status", "customs-order-status"):
         order_status_config["title"] = str(cfg.get("title") or "Order Status")
         try:
@@ -4265,7 +4299,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-order-status", "customs-pricing"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-order-status", "customs-pricing"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
