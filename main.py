@@ -1831,11 +1831,17 @@ async def portfolio_cmd(interaction: discord.Interaction):
     if not ch:
         await interaction.followup.send(embed=error_embed("No channel", "Pick a channel for the portfolio in the dashboard, then save it."), ephemeral=True)
         return
+    # A category can't receive messages — only text channels/threads can.
+    if isinstance(ch, discord.CategoryChannel) or not hasattr(ch, "send"):
+        await interaction.followup.send(embed=error_embed("Not a text channel", "The portfolio channel is a category. Pick a text channel in the dashboard, then save it."), ephemeral=True)
+        return
+    _V2_LAST_ERROR["msg"] = ""
     mid = await send_v2_message(ch, comps)
     if mid:
         await interaction.followup.send(embed=success_embed("Posted", f"Portfolio posted in {ch.mention}."), ephemeral=True)
     else:
-        await interaction.followup.send(embed=error_embed("Couldn't post", "Something went wrong sending the portfolio."), ephemeral=True)
+        reason = _V2_LAST_ERROR.get("msg") or "unknown error"
+        await interaction.followup.send(embed=error_embed("Couldn't post", f"Discord rejected the portfolio: {reason}"), ephemeral=True)
 
 
 # ===================== Pricing =====================
