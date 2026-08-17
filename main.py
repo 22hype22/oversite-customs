@@ -1875,12 +1875,10 @@ async def _portfolio_find_existing(guild_id, owner_id):
     return None
 
 
-@bot.tree.command(name="portfolio", description="Post your portfolio to its channel")
-async def portfolio_cmd(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message(embed=error_embed("No permission", "Only staff can post the portfolio."), ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
+async def _do_portfolio_post(interaction):
+    """Create this member's portfolio post. Assumes the interaction is already
+    deferred (ephemeral) and replies with a followup. Shared by /portfolio and
+    /joinsetup. Enforces one live post per member in forum channels."""
     comps = portfolio_config.get("components") or []
     if not comps:
         await interaction.followup.send(embed=error_embed("Nothing to post", "Design the portfolio in the dashboard first, then save it."), ephemeral=True)
@@ -1891,7 +1889,7 @@ async def portfolio_cmd(interaction: discord.Interaction):
         return
     _V2_LAST_ERROR["msg"] = ""
     # Forum channels can't take a plain message — post a new thread (forum post)
-    # named after the member who ran the command, and remember who owns it.
+    # named after the member, and remember who owns it.
     if isinstance(ch, discord.ForumChannel):
         # One portfolio post per member — if they already have a live one, just
         # hand them the link instead of making a second.
@@ -1913,16 +1911,24 @@ async def portfolio_cmd(interaction: discord.Interaction):
             reason = _V2_LAST_ERROR.get("msg") or "unknown error"
             await interaction.followup.send(embed=error_embed("Couldn't post", f"Discord rejected the portfolio: {reason}"), ephemeral=True)
         return
-    elif isinstance(ch, discord.CategoryChannel) or not hasattr(ch, "send"):
+    if isinstance(ch, discord.CategoryChannel) or not hasattr(ch, "send"):
         await interaction.followup.send(embed=error_embed("Not postable", "The portfolio channel is a category. Pick a text or forum channel in the dashboard, then save it."), ephemeral=True)
         return
-    else:
-        mid = await send_v2_message(ch, comps)
+    mid = await send_v2_message(ch, comps)
     if mid:
         await interaction.followup.send(embed=success_embed("Posted", f"Portfolio posted in {ch.mention}."), ephemeral=True)
     else:
         reason = _V2_LAST_ERROR.get("msg") or "unknown error"
         await interaction.followup.send(embed=error_embed("Couldn't post", f"Discord rejected the portfolio: {reason}"), ephemeral=True)
+
+
+@bot.tree.command(name="portfolio", description="Post your portfolio to its channel")
+async def portfolio_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(embed=error_embed("No permission", "Only staff can post the portfolio."), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await _do_portfolio_post(interaction)
 
 
 @tasks.loop(hours=24)
@@ -2290,6 +2296,126 @@ async def handle_setprice_one_submit(interaction, si, ii):
     await interaction.followup.send(embed=_pricing_embed(si, interaction.guild), ephemeral=True)
 
 
+# ===================== Join Setup =====================
+# /joinsetup onboards a designer: set your prices (same picker as /setpricing),
+# then click Done to auto-create your portfolio post. It reuses the pricing
+# save logic and the shared _do_portfolio_post helper.
+
+def _joinsetup_service_rows():
+    """The service picker plus a persistent Done button, shown at each step."""
+    services = pricing_config.get("services") or []
+    options = [{"label": s["name"][:100], "value": str(i)} for i, s in enumerate(services[:25])]
+    return [
+        {"type": 1, "components": [{"type": 3, "custom_id": "joinsetup_svc",
+                                    "placeholder": "Pick a service to set your prices", "options": options}]},
+        {"type": 1, "components": [{"type": 2, "style": 3, "custom_id": "joinsetup_done",
+                                    "label": "Done — Create my portfolio"}]},
+    ]
+
+
+@bot.tree.command(name="joinsetup", description="Set your pricing, then get your portfolio")
+async def joinsetup_cmd(interaction: discord.Interaction):
+    if not _pricing_can_manage(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "Only designers can run setup."), ephemeral=True)
+        return
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+    await _ensure_pricing_loaded()
+    if not (pricing_config.get("services") or []):
+        await interaction.followup.send(embed=info_embed("No services", "Add services in the dashboard Pricing block first, then Save."), ephemeral=True)
+        return
+    route = discord.http.Route(
+        "PATCH", "/webhooks/{application_id}/{interaction_token}/messages/@original",
+        application_id=bot.application_id, interaction_token=interaction.token,
+    )
+    await bot.http.request(route, json={
+        "content": "**Step 1 — Set your prices.** Pick each service and fill in your Robux/USD. "
+                   "When you're finished, click **Done — Create my portfolio**.",
+        "components": _joinsetup_service_rows(),
+    })
+
+
+async def _joinsetup_open_item(interaction, si):
+    services = pricing_config.get("services") or []
+    if si < 0 or si >= len(services):
+        return
+    svc = services[si]
+    name = svc.get("name") or ""
+    items = svc.get("items") or []
+    if not items:
+        await _raw_interaction_reply(interaction, 7, content=f"**{name}** has no items to price. Pick another, or click Done:", components=_joinsetup_service_rows())
+        return
+    options = [{"label": it[:100], "value": str(i)} for i, it in enumerate(items[:25])]
+    rows = [
+        {"type": 1, "components": [{"type": 3, "custom_id": f"joinsetup_item:{si}",
+                                    "placeholder": "Pick an item to price", "options": options}]},
+        {"type": 1, "components": [{"type": 2, "style": 3, "custom_id": "joinsetup_done",
+                                    "label": "Done — Create my portfolio"}]},
+    ]
+    await _raw_interaction_reply(interaction, 7, content=f"**{name}** — pick an item to price (or click Done when finished):", components=rows)
+
+
+async def _joinsetup_open_one(interaction, si, ii):
+    services = pricing_config.get("services") or []
+    if si < 0 or si >= len(services):
+        return
+    svc = services[si]
+    name = svc.get("name") or ""
+    items = svc.get("items") or []
+    if ii < 0 or ii >= len(items):
+        return
+    item = items[ii]
+    uid = str(interaction.user.id)
+    mine = ((pricing_config.get("values") or {}).get(name, {}) or {}).get(uid, {})
+    robux, usd = _price_parts(mine.get(item))
+    components = [
+        {"type": 18, "label": f"{item[:30]} — Robux",
+         "component": {"type": 4, "custom_id": "robux", "style": 1, "required": False,
+                       "max_length": 20, "value": robux, "placeholder": "e.g. 1500 (blank = none)"}},
+        {"type": 18, "label": f"{item[:30]} — USD",
+         "component": {"type": 4, "custom_id": "usd", "style": 1, "required": False,
+                       "max_length": 20, "value": usd, "placeholder": "e.g. 15 (blank = none)"}},
+    ]
+    data = {"title": f"{item} price"[:45], "custom_id": f"joinsetup_one:{si}:{ii}", "components": components}
+    route = discord.http.Route("POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+                               interaction_id=interaction.id, interaction_token=interaction.token)
+    await bot.http.request(route, json={"type": 9, "data": data})
+
+
+async def _joinsetup_one_submit(interaction, si, ii):
+    services = pricing_config.get("services") or []
+    if si < 0 or si >= len(services):
+        return
+    svc = services[si]
+    name = svc.get("name") or ""
+    items = svc.get("items") or []
+    if ii < 0 or ii >= len(items):
+        return
+    item = items[ii]
+    vals = _modal_values((interaction.data or {}).get("components"))
+    robux = str(vals.get("robux") or "").strip()
+    usd = str(vals.get("usd") or "").strip()
+    ok, err = await _save_pricing_entries([{
+        "service": name, "user": str(interaction.user.id), "item": item, "robux": robux, "usd": usd,
+    }])
+    if ok:
+        note = f"Saved **{item}** ✓ — set more prices, or click **Done — Create my portfolio**."
+    else:
+        note = f"Couldn't save **{item}**: {str(err)[:200]}"
+    # Update the message (the modal was launched from a component) back to the picker.
+    await _raw_interaction_reply(interaction, 7, content=note, components=_joinsetup_service_rows())
+
+
+async def _joinsetup_done(interaction):
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+    await _do_portfolio_post(interaction)
+
+
 def _parse_gw_cid(raw):
     """Split the Enter button's custom_id payload ('gid' or 'gid|end_ts|winners')."""
     parts = str(raw).split("|")
@@ -2526,6 +2652,13 @@ async def on_interaction(interaction: discord.Interaction):
             except Exception:
                 si, ii = -1, -1
             await handle_setprice_one_submit(interaction, si, ii)
+        elif cid.startswith("joinsetup_one:"):
+            parts = cid.split(":")
+            try:
+                si, ii = int(parts[1]), int(parts[2])
+            except Exception:
+                si, ii = -1, -1
+            await _joinsetup_one_submit(interaction, si, ii)
         return
     if interaction.type != discord.InteractionType.component:
         return
@@ -2619,6 +2752,23 @@ async def on_interaction(interaction: discord.Interaction):
         except Exception:
             si, ii = -1, -1
         await _open_setprice_one(interaction, si, ii)
+    elif cid == "joinsetup_svc":
+        vals = (interaction.data or {}).get("values") or []
+        try:
+            si = int(vals[0]) if vals else -1
+        except Exception:
+            si = -1
+        await _joinsetup_open_item(interaction, si)
+    elif cid.startswith("joinsetup_item:"):
+        vals = (interaction.data or {}).get("values") or []
+        try:
+            si = int(cid.split(":", 1)[1])
+            ii = int(vals[0]) if vals else -1
+        except Exception:
+            si, ii = -1, -1
+        await _joinsetup_open_one(interaction, si, ii)
+    elif cid == "joinsetup_done":
+        await _joinsetup_done(interaction)
 
 
 def _ticket_topic(opener_id, category, base=""):
