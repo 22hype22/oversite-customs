@@ -2201,7 +2201,13 @@ async def _gw_restore_all():
             end_ts = int(g.get("end_ts") or 0)
             if end_ts:
                 remaining = end_ts - now
-                asyncio.create_task(end_giveaway(gid) if remaining <= 0 else _giveaway_timer(gid, remaining))
+                if remaining <= 0:
+                    asyncio.create_task(end_giveaway(gid))
+                else:
+                    asyncio.create_task(_giveaway_timer(gid, remaining))
+                    # Re-draw the message so the Entries count reflects the restored
+                    # entrants immediately (not the pre-redeploy render).
+                    asyncio.create_task(_giveaway_refresh_count(gid))
     if restored:
         print(f"[Giveaway] restored {restored} giveaway(s) from storage")
 
