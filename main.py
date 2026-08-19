@@ -117,7 +117,7 @@ robux_locker_config = {"channel_id": "", "components": [], "panel_ref": None, "s
 # ---- Portfolio ----
 # Post designed in the dashboard "Portfolio" block. Running /portfolio sends the
 # design to the configured channel.
-portfolio_config = {"channel_id": "", "components": []}
+portfolio_config = {"channel_id": "", "components": [], "allowed_role_ids": []}
 
 # ---- Order Status ----
 # Configured in the dashboard "Order Status" block. An "Order Status" button
@@ -1922,10 +1922,20 @@ async def _do_portfolio_post(interaction):
         await interaction.followup.send(embed=error_embed("Couldn't post", f"Discord rejected the portfolio: {reason}"), ephemeral=True)
 
 
+def _portfolio_can_use(member):
+    """Manage Server, or one of the roles picked in the dashboard Portfolio block."""
+    try:
+        if member.guild_permissions.manage_guild:
+            return True
+    except Exception:
+        pass
+    return has_any_role(member, portfolio_config.get("allowed_role_ids", []))
+
+
 @bot.tree.command(name="portfolio", description="Post your portfolio to its channel")
 async def portfolio_cmd(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message(embed=error_embed("No permission", "Only staff can post the portfolio."), ephemeral=True)
+    if not _portfolio_can_use(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to run /portfolio."), ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
     await _do_portfolio_post(interaction)
@@ -4095,7 +4105,8 @@ async def apply_config(feature, cfg, post_panel=False):
             portfolio_config["channel_id"] = str(cfg["channel_id"])
         comps = cfg.get("components")
         portfolio_config["components"] = comps if isinstance(comps, list) else []
-        print(f"[Config] portfolio — channel {portfolio_config['channel_id']} design {len(portfolio_config['components'])}")
+        portfolio_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
+        print(f"[Config] portfolio — channel {portfolio_config['channel_id']} design {len(portfolio_config['components'])} roles {portfolio_config['allowed_role_ids']}")
     elif feature in ("order-status", "customs-order-status"):
         order_status_config["title"] = str(cfg.get("title") or "Order Status")
         try:
