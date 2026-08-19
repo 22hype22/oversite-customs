@@ -121,8 +121,8 @@ portfolio_config = {"channel_id": "", "components": [], "allowed_role_ids": []}
 
 # ---- Order Log ----
 # /orderlog pops a form built from the {Question:} tokens in this design, then
-# opens an order-log ticket (its own category + access roles) with the answers.
-orderlog_form_config = {"components": [], "category_id": "", "access_role_ids": [], "allowed_role_ids": []}
+# posts the completed log (answers filled in) to the configured channel.
+orderlog_form_config = {"components": [], "channel_id": "", "allowed_role_ids": []}
 ORDERLOG_FORM_KEY = "orderlog"
 
 # ---- Order Status ----
@@ -2102,6 +2102,30 @@ async def before_portfolio_cleanup():
 
 # ===================== Order Log =====================
 
+async def _post_orderlog(interaction, comps):
+    """Post a completed order log (design with answers + {user} filled in) to the
+    configured channel. Assumes the interaction is already deferred (ephemeral)."""
+    ch = await resolve_channel(orderlog_form_config.get("channel_id"))
+    if not ch:
+        await interaction.followup.send(embed=error_embed("No channel", "Pick a channel for /orderlog in the dashboard, then save it."), ephemeral=True)
+        return
+    def _js(s):
+        return json.dumps(str(s))[1:-1]
+    raw = json.dumps(comps or [])
+    raw = raw.replace("{user}", _js(interaction.user.mention)).replace("{username}", _js(interaction.user.display_name))
+    try:
+        final = json.loads(raw)
+    except Exception:
+        final = comps
+    _V2_LAST_ERROR["msg"] = ""
+    mid = await send_v2_message(ch, final, allowed_mentions={"parse": []})
+    if mid:
+        await interaction.followup.send(embed=success_embed("Logged", f"Your order log was posted in {ch.mention}."), ephemeral=True)
+    else:
+        reason = _V2_LAST_ERROR.get("msg") or "unknown error"
+        await interaction.followup.send(embed=error_embed("Couldn't post", f"Discord rejected the order log: {reason}"), ephemeral=True)
+
+
 @bot.tree.command(name="orderlog", description="Log an order — fills in a quick form")
 async def orderlog_cmd(interaction: discord.Interaction):
     if not _orderlog_can_open(interaction.user):
@@ -2111,32 +2135,17 @@ async def orderlog_cmd(interaction: discord.Interaction):
     if not comps:
         await interaction.response.send_message(embed=error_embed("Not set up", "Design the order-log form in the dashboard first, then save it."), ephemeral=True)
         return
-    guild = interaction.guild
-    # Resolve the category NAME + access role NAMES the ticket engine expects
-    # (the dashboard stores ids; the form flow keys off names).
-    cat_name = ""
-    if orderlog_form_config.get("category_id") and guild:
-        try:
-            c = guild.get_channel(int(orderlog_form_config["category_id"]))
-            cat_name = c.name if c else ""
-        except Exception:
-            cat_name = ""
-    access_names = []
-    if guild:
-        for rid in orderlog_form_config.get("access_role_ids", []):
-            try:
-                r = guild.get_role(int(rid))
-            except Exception:
-                r = None
-            if r:
-                access_names.append(r.name)
-    # Register a synthetic form entry for this run, then open the form modal. On
-    # submit, the shared form flow opens the order-log ticket with the answers.
+    # Register the design so the shared form pager can read its questions.
     form_msgs[ORDERLOG_FORM_KEY] = comps
     form_titles[ORDERLOG_FORM_KEY] = "Order Log"
-    ticket_categories[ORDERLOG_FORM_KEY] = cat_name
-    ticket_access[ORDERLOG_FORM_KEY] = ",".join(access_names)
-    await open_ticket_form(interaction, ORDERLOG_FORM_KEY)
+    questions = _parse_questions(comps, limit=FORM_MAX_QUESTIONS)
+    if not questions:
+        # No questions — just post the design straight to the channel.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await _post_orderlog(interaction, comps)
+        return
+    _pending_form_answers.pop((interaction.user.id, ORDERLOG_FORM_KEY), None)
+    await _open_form_page(interaction, ORDERLOG_FORM_KEY, 0)
 
 
 # ===================== Pricing =====================
@@ -3167,7 +3176,10 @@ async def open_ticket_form(interaction, key):
 
 
 async def handle_ticket_form_submit(interaction, key, page=0):
-    open_comps = form_msgs.get(key) or []
+    # The order-log form reads its design from its own config (robust even if the
+    # shared registry was rebuilt mid-form) and posts to a channel instead of
+    # opening a ticket.
+    open_comps = (orderlog_form_config.get("components") if key == ORDERLOG_FORM_KEY else form_msgs.get(key)) or []
     questions = _parse_questions(open_comps, limit=FORM_MAX_QUESTIONS)
     total_pages = (len(questions) + FORM_PAGE_SIZE - 1) // FORM_PAGE_SIZE
 
@@ -3205,6 +3217,9 @@ async def handle_ticket_form_submit(interaction, key, page=0):
     try:
         mapping = dict(_pending_form_answers.pop((interaction.user.id, key), {}))
         substituted = _apply_answers(open_comps, mapping)
+        if key == ORDERLOG_FORM_KEY:
+            await _post_orderlog(interaction, substituted)
+            return
         await open_ticket(interaction, f"ticket_form:{key}", open_comps_override=substituted,
                           category_name_override=ticket_categories.get(key), access_names_override=ticket_access.get(key), already_responded=True)
     except Exception as e:
@@ -4226,20 +4241,19 @@ async def apply_config(feature, cfg, post_panel=False):
         print(f"[Config] portfolio — channel {portfolio_config['channel_id']} design {len(portfolio_config['components'])} roles {portfolio_config['allowed_role_ids']}")
     elif feature in ("orderlog", "customs-orderlog"):
         # Order Log is the /orderlog slash command: it pops a form from the
-        # {Question:} tokens in the design, then opens an order-log ticket with
-        # the answers, in its own category with its own access roles.
+        # {Question:} tokens in the design, then posts the completed log to the
+        # configured channel (answers filled in). Not a ticket.
         comps = cfg.get("components")
         if comps is None:
             comps = cfg.get("panel_components")
             if not comps and isinstance(cfg.get("panels"), list) and cfg["panels"]:
                 comps = (cfg["panels"][0] or {}).get("components")
         orderlog_form_config["components"] = comps if isinstance(comps, list) else []
-        orderlog_form_config["category_id"] = str(cfg.get("category_id") or "")
-        orderlog_form_config["access_role_ids"] = [str(x) for x in (cfg.get("access_role_ids") or []) if x]
+        orderlog_form_config["channel_id"] = str(cfg.get("channel_id") or "")
         orderlog_form_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
         orderlog_gate["role_ids"] = orderlog_form_config["allowed_role_ids"]
-        _ticket_sources.pop("customs-orderlog", None)  # no longer a panel source
-        print(f"[Config] orderlog(form) — design {len(orderlog_form_config['components'])} cat {orderlog_form_config['category_id']} access {orderlog_form_config['access_role_ids']} allowed {orderlog_form_config['allowed_role_ids']}")
+        _ticket_sources.pop("customs-orderlog", None)  # not a panel source
+        print(f"[Config] orderlog(form) — design {len(orderlog_form_config['components'])} channel {orderlog_form_config['channel_id']} allowed {orderlog_form_config['allowed_role_ids']}")
     elif feature in ("order-status", "customs-order-status"):
         order_status_config["title"] = str(cfg.get("title") or "Order Status")
         try:
