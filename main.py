@@ -119,6 +119,12 @@ robux_locker_config = {"channel_id": "", "components": [], "panel_ref": None, "s
 # design to the configured channel.
 portfolio_config = {"channel_id": "", "components": [], "allowed_role_ids": []}
 
+# ---- Order Log ----
+# /orderlog pops a form built from the {Question:} tokens in this design, then
+# opens an order-log ticket (its own category + access roles) with the answers.
+orderlog_form_config = {"components": [], "category_id": "", "access_role_ids": [], "allowed_role_ids": []}
+ORDERLOG_FORM_KEY = "orderlog"
+
 # ---- Order Status ----
 # Configured in the dashboard "Order Status" block. An "Order Status" button
 # shows a live embed: each service is Open / Oversite+ only / Closed based on how
@@ -387,44 +393,6 @@ def _rebuild_ticket_registry():
 # belong to the Order Log panel (its Ticket/Form/Ephemeral buttons); `role_ids`
 # gates them. Regular ticket keys aren't in `keys`, so they're never gated here.
 orderlog_gate = {"role_ids": [], "keys": set()}
-
-
-def _collect_ticket_keys(trees):
-    """Set of registry keys (_comp_key) for the Ticket/Form/Ephemeral components
-    in the given panel trees — used to know which buttons are order-log ones."""
-    keys = set()
-
-    def _reg(x):
-        if ("ticket" in x) or ("form" in x) or ("ephemeral" in x):
-            keys.add(_comp_key(x))
-        oc = x.get("open_components") or []
-        if oc:
-            walk(oc)
-
-    def walk(items):
-        for c in (items or []):
-            if not isinstance(c, dict):
-                continue
-            t = c.get("type")
-            if t == "container":
-                walk(c.get("children") or c.get("components") or [])
-            elif t in ("buttonRow", "button_row", "buttons", "action_row"):
-                for b in (c.get("buttons") or []):
-                    if isinstance(b, dict):
-                        _reg(b)
-            elif t in ("select_menu", "select"):
-                for o in (c.get("options") or []):
-                    if isinstance(o, dict):
-                        _reg(o)
-            elif t == "section":
-                b = c.get("button")
-                if isinstance(b, dict):
-                    _reg(b)
-
-    for tree in trees or []:
-        if isinstance(tree, list):
-            walk(tree)
-    return keys
 
 
 def _orderlog_can_open(member):
@@ -2130,6 +2098,45 @@ async def portfolio_cleanup():
 @portfolio_cleanup.before_loop
 async def before_portfolio_cleanup():
     await bot.wait_until_ready()
+
+
+# ===================== Order Log =====================
+
+@bot.tree.command(name="orderlog", description="Log an order — fills in a quick form")
+async def orderlog_cmd(interaction: discord.Interaction):
+    if not _orderlog_can_open(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to log orders."), ephemeral=True)
+        return
+    comps = orderlog_form_config.get("components") or []
+    if not comps:
+        await interaction.response.send_message(embed=error_embed("Not set up", "Design the order-log form in the dashboard first, then save it."), ephemeral=True)
+        return
+    guild = interaction.guild
+    # Resolve the category NAME + access role NAMES the ticket engine expects
+    # (the dashboard stores ids; the form flow keys off names).
+    cat_name = ""
+    if orderlog_form_config.get("category_id") and guild:
+        try:
+            c = guild.get_channel(int(orderlog_form_config["category_id"]))
+            cat_name = c.name if c else ""
+        except Exception:
+            cat_name = ""
+    access_names = []
+    if guild:
+        for rid in orderlog_form_config.get("access_role_ids", []):
+            try:
+                r = guild.get_role(int(rid))
+            except Exception:
+                r = None
+            if r:
+                access_names.append(r.name)
+    # Register a synthetic form entry for this run, then open the form modal. On
+    # submit, the shared form flow opens the order-log ticket with the answers.
+    form_msgs[ORDERLOG_FORM_KEY] = comps
+    form_titles[ORDERLOG_FORM_KEY] = "Order Log"
+    ticket_categories[ORDERLOG_FORM_KEY] = cat_name
+    ticket_access[ORDERLOG_FORM_KEY] = ",".join(access_names)
+    await open_ticket_form(interaction, ORDERLOG_FORM_KEY)
 
 
 # ===================== Pricing =====================
@@ -4218,19 +4225,21 @@ async def apply_config(feature, cfg, post_panel=False):
         portfolio_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
         print(f"[Config] portfolio — channel {portfolio_config['channel_id']} design {len(portfolio_config['components'])} roles {portfolio_config['allowed_role_ids']}")
     elif feature in ("orderlog", "customs-orderlog"):
-        # Order Log is a second ticket panel: its buttons open tickets in their
-        # own category with their own access roles (set per Ticket/Form button).
-        # We register it as an additional ticket source — the shared handlers open
-        # its tickets independently from the main Tickets panel.
-        panels = _parse_ticket_panels(cfg)
-        edited_ch = str(cfg.get("panel_channel_id") or (panels[0]["channel_id"] if panels else ""))
-        _ticket_sources["customs-orderlog"] = {"panels": panels, "types": _parse_ticket_types(cfg)}
-        _rebuild_ticket_registry()
-        orderlog_gate["role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
-        orderlog_gate["keys"] = _collect_ticket_keys([p["components"] for p in panels])
-        print(f"[Config] orderlog — panels {len(panels)} types {len(_ticket_sources['customs-orderlog']['types'])} panel_ch {edited_ch} gate_roles {orderlog_gate['role_ids']} gated_keys {len(orderlog_gate['keys'])}")
-        if post_panel:
-            await post_ticket_panel(only_channel_id=edited_ch or None)
+        # Order Log is the /orderlog slash command: it pops a form from the
+        # {Question:} tokens in the design, then opens an order-log ticket with
+        # the answers, in its own category with its own access roles.
+        comps = cfg.get("components")
+        if comps is None:
+            comps = cfg.get("panel_components")
+            if not comps and isinstance(cfg.get("panels"), list) and cfg["panels"]:
+                comps = (cfg["panels"][0] or {}).get("components")
+        orderlog_form_config["components"] = comps if isinstance(comps, list) else []
+        orderlog_form_config["category_id"] = str(cfg.get("category_id") or "")
+        orderlog_form_config["access_role_ids"] = [str(x) for x in (cfg.get("access_role_ids") or []) if x]
+        orderlog_form_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
+        orderlog_gate["role_ids"] = orderlog_form_config["allowed_role_ids"]
+        _ticket_sources.pop("customs-orderlog", None)  # no longer a panel source
+        print(f"[Config] orderlog(form) — design {len(orderlog_form_config['components'])} cat {orderlog_form_config['category_id']} access {orderlog_form_config['access_role_ids']} allowed {orderlog_form_config['allowed_role_ids']}")
     elif feature in ("order-status", "customs-order-status"):
         order_status_config["title"] = str(cfg.get("title") or "Order Status")
         try:
