@@ -119,6 +119,11 @@ robux_locker_config = {"channel_id": "", "components": [], "panel_ref": None, "s
 # design to the configured channel.
 portfolio_config = {"channel_id": "", "components": [], "allowed_role_ids": []}
 
+# ---- Order Log ----
+# Post designed in the dashboard "Order Log" block. Running /orderlog sends the
+# design to the configured channel.
+orderlog_config = {"channel_id": "", "components": [], "allowed_role_ids": []}
+
 # ---- Order Status ----
 # Configured in the dashboard "Order Status" block. An "Order Status" button
 # shows a live embed: each service is Open / Oversite+ only / Closed based on how
@@ -1990,6 +1995,47 @@ async def portfolio_cleanup():
 @portfolio_cleanup.before_loop
 async def before_portfolio_cleanup():
     await bot.wait_until_ready()
+
+
+# ===================== Order Log =====================
+
+def _orderlog_can_use(member):
+    """Manage Server, or one of the roles picked in the dashboard Order Log block."""
+    try:
+        if member.guild_permissions.manage_guild:
+            return True
+    except Exception:
+        pass
+    return has_any_role(member, orderlog_config.get("allowed_role_ids", []))
+
+
+@bot.tree.command(name="orderlog", description="Post the order log design to its channel")
+async def orderlog_cmd(interaction: discord.Interaction):
+    if not _orderlog_can_use(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to run /orderlog."), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    comps = orderlog_config.get("components") or []
+    if not comps:
+        await interaction.followup.send(embed=error_embed("Nothing to post", "Design the order log in the dashboard first, then save it."), ephemeral=True)
+        return
+    ch = await resolve_channel(orderlog_config.get("channel_id"))
+    if not ch:
+        await interaction.followup.send(embed=error_embed("No channel", "Pick a channel for /orderlog in the dashboard, then save it."), ephemeral=True)
+        return
+    _V2_LAST_ERROR["msg"] = ""
+    if isinstance(ch, discord.ForumChannel):
+        mid = await send_v2_forum_post(ch, comps)
+    elif isinstance(ch, discord.CategoryChannel) or not hasattr(ch, "send"):
+        await interaction.followup.send(embed=error_embed("Not postable", "The order log channel is a category. Pick a text or forum channel in the dashboard, then save it."), ephemeral=True)
+        return
+    else:
+        mid = await send_v2_message(ch, comps)
+    if mid:
+        await interaction.followup.send(embed=success_embed("Posted", f"Order log posted in {ch.mention}."), ephemeral=True)
+    else:
+        reason = _V2_LAST_ERROR.get("msg") or "unknown error"
+        await interaction.followup.send(embed=error_embed("Couldn't post", f"Discord rejected the order log: {reason}"), ephemeral=True)
 
 
 # ===================== Pricing =====================
@@ -4107,6 +4153,13 @@ async def apply_config(feature, cfg, post_panel=False):
         portfolio_config["components"] = comps if isinstance(comps, list) else []
         portfolio_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
         print(f"[Config] portfolio — channel {portfolio_config['channel_id']} design {len(portfolio_config['components'])} roles {portfolio_config['allowed_role_ids']}")
+    elif feature in ("orderlog", "customs-orderlog"):
+        if cfg.get("channel_id"):
+            orderlog_config["channel_id"] = str(cfg["channel_id"])
+        comps = cfg.get("components")
+        orderlog_config["components"] = comps if isinstance(comps, list) else []
+        orderlog_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
+        print(f"[Config] orderlog — channel {orderlog_config['channel_id']} design {len(orderlog_config['components'])} roles {orderlog_config['allowed_role_ids']}")
     elif feature in ("order-status", "customs-order-status"):
         order_status_config["title"] = str(cfg.get("title") or "Order Status")
         try:
@@ -4652,7 +4705,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-order-status", "customs-pricing"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-orderlog", "customs-order-status", "customs-pricing"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
