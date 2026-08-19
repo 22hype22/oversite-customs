@@ -119,11 +119,6 @@ robux_locker_config = {"channel_id": "", "components": [], "panel_ref": None, "s
 # design to the configured channel.
 portfolio_config = {"channel_id": "", "components": [], "allowed_role_ids": []}
 
-# ---- Order Log ----
-# Post designed in the dashboard "Order Log" block. Running /orderlog sends the
-# design to the configured channel.
-orderlog_config = {"channel_id": "", "components": [], "allowed_role_ids": []}
-
 # ---- Order Status ----
 # Configured in the dashboard "Order Status" block. An "Order Status" button
 # shows a live embed: each service is Open / Oversite+ only / Closed based on how
@@ -318,6 +313,74 @@ def _register_ticket_components(panels):
             walk(tree, 0)
     print(f"[Tickets] registry: {len(ticket_msgs)} ticket + {len(form_msgs)} form + {len(eph_msgs)} ephemeral messages")
     print(f"[Tickets] registry built: tickets={{{', '.join(f'{k}:{len(v)}' for k,v in ticket_msgs.items())}}} eph={{{', '.join(f'{k}:{len(v)}' for k,v in eph_msgs.items())}}}")
+
+
+# Ticket panels can come from more than one dashboard block — the main "Tickets"
+# block and the "Order Log" block. Each registers its panels + types here under
+# its feature key; the registry, posted-panel list, and type list are rebuilt
+# from ALL sources so neither block wipes the other's buttons. Order-log tickets
+# route by each Ticket/Form button's own category + access roles, so they open in
+# their own category independently of regular tickets.
+_ticket_sources = {}  # feature -> {"panels": [{channel_id, components}], "types": [type defs]}
+
+
+def _parse_ticket_panels(cfg):
+    raw_panels = cfg.get("panels")
+    panels = []
+    if isinstance(raw_panels, list) and raw_panels:
+        for p in raw_panels:
+            if not isinstance(p, dict):
+                continue
+            comps = p.get("components")
+            panels.append({
+                "channel_id": str(p.get("channel_id") or ""),
+                "components": comps if isinstance(comps, list) else [],
+            })
+    if not panels:
+        pc = cfg.get("panel_components")
+        panels.append({
+            "channel_id": str(cfg.get("panel_channel_id") or ""),
+            "components": pc if isinstance(pc, list) else [],
+        })
+    return panels
+
+
+def _parse_ticket_types(cfg):
+    raw_types = cfg.get("ticket_types")
+    if isinstance(raw_types, list) and raw_types:
+        types = []
+        for t in raw_types:
+            if not isinstance(t, dict) or not t.get("id"):
+                continue
+            types.append({
+                "id": str(t.get("id")),
+                "name": str(t.get("name") or "Ticket"),
+                "button_label": str(t.get("button_label") or "Open Ticket"),
+                "button_style": str(t.get("button_style") or "primary"),
+                "open_components": t.get("open_components") if isinstance(t.get("open_components"), list) else [],
+            })
+        return types
+    oc = cfg.get("open_components")
+    return [{
+        "id": "support", "name": "Support",
+        "button_label": str(cfg.get("open_button_label") or "Open Ticket"),
+        "button_style": str(cfg.get("open_button_style") or "primary"),
+        "open_components": oc if isinstance(oc, list) else [],
+    }]
+
+
+def _rebuild_ticket_registry():
+    """Rebuild the interactive-component registry AND the union panel/type lists
+    from every registered ticket source (main Tickets + Order Log)."""
+    trees = []
+    for src in _ticket_sources.values():
+        for p in src.get("panels", []):
+            comps = p.get("components")
+            if isinstance(comps, list):
+                trees.append(comps)
+    _register_ticket_components(trees)
+    ticket_config["panels"] = [p for src in _ticket_sources.values() for p in src.get("panels", [])]
+    ticket_config["types"] = [t for src in _ticket_sources.values() for t in src.get("types", [])]
 credits_config = {"manager_role_ids": CREDIT_MANAGER_ROLE_IDS, "currency_name": "credits", "log_channel_id": ""}
 _credits_memory = {}
 # Roblox OAuth verification config (from the dashboard "Verification" block).
@@ -1995,47 +2058,6 @@ async def portfolio_cleanup():
 @portfolio_cleanup.before_loop
 async def before_portfolio_cleanup():
     await bot.wait_until_ready()
-
-
-# ===================== Order Log =====================
-
-def _orderlog_can_use(member):
-    """Manage Server, or one of the roles picked in the dashboard Order Log block."""
-    try:
-        if member.guild_permissions.manage_guild:
-            return True
-    except Exception:
-        pass
-    return has_any_role(member, orderlog_config.get("allowed_role_ids", []))
-
-
-@bot.tree.command(name="orderlog", description="Post the order log design to its channel")
-async def orderlog_cmd(interaction: discord.Interaction):
-    if not _orderlog_can_use(interaction.user):
-        await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to run /orderlog."), ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    comps = orderlog_config.get("components") or []
-    if not comps:
-        await interaction.followup.send(embed=error_embed("Nothing to post", "Design the order log in the dashboard first, then save it."), ephemeral=True)
-        return
-    ch = await resolve_channel(orderlog_config.get("channel_id"))
-    if not ch:
-        await interaction.followup.send(embed=error_embed("No channel", "Pick a channel for /orderlog in the dashboard, then save it."), ephemeral=True)
-        return
-    _V2_LAST_ERROR["msg"] = ""
-    if isinstance(ch, discord.ForumChannel):
-        mid = await send_v2_forum_post(ch, comps)
-    elif isinstance(ch, discord.CategoryChannel) or not hasattr(ch, "send"):
-        await interaction.followup.send(embed=error_embed("Not postable", "The order log channel is a category. Pick a text or forum channel in the dashboard, then save it."), ephemeral=True)
-        return
-    else:
-        mid = await send_v2_message(ch, comps)
-    if mid:
-        await interaction.followup.send(embed=success_embed("Posted", f"Order log posted in {ch.mention}."), ephemeral=True)
-    else:
-        reason = _V2_LAST_ERROR.get("msg") or "unknown error"
-        await interaction.followup.send(embed=error_embed("Couldn't post", f"Discord rejected the order log: {reason}"), ephemeral=True)
 
 
 # ===================== Pricing =====================
@@ -4038,56 +4060,16 @@ async def apply_config(feature, cfg, post_panel=False):
         # Multi-panel: cfg.panels = [{channel_id, components}, ...]. Falls back to
         # the single panel_channel_id + panel_components for older configs. ALL
         # panels are registered so every posted panel keeps working.
-        raw_panels = cfg.get("panels")
-        panels = []
-        if isinstance(raw_panels, list) and raw_panels:
-            for p in raw_panels:
-                if not isinstance(p, dict):
-                    continue
-                comps = p.get("components")
-                panels.append({
-                    "channel_id": str(p.get("channel_id") or ""),
-                    "components": comps if isinstance(comps, list) else [],
-                })
-        if not panels:
-            pc = cfg.get("panel_components")
-            panels.append({
-                "channel_id": str(cfg.get("panel_channel_id") or ""),
-                "components": pc if isinstance(pc, list) else [],
-            })
         # The dashboard sends panel_channel_id = the panel currently being edited.
         # We register ALL panels (so every panel's buttons keep working) but only
         # (re)post that one on save.
+        panels = _parse_ticket_panels(cfg)
         edited_ch = str(cfg.get("panel_channel_id") or (panels[0]["channel_id"] if panels else ""))
         edited_panel = next((p for p in panels if p["channel_id"] == edited_ch), (panels[0] if panels else {"components": []}))
-        ticket_config["panels"] = panels
         ticket_config["panel_channel_id"] = edited_ch
         ticket_config["panel_components"] = edited_panel.get("components", [])
-        _register_ticket_components([p["components"] for p in panels])
-        # Ticket types (each with its own button + opening message).
-        raw_types = cfg.get("ticket_types")
-        if isinstance(raw_types, list) and raw_types:
-            types = []
-            for t in raw_types:
-                if not isinstance(t, dict) or not t.get("id"):
-                    continue
-                types.append({
-                    "id": str(t.get("id")),
-                    "name": str(t.get("name") or "Ticket"),
-                    "button_label": str(t.get("button_label") or "Open Ticket"),
-                    "button_style": str(t.get("button_style") or "primary"),
-                    "open_components": t.get("open_components") if isinstance(t.get("open_components"), list) else [],
-                })
-            ticket_config["types"] = types
-        else:
-            # Legacy single-type fallback (from the earlier single open message).
-            oc = cfg.get("open_components")
-            ticket_config["types"] = [{
-                "id": "support", "name": "Support",
-                "button_label": str(cfg.get("open_button_label") or "Open Ticket"),
-                "button_style": str(cfg.get("open_button_style") or "primary"),
-                "open_components": oc if isinstance(oc, list) else [],
-            }]
+        _ticket_sources["tickets"] = {"panels": panels, "types": _parse_ticket_types(cfg)}
+        _rebuild_ticket_registry()
         print(f"[Config] tickets — category {ticket_config['category_id']} roles {ticket_config['support_role_ids']} panel_ch {ticket_config['panel_channel_id']} panel {len(ticket_config['panel_components'])} types {len(ticket_config['types'])}")
         # Post/refresh ONLY the panel being edited on a save (not on boot, and
         # not the other panels — those stay put).
@@ -4154,12 +4136,17 @@ async def apply_config(feature, cfg, post_panel=False):
         portfolio_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
         print(f"[Config] portfolio — channel {portfolio_config['channel_id']} design {len(portfolio_config['components'])} roles {portfolio_config['allowed_role_ids']}")
     elif feature in ("orderlog", "customs-orderlog"):
-        if cfg.get("channel_id"):
-            orderlog_config["channel_id"] = str(cfg["channel_id"])
-        comps = cfg.get("components")
-        orderlog_config["components"] = comps if isinstance(comps, list) else []
-        orderlog_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
-        print(f"[Config] orderlog — channel {orderlog_config['channel_id']} design {len(orderlog_config['components'])} roles {orderlog_config['allowed_role_ids']}")
+        # Order Log is a second ticket panel: its buttons open tickets in their
+        # own category with their own access roles (set per Ticket/Form button).
+        # We register it as an additional ticket source — the shared handlers open
+        # its tickets independently from the main Tickets panel.
+        panels = _parse_ticket_panels(cfg)
+        edited_ch = str(cfg.get("panel_channel_id") or (panels[0]["channel_id"] if panels else ""))
+        _ticket_sources["customs-orderlog"] = {"panels": panels, "types": _parse_ticket_types(cfg)}
+        _rebuild_ticket_registry()
+        print(f"[Config] orderlog — panels {len(panels)} types {len(_ticket_sources['customs-orderlog']['types'])} panel_ch {edited_ch}")
+        if post_panel:
+            await post_ticket_panel(only_channel_id=edited_ch or None)
     elif feature in ("order-status", "customs-order-status"):
         order_status_config["title"] = str(cfg.get("title") or "Order Status")
         try:
