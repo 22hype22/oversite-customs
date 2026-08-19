@@ -381,6 +381,78 @@ def _rebuild_ticket_registry():
     _register_ticket_components(trees)
     ticket_config["panels"] = [p for src in _ticket_sources.values() for p in src.get("panels", [])]
     ticket_config["types"] = [t for src in _ticket_sources.values() for t in src.get("types", [])]
+
+
+# Who may OPEN an order-log ticket. `keys` is the set of registry keys that
+# belong to the Order Log panel (its Ticket/Form/Ephemeral buttons); `role_ids`
+# gates them. Regular ticket keys aren't in `keys`, so they're never gated here.
+orderlog_gate = {"role_ids": [], "keys": set()}
+
+
+def _collect_ticket_keys(trees):
+    """Set of registry keys (_comp_key) for the Ticket/Form/Ephemeral components
+    in the given panel trees — used to know which buttons are order-log ones."""
+    keys = set()
+
+    def _reg(x):
+        if ("ticket" in x) or ("form" in x) or ("ephemeral" in x):
+            keys.add(_comp_key(x))
+        oc = x.get("open_components") or []
+        if oc:
+            walk(oc)
+
+    def walk(items):
+        for c in (items or []):
+            if not isinstance(c, dict):
+                continue
+            t = c.get("type")
+            if t == "container":
+                walk(c.get("children") or c.get("components") or [])
+            elif t in ("buttonRow", "button_row", "buttons", "action_row"):
+                for b in (c.get("buttons") or []):
+                    if isinstance(b, dict):
+                        _reg(b)
+            elif t in ("select_menu", "select"):
+                for o in (c.get("options") or []):
+                    if isinstance(o, dict):
+                        _reg(o)
+            elif t == "section":
+                b = c.get("button")
+                if isinstance(b, dict):
+                    _reg(b)
+
+    for tree in trees or []:
+        if isinstance(tree, list):
+            walk(tree)
+    return keys
+
+
+def _orderlog_can_open(member):
+    """Allowed if no roles are set (open to all), or member has an allowed role,
+    or has Manage Server."""
+    if not orderlog_gate["role_ids"]:
+        return True
+    try:
+        if member.guild_permissions.manage_guild:
+            return True
+    except Exception:
+        pass
+    return has_any_role(member, orderlog_gate["role_ids"])
+
+
+async def _orderlog_gate_block(interaction, key):
+    """If `key` is an order-log button and the user isn't allowed, deny + return
+    True (caller should stop). Otherwise return False."""
+    if key in orderlog_gate["keys"] and not _orderlog_can_open(interaction.user):
+        try:
+            await interaction.response.send_message(
+                embed=error_embed("No permission", "You don't have a role allowed to open an order log."),
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+        return True
+    return False
 credits_config = {"manager_role_ids": CREDIT_MANAGER_ROLE_IDS, "currency_name": "credits", "log_channel_id": ""}
 _credits_memory = {}
 # Roblox OAuth verification config (from the dashboard "Verification" block).
@@ -2749,9 +2821,14 @@ async def on_interaction(interaction: discord.Interaction):
             v = values[0]
             if v.startswith("ticket_msg:"):
                 mk = v.split(":", 1)[1]
+                if await _orderlog_gate_block(interaction, mk):
+                    return
                 await open_ticket(interaction, v, open_comps_override=ticket_msgs.get(mk), category_name_override=ticket_categories.get(mk), access_names_override=ticket_access.get(mk))
             elif v.startswith("ticket_form:"):
-                await open_ticket_form(interaction, v.split(":", 1)[1])
+                fk = v.split(":", 1)[1]
+                if await _orderlog_gate_block(interaction, fk):
+                    return
+                await open_ticket_form(interaction, fk)
             elif v.startswith("eph:"):
                 await show_ephemeral(interaction, v.split(":", 1)[1])
             elif v.startswith("ch:") or v.startswith("url:"):
@@ -2763,9 +2840,14 @@ async def on_interaction(interaction: discord.Interaction):
                 await open_ticket(interaction, v)
     elif cid.startswith("ticket_msg:"):
         mk = cid.split(":", 1)[1]
+        if await _orderlog_gate_block(interaction, mk):
+            return
         await open_ticket(interaction, cid, open_comps_override=ticket_msgs.get(mk), category_name_override=ticket_categories.get(mk), access_names_override=ticket_access.get(mk))
     elif cid.startswith("ticket_form:"):
-        await open_ticket_form(interaction, cid.split(":", 1)[1])
+        fk = cid.split(":", 1)[1]
+        if await _orderlog_gate_block(interaction, fk):
+            return
+        await open_ticket_form(interaction, fk)
     elif cid.startswith("formcont:"):
         payload = cid.split(":", 1)[1]
         fkey, pg = (payload.rsplit("|", 1) + ["0"])[:2] if "|" in payload else (payload, "0")
@@ -4144,7 +4226,9 @@ async def apply_config(feature, cfg, post_panel=False):
         edited_ch = str(cfg.get("panel_channel_id") or (panels[0]["channel_id"] if panels else ""))
         _ticket_sources["customs-orderlog"] = {"panels": panels, "types": _parse_ticket_types(cfg)}
         _rebuild_ticket_registry()
-        print(f"[Config] orderlog — panels {len(panels)} types {len(_ticket_sources['customs-orderlog']['types'])} panel_ch {edited_ch}")
+        orderlog_gate["role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
+        orderlog_gate["keys"] = _collect_ticket_keys([p["components"] for p in panels])
+        print(f"[Config] orderlog — panels {len(panels)} types {len(_ticket_sources['customs-orderlog']['types'])} panel_ch {edited_ch} gate_roles {orderlog_gate['role_ids']} gated_keys {len(orderlog_gate['keys'])}")
         if post_panel:
             await post_ticket_panel(only_channel_id=edited_ch or None)
     elif feature in ("order-status", "customs-order-status"):
