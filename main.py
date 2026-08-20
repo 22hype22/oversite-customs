@@ -2145,10 +2145,16 @@ async def _post_form_log(interaction, key, comps, files=None):
     except Exception:
         final = comps
     _V2_LAST_ERROR["msg"] = ""
-    mid = await send_v2_message(ch, final, allowed_mentions={"parse": []})
+    if files:
+        # Embed the uploaded files INSIDE the posted message.
+        mid = await _send_v2_with_files(ch, final, files, allowed_mentions={"parse": []})
+        if not mid:
+            mid = await send_v2_message(ch, final, allowed_mentions={"parse": []})
+            if mid:
+                await _post_form_files(ch, files)
+    else:
+        mid = await send_v2_message(ch, final, allowed_mentions={"parse": []})
     if mid:
-        if files:
-            await _post_form_files(ch, files)
         await interaction.followup.send(embed=success_embed("Logged", f"Posted in {ch.mention}."), ephemeral=True)
     else:
         reason = _V2_LAST_ERROR.get("msg") or "unknown error"
@@ -3785,7 +3791,8 @@ FORM_MAX_QUESTIONS = 10
 
 
 async def _post_form_files(channel, files):
-    """Upload collected form files into a channel, each labelled by its field."""
+    """Upload collected form files into a channel, each labelled by its field.
+    (Fallback for when files can't be embedded inline in the message.)"""
     for f in files or []:
         try:
             async with httpx.AsyncClient() as client:
@@ -3797,6 +3804,67 @@ async def _post_form_files(channel, files):
                                file=discord.File(io.BytesIO(blob), filename=f.get("filename") or "file"))
         except Exception as e:
             print(f"[Form] file post failed: {e}")
+
+
+def _is_image_name(filename):
+    return str(filename or "").lower().rsplit(".", 1)[-1] in ("png", "jpg", "jpeg", "gif", "webp")
+
+
+def _san_filename(name, fallback="file"):
+    n = re.sub(r"[^A-Za-z0-9._-]", "_", str(name or "").strip()) or fallback
+    return n[:80]
+
+
+async def _send_v2_with_files(channel, components_v2, files, allowed_mentions=None):
+    """Send a Components-V2 message with uploaded files embedded INSIDE it — each
+    as a labelled File component (type 13) or, for images, a Media Gallery (type
+    12) — sent as multipart with the real attachments. `files` = [{label, url,
+    filename}]. Returns the message id, or False so the caller can fall back."""
+    guild = getattr(channel, "guild", None)
+    built = [b for b in (_build_v2(c, guild) for c in components_v2) if b]
+    attachments = []
+    dfiles = []
+    extra = []
+    for i, f in enumerate(files or []):
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(f["url"], timeout=90, follow_redirects=True)
+                if r.status_code != 200:
+                    print(f"[Form] file fetch HTTP {r.status_code}")
+                    continue
+                blob = r.content
+        except Exception as e:
+            print(f"[Form] file fetch failed: {e}")
+            continue
+        fname = _san_filename(f.get("filename"), f"file{i}")
+        label = _clean_label(f.get("label") or "File")
+        extra.append({"type": 10, "content": f"**{label}**"})
+        if _is_image_name(fname):
+            extra.append({"type": 12, "items": [{"media": {"url": f"attachment://{fname}"}}]})
+        else:
+            extra.append({"type": 13, "file": {"url": f"attachment://{fname}"}})
+        attachments.append({"id": i, "filename": fname})
+        dfiles.append(discord.File(io.BytesIO(blob), filename=fname))
+    if not dfiles:
+        return False
+    built = built + extra
+    ALLOWED_TOP = {1, 9, 10, 12, 13, 14, 17}
+    if not {c.get("type") for c in built}.issubset(ALLOWED_TOP):
+        built = [{"type": 17, "components": built}]
+    payload = {"components": built, "flags": 1 << 15, "attachments": attachments}
+    if allowed_mentions is not None:
+        payload["allowed_mentions"] = allowed_mentions
+    form = [{"name": "payload_json", "value": json.dumps(payload)}]
+    for index, fobj in enumerate(dfiles):
+        form.append({"name": f"files[{index}]", "value": fobj.fp,
+                     "filename": fobj.filename, "content_type": "application/octet-stream"})
+    route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
+    try:
+        resp = await bot.http.request(route, form=form, files=dfiles)
+        return str(resp["id"]) if isinstance(resp, dict) and resp.get("id") else True
+    except Exception as e:
+        print(f"[Form] V2+files send failed: {e}")
+        return False
 
 
 async def _form_fields_for(key):
@@ -4142,7 +4210,16 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
                     pass
             # Allow role + user mentions inside the ticket message to actually
             # ping (e.g. a @Livery Designer role written into the design).
-            sent_rich = bool(await send_v2_message(channel, panel, allowed_mentions={"parse": ["users", "roles"]}))
+            # When the form collected files, embed them INSIDE this message
+            # (labelled file/image components) instead of a separate post.
+            if attachments:
+                sent_rich = bool(await _send_v2_with_files(channel, panel, attachments, allowed_mentions={"parse": ["users", "roles"]}))
+                if sent_rich:
+                    attachments = None  # embedded — don't also post separately
+                else:
+                    sent_rich = bool(await send_v2_message(channel, panel, allowed_mentions={"parse": ["users", "roles"]}))
+            else:
+                sent_rich = bool(await send_v2_message(channel, panel, allowed_mentions={"parse": ["users", "roles"]}))
         except Exception as e:
             print(f"[Tickets] rich open message failed: {e}")
             sent_rich = False
