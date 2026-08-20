@@ -123,6 +123,11 @@ portfolio_config = {"channel_id": "", "components": [], "allowed_role_ids": []}
 # The dashboard "Payment" block only picks who may run /payment.
 payment_config = {"allowed_role_ids": []}
 
+# ---- Logging ----
+# The dashboard "Logging" block. Purchase logs post every completed Stripe
+# (/payment) and Roblox group game-pass purchase to a channel.
+logging_config = {"purchase_log_channel_id": ""}
+
 # ---- Form logs (/orderlog, /infraction, /promote) ----
 # Each pops a form built from the {Question:} tokens in its design, then posts
 # the completed message (answers filled in) to its configured channel.
@@ -1002,6 +1007,39 @@ async def log_credit_action(guild, text):
             await channel.send(embed=info_embed("Credit log", text))
         except Exception:
             pass
+
+
+async def log_purchase(guild, *, discord_id=None, roblox_username=None, roblox_id=None,
+                       payment_type="", amount="", payment_id="", when=None):
+    """Post a purchase to the Logging block's purchase-logs channel, in the
+    standard format (customer, Roblox account, payment type, amount, id, date)."""
+    ch = await resolve_channel(logging_config.get("purchase_log_channel_id"))
+    if not ch:
+        return
+    lines = []
+    if discord_id:
+        lines.append(f"Customer: <@{discord_id}> ({discord_id})")
+    if roblox_username:
+        lines.append(f"Roblox account: {roblox_username}")
+    if roblox_id:
+        lines.append(f"Roblox user ID: {roblox_id}")
+    lines.append("")
+    if payment_type:
+        lines.append(f"Payment type: {payment_type}")
+    if amount:
+        lines.append(f"Amount: {amount}")
+    if payment_id:
+        lines.append(f"Payment ID: {payment_id}")
+    try:
+        ts = int(when) if when else int(discord.utils.utcnow().timestamp())
+    except Exception:
+        ts = int(discord.utils.utcnow().timestamp())
+    lines.append(f"Purchased: <t:{ts}:F>")
+    embed = info_embed("Purchase Log", "\n".join(lines))
+    try:
+        await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as e:
+        print(f"[Purchase] log failed: {e}")
 
 
 bot.tree.add_command(credits_group)
@@ -2834,6 +2872,16 @@ async def _pkg_do_claim(interaction, sid, recipient_id):
     if buyer not in claimed:
         claimed.append(buyer)
         await _pkg_call("pkg_update", submission_id=sid, pkg={"claimed_by": claimed})
+        # Log the purchase (first claim only) to the Logging block's channel.
+        try:
+            await log_purchase(
+                interaction.guild, discord_id=interaction.user.id,
+                roblox_username=(rl or {}).get("roblox_username"), roblox_id=roblox_id,
+                payment_type="Roblox Game Pass", amount=f"{pkg.get('price')} Robux",
+                payment_id=f"#{sid}",
+            )
+        except Exception as e:
+            print(f"[Purchase] package log failed: {e}")
     await interaction.followup.send(embed=success_embed("Sent", f"Ownership verified — sent to {recipient.mention}'s DMs."), ephemeral=True)
 
 
@@ -5133,6 +5181,9 @@ async def apply_config(feature, cfg, post_panel=False):
     elif feature in ("payment", "customs-payment"):
         payment_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
         print(f"[Config] payment — roles {payment_config['allowed_role_ids']}")
+    elif feature in ("logging", "customs-logging"):
+        logging_config["purchase_log_channel_id"] = str(cfg.get("purchase_log_channel_id") or "")
+        print(f"[Config] logging — purchase_log {logging_config['purchase_log_channel_id']}")
     elif feature in ("packages", "customs-packages"):
         packages_config["panel_channel_id"] = str(cfg.get("panel_channel_id") or "")
         packages_config["listings_channel_id"] = str(cfg.get("listings_channel_id") or "")
@@ -5693,7 +5744,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-payment", "customs-packages", "customs-order-status", "customs-pricing"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-payment", "customs-logging", "customs-packages", "customs-order-status", "customs-pricing"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
