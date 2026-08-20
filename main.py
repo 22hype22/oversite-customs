@@ -1114,6 +1114,9 @@ async def _log_group_sale(sale):
     )
 
 
+_sales_diag = {"top": None}
+
+
 @tasks.loop(minutes=2)
 async def poll_group_sales():
     """Poll the Roblox group's recent sales and log any new ones. Dedups via a
@@ -1129,6 +1132,14 @@ async def poll_group_sales():
     sales = res.get("sales") or []
     if not sales:
         return
+    # Diagnostic: print ONLY when the newest sale changes, so a real purchase is
+    # visible in the log the moment Roblox registers it.
+    top = sales[0]
+    top_id = str(top.get("id") or "")
+    if top_id and top_id != _sales_diag.get("top"):
+        _sales_diag["top"] = top_id
+        print(f"[Purchase] newest sale changed -> {top.get('itemType')} '{top.get('itemName')}' "
+              f"by {top.get('buyerName')} ({top.get('amount')} R$) id={top_id}")
     st = await _robux_locker_call("log_state_get")
     if not (isinstance(st, dict) and st.get("ok")):
         if isinstance(st, dict) and st.get("error"):
