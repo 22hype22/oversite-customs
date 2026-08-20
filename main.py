@@ -1072,6 +1072,24 @@ async def log_purchase(guild, *, discord_id=None, roblox_username=None, roblox_i
         print(f"[Purchase] log failed: {e}")
 
 
+@bot.tree.command(name="logtest", description="Post a sample purchase log (staff — to test the channel + design)")
+async def logtest_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(embed=error_embed("No permission", "Only staff can run this."), ephemeral=True)
+        return
+    if not logging_config.get("purchase_log_channel_id"):
+        await interaction.response.send_message(embed=error_embed("Not set up", "Pick a Purchase logs channel in the Logging block first."), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await log_purchase(
+        interaction.guild, discord_id=interaction.user.id, roblox_username="SampleUser",
+        roblox_id="123456789", payment_type="Sample (test)", amount="500 Robux", payment_id="#TEST",
+    )
+    await interaction.followup.send(
+        embed=success_embed("Sent", f"Sample purchase log posted in <#{logging_config.get('purchase_log_channel_id')}>."),
+        ephemeral=True)
+
+
 async def _log_group_sale(sale):
     """Log one Roblox group sale (from the sales poller) to the purchase channel."""
     buyer_roblox_id = str(sale.get("buyerId") or "")
