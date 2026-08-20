@@ -546,6 +546,8 @@ async def on_ready():
         update_status.start()
     if not portfolio_cleanup.is_running():
         portfolio_cleanup.start()
+    if not poll_group_sales.is_running():
+        poll_group_sales.start()
     await refresh_status()
 
     try:
@@ -1068,6 +1070,74 @@ async def log_purchase(guild, *, discord_id=None, roblox_username=None, roblox_i
         await ch.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
     except Exception as e:
         print(f"[Purchase] log failed: {e}")
+
+
+async def _log_group_sale(sale):
+    """Log one Roblox group sale (from the sales poller) to the purchase channel."""
+    buyer_roblox_id = str(sale.get("buyerId") or "")
+    buyer_name = sale.get("buyerName") or ""
+    discord_id = None
+    if buyer_roblox_id:
+        rev = await _pkg_call("roblox_reverse", roblox_id=buyer_roblox_id)
+        discord_id = (rev or {}).get("discord_user_id")
+    item_type = (sale.get("itemType") or "Item").strip()
+    amount = int(sale.get("amount") or 0)
+    when = None
+    if sale.get("created"):
+        try:
+            dt = discord.utils.parse_time(str(sale["created"]))
+            when = int(dt.timestamp()) if dt else None
+        except Exception:
+            when = None
+    await log_purchase(
+        None, discord_id=discord_id, roblox_username=buyer_name, roblox_id=buyer_roblox_id,
+        payment_type=f"Roblox {item_type}".strip(), amount=f"{amount} Robux",
+        payment_id=f"#{sale.get('id')}", when=when,
+    )
+
+
+@tasks.loop(minutes=2)
+async def poll_group_sales():
+    """Poll the Roblox group's recent sales and log any new ones. Dedups via a
+    persisted seen-id cursor. On the first run it seeds the cursor WITHOUT logging
+    (so old sales don't spam the channel)."""
+    if not logging_config.get("purchase_log_channel_id"):
+        return
+    res = await _robux_locker_call("sales")
+    if not (isinstance(res, dict) and res.get("ok")):
+        if isinstance(res, dict) and res.get("error"):
+            print(f"[Purchase] sales poll: {str(res.get('error'))[:200]}")
+        return
+    sales = res.get("sales") or []
+    if not sales:
+        return
+    st = await _pkg_call("log_state_get")
+    seen_list = list((st or {}).get("seen_ids") or [])
+    seen = set(seen_list)
+    first_run = len(seen) == 0
+    to_log = []
+    added = False
+    for sale in reversed(sales):  # oldest first, so logs post in order
+        sid = str(sale.get("id") or "")
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        seen_list.append(sid)
+        added = True
+        if not first_run:
+            to_log.append(sale)
+    if added:
+        await _pkg_call("log_state_set", seen_ids=seen_list[-500:])
+    for sale in to_log:
+        try:
+            await _log_group_sale(sale)
+        except Exception as e:
+            print(f"[Purchase] group sale log failed: {e}")
+
+
+@poll_group_sales.before_loop
+async def _before_poll_group_sales():
+    await bot.wait_until_ready()
 
 
 bot.tree.add_command(credits_group)
