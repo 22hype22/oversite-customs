@@ -1109,10 +1109,6 @@ async def poll_group_sales():
             print(f"[Purchase] sales poll: {str(res.get('error'))[:200]}")
         return
     sales = res.get("sales") or []
-    # Diagnostic: how many sales the group endpoint returned, and a sample.
-    sample = sales[0] if sales else None
-    print(f"[Purchase] sales poll: {len(sales)} sale(s) fetched"
-          + (f" | latest: {sample.get('itemType')} '{sample.get('itemName')}' by {sample.get('buyerName')} ({sample.get('amount')} R$)" if sample else ""))
     if not sales:
         return
     st = await _robux_locker_call("log_state_get")
