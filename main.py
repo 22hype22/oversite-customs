@@ -3890,7 +3890,7 @@ async def _open_form_page(interaction, key, page):
         if f["kind"] == "file":
             components.append({
                 "type": 18, "label": label,
-                "component": {"type": 19, "custom_id": f"f{idx}", "min_values": 1, "max_values": 1},
+                "component": {"type": 19, "custom_id": f"f{idx}", "min_values": 1, "max_values": 10},
             })
         else:
             components.append({
