@@ -2128,7 +2128,7 @@ async def before_portfolio_cleanup():
 
 # ===================== Form logs (/orderlog, /infraction, /promote) =====================
 
-async def _post_form_log(interaction, key, comps):
+async def _post_form_log(interaction, key, comps, files=None):
     """Post a completed log (design with answers + {user} filled in) to the log's
     configured channel. Assumes the interaction is already deferred (ephemeral)."""
     cfg = form_log_configs.get(key, {})
@@ -2147,6 +2147,8 @@ async def _post_form_log(interaction, key, comps):
     _V2_LAST_ERROR["msg"] = ""
     mid = await send_v2_message(ch, final, allowed_mentions={"parse": []})
     if mid:
+        if files:
+            await _post_form_files(ch, files)
         await interaction.followup.send(embed=success_embed("Logged", f"Posted in {ch.mention}."), ephemeral=True)
     else:
         reason = _V2_LAST_ERROR.get("msg") or "unknown error"
@@ -2163,16 +2165,17 @@ async def _run_form_log(interaction, key):
     if not comps:
         await interaction.response.send_message(embed=error_embed("Not set up", "Design this in the dashboard first, then save it."), ephemeral=True)
         return
-    # Register the design so the shared form pager can read its questions.
+    # Register the design so the shared form pager can read its fields.
     form_msgs[key] = comps
     form_titles[key] = form_log_titles.get(key, "Log")
-    questions = _parse_questions(comps, limit=FORM_MAX_QUESTIONS)
-    if not questions:
-        # No questions — just post the design straight to the channel.
+    fields = _parse_form_fields(comps, limit=FORM_MAX_QUESTIONS)
+    if not fields:
+        # No questions/files — just post the design straight to the channel.
         await interaction.response.defer(ephemeral=True, thinking=True)
         await _post_form_log(interaction, key, comps)
         return
     _pending_form_answers.pop((interaction.user.id, key), None)
+    _pending_form_files.pop((interaction.user.id, key), None)
     await _open_form_page(interaction, key, 0)
 
 
@@ -3678,6 +3681,9 @@ def _ticket_first_word(open_comps):
 
 
 _QUESTION_RE = re.compile(r"\{Question:\s*(.*?)\}", re.IGNORECASE)
+# A form field is either a {Question: Label} (text input) or a {File: Label}
+# (file upload — Discord modals support file components now).
+_FIELD_RE = re.compile(r"\{(Question|File):\s*(.*?)\}", re.IGNORECASE)
 
 
 def _existing_ticket_for(guild, user_id):
@@ -3753,33 +3759,77 @@ def _parse_questions(open_comps, limit=5):
     return seen[:limit]
 
 
-# In-progress ticket-form answers between paged modals, keyed by (user_id, key).
+def _parse_form_fields(open_comps, limit=10):
+    """Ordered, de-duplicated form fields in a design — both {Question: LABEL}
+    (text) and {File: LABEL} (upload) — in the order they appear. Each is
+    {"kind": "q"|"file", "label": ...}."""
+    raw = json.dumps(open_comps or [])
+    seen = set()
+    fields = []
+    for m in _FIELD_RE.finditer(raw):
+        kind = "file" if m.group(1).lower() == "file" else "q"
+        label = (m.group(2) or "").strip()
+        sig = (kind, label.lower())
+        if label and sig not in seen:
+            seen.add(sig)
+            fields.append({"kind": kind, "label": label})
+    return fields[:limit]
+
+
+# In-progress ticket-form answers + uploaded files between paged modals,
+# keyed by (user_id, key).
 _pending_form_answers = {}
+_pending_form_files = {}
 FORM_PAGE_SIZE = 5
 FORM_MAX_QUESTIONS = 10
 
 
+async def _post_form_files(channel, files):
+    """Upload collected form files into a channel, each labelled by its field."""
+    for f in files or []:
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(f["url"], timeout=90, follow_redirects=True)
+                if r.status_code != 200:
+                    continue
+                blob = r.content
+            await channel.send(content=f"**{_clean_label(f.get('label') or 'File')}**",
+                               file=discord.File(io.BytesIO(blob), filename=f.get("filename") or "file"))
+        except Exception as e:
+            print(f"[Form] file post failed: {e}")
+
+
+async def _form_fields_for(key):
+    """The form design's fields (text + file), source depending on the form kind."""
+    open_comps = (form_log_configs[key]["components"] if key in form_log_configs else form_msgs.get(key)) or []
+    return _parse_form_fields(open_comps, limit=FORM_MAX_QUESTIONS)
+
+
 async def _open_form_page(interaction, key, page):
-    """Open the modal for one page (5 questions) of a ticket form. Called as the
-    response to the Form button (page 0) or a 'Continue' button (later pages)."""
-    open_comps = form_msgs.get(key) or []
-    questions = _parse_questions(open_comps, limit=FORM_MAX_QUESTIONS)
+    """Open the modal for one page (up to 5 fields) of a form. Fields may be text
+    inputs ({Question:}) or file uploads ({File:}). Called as the response to the
+    Form button (page 0) or a 'Continue' button (later pages)."""
+    fields = await _form_fields_for(key)
     start = page * FORM_PAGE_SIZE
-    page_qs = questions[start:start + FORM_PAGE_SIZE]
-    if not page_qs:
+    page_fields = fields[start:start + FORM_PAGE_SIZE]
+    if not page_fields:
         return
-    total_pages = (len(questions) + FORM_PAGE_SIZE - 1) // FORM_PAGE_SIZE
+    total_pages = (len(fields) + FORM_PAGE_SIZE - 1) // FORM_PAGE_SIZE
     components = []
-    for j, q in enumerate(page_qs):
+    for j, f in enumerate(page_fields):
         idx = start + j
-        components.append({
-            "type": 18,  # Label — carries the field label
-            "label": (_clean_label(q) or q)[:45],
-            "component": {
-                "type": 4, "custom_id": f"q{idx}", "style": _form_input_style(q),
-                "required": True, "max_length": 1000,
-            },
-        })
+        label = (_clean_label(f["label"]) or f["label"])[:45]
+        if f["kind"] == "file":
+            components.append({
+                "type": 18, "label": label,
+                "component": {"type": 19, "custom_id": f"f{idx}", "min_values": 1, "max_values": 1},
+            })
+        else:
+            components.append({
+                "type": 18, "label": label,
+                "component": {"type": 4, "custom_id": f"q{idx}", "style": _form_input_style(f["label"]),
+                              "required": True, "max_length": 1000},
+            })
     title = (form_titles.get(key) or "Application")
     if total_pages > 1:
         title = f"{title} ({page + 1}/{total_pages})"
@@ -3818,26 +3868,31 @@ def _collect_modal_values(components):
 
 
 def _apply_answers(open_comps, mapping):
-    """Replace each {Question: LABEL} token with '**LABEL** answer'."""
+    """Replace each {Question: LABEL} token with '**LABEL** answer', and each
+    {File: LABEL} token with '**LABEL**' (the file itself is posted separately)."""
     raw = json.dumps(open_comps or [])
 
     def repl(m):
-        label = (m.group(1) or "").strip()
-        answer = mapping.get(label, "")
+        kind = m.group(1).lower()
+        label = (m.group(2) or "").strip()
         clean = _clean_label(label)
-        out = f"**{clean}** {answer}".strip() if answer else f"**{clean}**"
+        if kind == "file":
+            out = f"**{clean}**"
+        else:
+            answer = mapping.get(label, "")
+            out = f"**{clean}** {answer}".strip() if answer else f"**{clean}**"
         return json.dumps(out)[1:-1]  # JSON-escape (we're inside a string literal)
 
-    return json.loads(_QUESTION_RE.sub(repl, raw))
+    return json.loads(_FIELD_RE.sub(repl, raw))
 
 
 async def open_ticket_form(interaction, key):
     """A Form button/option: pop a modal to collect {Question:} answers, then
     open the ticket with those answers filled into the designed message."""
     open_comps = form_msgs.get(key) or []
-    questions = _parse_questions(open_comps, limit=FORM_MAX_QUESTIONS)
-    if not questions:
-        # No questions defined — behave exactly like a Ticket button.
+    fields = _parse_form_fields(open_comps, limit=FORM_MAX_QUESTIONS)
+    if not fields:
+        # No questions/files defined — behave exactly like a Ticket button.
         await open_ticket(interaction, f"ticket_form:{key}", open_comps_override=open_comps)
         return
 
@@ -3859,9 +3914,10 @@ async def open_ticket_form(interaction, key):
                 pass
             return
 
-    # Start fresh, then open page 1 of the form (up to 5 questions per page,
+    # Start fresh, then open page 1 of the form (up to 5 fields per page,
     # continued with a button if there are more — Discord caps a modal at 5).
     _pending_form_answers.pop((interaction.user.id, key), None)
+    _pending_form_files.pop((interaction.user.id, key), None)
     try:
         await _open_form_page(interaction, key, 0)
     except Exception as e:
@@ -3877,25 +3933,31 @@ async def handle_ticket_form_submit(interaction, key, page=0):
     # their own config (robust even if the shared registry was rebuilt mid-form)
     # and post to a channel instead of opening a ticket.
     open_comps = (form_log_configs[key]["components"] if key in form_log_configs else form_msgs.get(key)) or []
-    questions = _parse_questions(open_comps, limit=FORM_MAX_QUESTIONS)
-    total_pages = (len(questions) + FORM_PAGE_SIZE - 1) // FORM_PAGE_SIZE
+    fields = _parse_form_fields(open_comps, limit=FORM_MAX_QUESTIONS)
+    total_pages = (len(fields) + FORM_PAGE_SIZE - 1) // FORM_PAGE_SIZE
 
-    # Stash this page's answers (keyed to the member so pages accumulate).
+    # Stash this page's answers + files (keyed to the member so pages accumulate).
     vals = _collect_modal_values((interaction.data or {}).get("components"))
     pend = _pending_form_answers.setdefault((interaction.user.id, key), {})
+    pend_files = _pending_form_files.setdefault((interaction.user.id, key), [])
     start = page * FORM_PAGE_SIZE
-    for j, q in enumerate(questions[start:start + FORM_PAGE_SIZE]):
-        pend[q] = (vals.get(f"q{start + j}") or "").strip()
+    for j, f in enumerate(fields[start:start + FORM_PAGE_SIZE]):
+        idx = start + j
+        if f["kind"] == "file":
+            for up in _modal_uploaded_files(interaction, f"f{idx}"):
+                pend_files.append({"label": f["label"], "url": up["url"], "filename": up.get("filename")})
+        else:
+            pend[f["label"]] = (vals.get(f"q{idx}") or "").strip()
 
-    # More questions to go — offer a Continue button that opens the next modal
+    # More fields to go — offer a Continue button that opens the next modal
     # (button -> modal is always allowed, unlike modal -> modal).
     if page + 1 < total_pages:
-        remaining = len(questions) - (page + 1) * FORM_PAGE_SIZE
+        remaining = len(fields) - (page + 1) * FORM_PAGE_SIZE
         row = {"type": 1, "components": [{
             "type": 2, "style": 1, "custom_id": f"formcont:{key}|{page + 1}", "label": "Continue",
         }]}
         data = {"flags": 1 << 6,
-                "content": f"Saved — **{remaining}** more question{'s' if remaining != 1 else ''} to go. Tap **Continue**.",
+                "content": f"Saved — **{remaining}** more field{'s' if remaining != 1 else ''} to go. Tap **Continue**.",
                 "components": [row]}
         try:
             route = discord.http.Route(
@@ -3913,12 +3975,14 @@ async def handle_ticket_form_submit(interaction, key, page=0):
         print(f"[Ticket] form submit defer failed: {e}")
     try:
         mapping = dict(_pending_form_answers.pop((interaction.user.id, key), {}))
+        files = list(_pending_form_files.pop((interaction.user.id, key), []))
         substituted = _apply_answers(open_comps, mapping)
         if key in form_log_configs:
-            await _post_form_log(interaction, key, substituted)
+            await _post_form_log(interaction, key, substituted, files=files)
             return
         await open_ticket(interaction, f"ticket_form:{key}", open_comps_override=substituted,
-                          category_name_override=ticket_categories.get(key), access_names_override=ticket_access.get(key), already_responded=True)
+                          category_name_override=ticket_categories.get(key), access_names_override=ticket_access.get(key),
+                          already_responded=True, attachments=files)
     except Exception as e:
         import traceback
         print(f"[Ticket] form submit failed: {e}\n{traceback.format_exc()}")
@@ -3982,7 +4046,7 @@ def _resolve_role_names(guild, names_csv):
     return out
 
 
-async def open_ticket(interaction, category, open_comps_override=None, category_name_override=None, access_names_override=None, already_responded=False):
+async def open_ticket(interaction, category, open_comps_override=None, category_name_override=None, access_names_override=None, already_responded=False, attachments=None):
     guild = interaction.guild
     if not guild:
         return
@@ -4094,6 +4158,9 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
         close_view.add_item(discord.ui.Button(label="Close Order", style=discord.ButtonStyle.danger, custom_id="ticket_close", emoji="🔒"))
 
         await channel.send(content=content, embed=embed, view=close_view)
+    # Post any uploaded form files into the ticket (each labelled by its field).
+    if attachments:
+        await _post_form_files(channel, attachments)
     await record_ticket(guild.id, channel.id, interaction.user.id, category, "open")
     await interaction.followup.send(embed=success_embed("Ticket opened", f"Your ticket is ready: {channel.mention}"), ephemeral=True)
 
