@@ -1109,6 +1109,10 @@ async def poll_group_sales():
             print(f"[Purchase] sales poll: {str(res.get('error'))[:200]}")
         return
     sales = res.get("sales") or []
+    # Diagnostic: how many sales the group endpoint returned, and a sample.
+    sample = sales[0] if sales else None
+    print(f"[Purchase] sales poll: {len(sales)} sale(s) fetched"
+          + (f" | latest: {sample.get('itemType')} '{sample.get('itemName')}' by {sample.get('buyerName')} ({sample.get('amount')} R$)" if sample else ""))
     if not sales:
         return
     st = await _robux_locker_call("log_state_get")
@@ -1130,6 +1134,10 @@ async def poll_group_sales():
         added = True
         if not first_run:
             to_log.append(sale)
+    if first_run:
+        print(f"[Purchase] seeded {len(seen_list)} existing sale(s) (first run — not logging these)")
+    elif to_log:
+        print(f"[Purchase] {len(to_log)} new sale(s) to log")
     if added:
         await _robux_locker_call("log_state_set", seen_ids=seen_list[-500:])
     for sale in to_log:
