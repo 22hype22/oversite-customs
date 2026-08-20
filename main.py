@@ -3867,6 +3867,29 @@ async def _send_v2_with_files(channel, components_v2, files, allowed_mentions=No
         return False
 
 
+async def _post_form_files_thread(channel, opening_message_id, files, thread_name="References"):
+    """Post the uploaded form files into a THREAD off the ticket's opening
+    message (falls back to a standalone thread, then to the channel itself)."""
+    name = (thread_name or "References")[:100]
+    thread = None
+    if opening_message_id:
+        try:
+            msg = await channel.fetch_message(int(opening_message_id))
+            thread = await msg.create_thread(name=name, auto_archive_duration=10080)
+        except Exception as e:
+            print(f"[Form] thread-from-message failed: {e}")
+    if thread is None:
+        try:
+            thread = await channel.create_thread(name=name, type=discord.ChannelType.public_thread, auto_archive_duration=10080)
+        except Exception as e:
+            print(f"[Form] standalone thread failed: {e}")
+    if thread is None:
+        await _post_form_files(channel, files)  # last resort: post in the channel
+        return None
+    await _post_form_files(thread, files)
+    return thread
+
+
 async def _form_fields_for(key):
     """The form design's fields (text + file), source depending on the form kind."""
     open_comps = (form_log_configs[key]["components"] if key in form_log_configs else form_msgs.get(key)) or []
@@ -4210,16 +4233,14 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
                     pass
             # Allow role + user mentions inside the ticket message to actually
             # ping (e.g. a @Livery Designer role written into the design).
-            # When the form collected files, embed them INSIDE this message
-            # (labelled file/image components) instead of a separate post.
-            if attachments:
-                sent_rich = bool(await _send_v2_with_files(channel, panel, attachments, allowed_mentions={"parse": ["users", "roles"]}))
-                if sent_rich:
-                    attachments = None  # embedded — don't also post separately
-                else:
-                    sent_rich = bool(await send_v2_message(channel, panel, allowed_mentions={"parse": ["users", "roles"]}))
-            else:
-                sent_rich = bool(await send_v2_message(channel, panel, allowed_mentions={"parse": ["users", "roles"]}))
+            mid = await send_v2_message(channel, panel, allowed_mentions={"parse": ["users", "roles"]})
+            sent_rich = bool(mid)
+            # Uploaded form files go into a THREAD off the opening message (named
+            # after the file field, e.g. "References"), not on the main message.
+            if sent_rich and attachments:
+                thread_name = _clean_label(attachments[0].get("label") or "References") or "References"
+                await _post_form_files_thread(channel, mid if isinstance(mid, str) else None, attachments, thread_name)
+                attachments = None  # handled in the thread
         except Exception as e:
             print(f"[Tickets] rich open message failed: {e}")
             sent_rich = False
