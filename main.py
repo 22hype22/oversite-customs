@@ -126,7 +126,7 @@ payment_config = {"allowed_role_ids": []}
 # ---- Logging ----
 # The dashboard "Logging" block. Purchase logs post every completed Stripe
 # (/payment) and Roblox group game-pass purchase to a channel.
-logging_config = {"purchase_log_channel_id": ""}
+logging_config = {"purchase_log_channel_id": "", "purchase_components": []}
 
 # ---- Form logs (/orderlog, /infraction, /promote) ----
 # Each pops a form built from the {Question:} tokens in its design, then posts
@@ -1011,11 +1011,43 @@ async def log_credit_action(guild, text):
 
 async def log_purchase(guild, *, discord_id=None, roblox_username=None, roblox_id=None,
                        payment_type="", amount="", payment_id="", when=None):
-    """Post a purchase to the Logging block's purchase-logs channel, in the
-    standard format (customer, Roblox account, payment type, amount, id, date)."""
+    """Post a purchase to the Logging block's purchase-logs channel. If a message
+    was designed in the dashboard, its tokens are filled in and it's posted;
+    otherwise a default layout is used."""
     ch = await resolve_channel(logging_config.get("purchase_log_channel_id"))
     if not ch:
         return
+    try:
+        ts = int(when) if when else int(discord.utils.utcnow().timestamp())
+    except Exception:
+        ts = int(discord.utils.utcnow().timestamp())
+    subs = {
+        "{customer}": f"<@{discord_id}> ({discord_id})" if discord_id else "",
+        "{customer_mention}": f"<@{discord_id}>" if discord_id else "",
+        "{customer_id}": str(discord_id or ""),
+        "{roblox}": str(roblox_username or ""),
+        "{roblox_account}": str(roblox_username or ""),
+        "{roblox_id}": str(roblox_id or ""),
+        "{payment_type}": str(payment_type or ""),
+        "{amount}": str(amount or ""),
+        "{payment_id}": str(payment_id or ""),
+        "{purchased}": f"<t:{ts}:F>",
+    }
+    comps = logging_config.get("purchase_components") or []
+    if comps:
+        raw = json.dumps(comps)
+        for tok, val in subs.items():
+            raw = raw.replace(tok, json.dumps(str(val))[1:-1])
+        try:
+            rendered = json.loads(raw)
+        except Exception:
+            rendered = comps
+        try:
+            await send_v2_message(ch, rendered, allowed_mentions={"parse": []})
+            return
+        except Exception as e:
+            print(f"[Purchase] designed log failed, using default: {e}")
+    # Default layout.
     lines = []
     if discord_id:
         lines.append(f"Customer: <@{discord_id}> ({discord_id})")
@@ -1030,10 +1062,6 @@ async def log_purchase(guild, *, discord_id=None, roblox_username=None, roblox_i
         lines.append(f"Amount: {amount}")
     if payment_id:
         lines.append(f"Payment ID: {payment_id}")
-    try:
-        ts = int(when) if when else int(discord.utils.utcnow().timestamp())
-    except Exception:
-        ts = int(discord.utils.utcnow().timestamp())
     lines.append(f"Purchased: <t:{ts}:F>")
     embed = info_embed("Purchase Log", "\n".join(lines))
     try:
@@ -5183,7 +5211,9 @@ async def apply_config(feature, cfg, post_panel=False):
         print(f"[Config] payment — roles {payment_config['allowed_role_ids']}")
     elif feature in ("logging", "customs-logging"):
         logging_config["purchase_log_channel_id"] = str(cfg.get("purchase_log_channel_id") or "")
-        print(f"[Config] logging — purchase_log {logging_config['purchase_log_channel_id']}")
+        comps = cfg.get("purchase_components")
+        logging_config["purchase_components"] = comps if isinstance(comps, list) else []
+        print(f"[Config] logging — purchase_log {logging_config['purchase_log_channel_id']} design {len(logging_config['purchase_components'])}")
     elif feature in ("packages", "customs-packages"):
         packages_config["panel_channel_id"] = str(cfg.get("panel_channel_id") or "")
         packages_config["listings_channel_id"] = str(cfg.get("listings_channel_id") or "")
