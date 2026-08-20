@@ -1078,7 +1078,7 @@ async def _log_group_sale(sale):
     buyer_name = sale.get("buyerName") or ""
     discord_id = None
     if buyer_roblox_id:
-        rev = await _pkg_call("roblox_reverse", roblox_id=buyer_roblox_id)
+        rev = await _robux_locker_call("roblox_reverse", roblox_id=buyer_roblox_id)
         discord_id = (rev or {}).get("discord_user_id")
     item_type = (sale.get("itemType") or "Item").strip()
     amount = int(sale.get("amount") or 0)
@@ -1111,7 +1111,11 @@ async def poll_group_sales():
     sales = res.get("sales") or []
     if not sales:
         return
-    st = await _pkg_call("log_state_get")
+    st = await _robux_locker_call("log_state_get")
+    if not (isinstance(st, dict) and st.get("ok")):
+        if isinstance(st, dict) and st.get("error"):
+            print(f"[Purchase] log_state read: {str(st.get('error'))[:200]}")
+        return
     seen_list = list((st or {}).get("seen_ids") or [])
     seen = set(seen_list)
     first_run = len(seen) == 0
@@ -1127,7 +1131,7 @@ async def poll_group_sales():
         if not first_run:
             to_log.append(sale)
     if added:
-        await _pkg_call("log_state_set", seen_ids=seen_list[-500:])
+        await _robux_locker_call("log_state_set", seen_ids=seen_list[-500:])
     for sale in to_log:
         try:
             await _log_group_sale(sale)
@@ -5577,12 +5581,14 @@ async def _robux_update_panel():
         print(f"[RobuxLocker] panel update failed: {e}")
 
 
-async def _robux_locker_call(action, amount=0, time_frame=None):
-    """POST to the robux-locker edge function (funds / stock / rate ops).
-    `amount` may be fractional (the rate is dollars per 1k, e.g. 7.5)."""
+async def _robux_locker_call(action, amount=0, time_frame=None, **extra):
+    """POST to the robux-locker edge function (funds / stock / rate / sales /
+    purchase-log ops). `amount` may be fractional (the rate is dollars per 1k)."""
     payload = {"action": action, "amount": amount}
     if time_frame:
         payload["timeFrame"] = time_frame
+    for k, v in extra.items():
+        payload[k] = v
     try:
         async with httpx.AsyncClient() as client:
             r = await client.post(
