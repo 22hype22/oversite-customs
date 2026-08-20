@@ -683,6 +683,14 @@ async def on_member_join(member):
 @bot.event
 async def on_member_remove(member):
     await refresh_status()
+    # Drop a designer's saved pricing when they leave, so /pricing never shows
+    # prices for people who aren't in the server anymore.
+    try:
+        res = await _pricing_call("remove_user", user=member.id)
+        if isinstance(res, dict) and res.get("ok") and res.get("prices") is not None:
+            pricing_config["values"] = res.get("prices") or {}
+    except Exception as e:
+        print(f"[Pricing] remove on leave failed: {e}")
 
 
 _EMOJI_SHORTCODE_RE = re.compile(r":([a-zA-Z][a-zA-Z0-9_]*)(?:~\d+)?:")
@@ -2831,11 +2839,13 @@ async def _pkg_do_claim(interaction, sid, recipient_id):
 
 # ===================== Pricing =====================
 
-async def _pricing_call(action, entries=None):
-    """POST to the pricing edge function (get / set price values)."""
+async def _pricing_call(action, entries=None, user=None):
+    """POST to the pricing edge function (get / set / remove_user price values)."""
     payload = {"action": action}
     if entries is not None:
         payload["entries"] = entries
+    if user is not None:
+        payload["user"] = str(user)
     try:
         async with httpx.AsyncClient() as client:
             r = await client.post(
@@ -2919,6 +2929,9 @@ def _pricing_lines_text(si, guild=None):
 
     blocks = []
     for uid in sorted(by_user.keys(), key=_join_key):
+        # Never show pricing for a designer who has left the server.
+        if guild and str(uid).isdigit() and guild.get_member(int(uid)) is None:
+            continue
         item_map = by_user.get(uid) or {}
         if not isinstance(item_map, dict):
             continue
