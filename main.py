@@ -9,6 +9,7 @@ import datetime
 import time
 import random
 import secrets
+import typing
 
 import discord
 from discord import app_commands
@@ -2618,19 +2619,45 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
                 view.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.link, url=url))
             else:
                 view.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.success, custom_id="pkg_claim"))
+
+    async def _banner_file(f):
+        """Download an {SFile} Preview so it can post as a real native image."""
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(f["url"], timeout=90, follow_redirects=True)
+            if r.status_code == 200:
+                return discord.File(io.BytesIO(r.content),
+                                    filename=_san_filename(f.get("filename"), "preview.png"))
+        except Exception as e:
+            print(f"[Package] preview fetch failed: {e}")
+        return None
+
+    none_mentions = discord.AllowedMentions.none()
     try:
+        if isinstance(ch, discord.ForumChannel):
+            # Forum channels take a new thread (forum post), not a plain message.
+            # The banner is the thread's starter message; the embed follows inside.
+            thread_name = ((embed.title or ctx.get("payment") or "Package") or "Package")[:100]
+            banners = [b for b in [await _banner_file(f) for f in sfile_files] if b]
+            if banners:
+                created = await ch.create_thread(name=thread_name, files=banners, allowed_mentions=none_mentions)
+                target = getattr(created, "thread", created)
+                await target.send(embed=embed, view=view, allowed_mentions=none_mentions)
+            else:
+                created = await ch.create_thread(name=thread_name, embed=embed, view=view, allowed_mentions=none_mentions)
+                target = getattr(created, "thread", created)
+            if after_files:
+                await _post_form_files(target, after_files)
+            link = f"https://discord.com/channels/{ch.guild.id}/{target.id}"
+            await interaction.followup.send(embed=success_embed("Posted", f"Package post created: {link}"), ephemeral=True)
+            return
         # 1) The {SFile} Preview banner posts on its own as a normal native image.
         for f in sfile_files:
-            try:
-                async with httpx.AsyncClient() as client:
-                    r = await client.get(f["url"], timeout=90, follow_redirects=True)
-                if r.status_code == 200:
-                    await ch.send(file=discord.File(io.BytesIO(r.content),
-                                  filename=_san_filename(f.get("filename"), "preview.png")))
-            except Exception as e:
-                print(f"[Package] preview post failed: {e}")
+            bf = await _banner_file(f)
+            if bf:
+                await ch.send(file=bf, allowed_mentions=none_mentions)
         # 2) The embed — with the Media Gallery photo inside it — as its own message.
-        await ch.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+        await ch.send(embed=embed, view=view, allowed_mentions=none_mentions)
         # 3) {File} attachments underneath.
         if after_files:
             await _post_form_files(ch, after_files)
@@ -2645,7 +2672,7 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
     payment="What the payment is — e.g. Gamepass, Roblox Select, Stripe. Fills {payment}.",
     link="The payment link. Fills {payment_link} — e.g. [{payment}]({payment_link}).",
 )
-async def package_cmd(interaction: discord.Interaction, channel: discord.TextChannel, payment: str = "", link: str = ""):
+async def package_cmd(interaction: discord.Interaction, channel: typing.Union[discord.TextChannel, discord.ForumChannel], payment: str = "", link: str = ""):
     if not _packages_can_use(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to run /package."), ephemeral=True)
         return
