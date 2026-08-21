@@ -543,6 +543,13 @@ async def on_ready():
         else:
             synced = await bot.tree.sync()
             print(f"Synced {len(synced)} commands")
+            for cmd in synced:
+                if cmd.name == "package":
+                    for opt in getattr(cmd, "options", []):
+                        if getattr(opt, "name", "") == "channel":
+                            types = [int(t.value) for t in (getattr(opt, "channel_types", None) or [])]
+                            print(f"[package] channel option accepts channel_types={types} "
+                                  f"(15=forum, 16=media expected)")
     except Exception as e:
         print(f"Sync error: {e}")
 
