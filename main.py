@@ -1023,10 +1023,26 @@ async def log_purchase(guild, *, discord_id=None, roblox_username=None, roblox_i
         ts = int(when) if when else int(discord.utils.utcnow().timestamp())
     except Exception:
         ts = int(discord.utils.utcnow().timestamp())
+    # Customer must never be blank. Prefer the linked Discord user; if the buyer
+    # isn't verified, fall back to their Roblox account (name + profile link) so
+    # every box is filled out.
+    roblox_profile = f"https://www.roblox.com/users/{roblox_id}/profile" if roblox_id else ""
+    if discord_id:
+        cust = f"<@{discord_id}> ({discord_id})"
+        cust_mention = f"<@{discord_id}>"
+        cust_id = str(discord_id)
+    elif roblox_username or roblox_id:
+        label = roblox_username or f"Roblox {roblox_id}"
+        cust = f"[{label}]({roblox_profile})" if roblox_profile else label
+        cust_mention = cust
+        cust_id = str(roblox_id or "")
+    else:
+        cust = cust_mention = "Unknown"
+        cust_id = ""
     subs = {
-        "{customer}": f"<@{discord_id}> ({discord_id})" if discord_id else "",
-        "{customer_mention}": f"<@{discord_id}>" if discord_id else "",
-        "{customer_id}": str(discord_id or ""),
+        "{customer}": cust,
+        "{customer_mention}": cust_mention,
+        "{customer_id}": cust_id,
         "{roblox}": str(roblox_username or ""),
         "{roblox_account}": str(roblox_username or ""),
         "{roblox_id}": str(roblox_id or ""),
@@ -1051,8 +1067,7 @@ async def log_purchase(guild, *, discord_id=None, roblox_username=None, roblox_i
             print(f"[Purchase] designed log failed, using default: {e}")
     # Default layout.
     lines = []
-    if discord_id:
-        lines.append(f"Customer: <@{discord_id}> ({discord_id})")
+    lines.append(f"Customer: {cust}")
     if roblox_username:
         lines.append(f"Roblox account: {roblox_username}")
     if roblox_id:
@@ -1083,11 +1098,53 @@ async def logtest_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     await log_purchase(
         interaction.guild, discord_id=interaction.user.id, roblox_username="SampleUser",
-        roblox_id="123456789", payment_type="Sample (test)", amount="500 Robux", payment_id="#TEST",
+        roblox_id="123456789", payment_type="Sample (test)", amount="R$ 500", payment_id="#TEST",
     )
     await interaction.followup.send(
         embed=success_embed("Sent", f"Sample purchase log posted in <#{logging_config.get('purchase_log_channel_id')}>."),
         ephemeral=True)
+
+
+@bot.tree.command(name="logdebug", description="Diagnose why a purchase log's Customer is blank (staff)")
+@app_commands.describe(roblox_id="The buyer's Roblox user ID (e.g. 376043957)", roblox_username="The buyer's Roblox username (optional)")
+async def logdebug_cmd(interaction: discord.Interaction, roblox_id: str, roblox_username: str = ""):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(embed=error_embed("No permission", "Only staff can run this."), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    dbg = await _robux_locker_call("verify_debug", roblox_id=roblox_id.strip(), roblox_username=roblox_username.strip())
+    rev = await _robux_locker_call("roblox_reverse", roblox_id=roblox_id.strip(), roblox_username=roblox_username.strip())
+
+    def _row(r):
+        if not r:
+            return "— none —"
+        return f"discord=`{r.get('discord_user_id')}` roblox_id=`{r.get('roblox_id')}` name=`{r.get('roblox_username')}`"
+
+    if not (isinstance(dbg, dict) and dbg.get("ok")):
+        await interaction.followup.send(
+            embed=error_embed("Debug failed", f"`{(dbg or {}).get('error', 'unknown')}`\n\nIf this says *Unknown action*, the robux-locker function hasn't redeployed yet."),
+            ephemeral=True)
+        return
+
+    resolved = (rev or {}).get("discord_user_id")
+    lines = [
+        f"**Reverse lookup result:** {'<@' + str(resolved) + '>' if resolved else '❌ blank (this is why Customer is empty)'}",
+        "",
+        f"**Match by roblox_id (this bot):** {_row(dbg.get('by_id'))}",
+        f"**Match by username (this bot):** {_row(dbg.get('by_name'))}",
+        f"**Match by roblox_id (any bot):** {_row(dbg.get('any_bot'))}",
+        f"**Total verifications for this bot:** `{dbg.get('total_for_bot')}`",
+    ]
+    hint = ""
+    if not resolved:
+        if dbg.get("any_bot") and not dbg.get("by_id"):
+            hint = "\n\n➡️ A row exists under a **different bot_id** — the buyer verified with another bot."
+        elif dbg.get("by_name") and not dbg.get("by_id"):
+            hint = "\n\n➡️ Found by username — the row's `roblox_id` is empty. The username fallback now handles this; re-run a purchase."
+        elif not dbg.get("by_id") and not dbg.get("by_name") and not dbg.get("any_bot"):
+            hint = "\n\n➡️ No verification row at all for this Roblox account. The buyer isn't verified in this bot's `/verify` system."
+    await interaction.followup.send(
+        embed=success_embed(f"Verify debug — {roblox_id}", "\n".join(lines) + hint), ephemeral=True)
 
 
 async def _log_group_sale(sale):
@@ -1095,8 +1152,10 @@ async def _log_group_sale(sale):
     buyer_roblox_id = str(sale.get("buyerId") or "")
     buyer_name = sale.get("buyerName") or ""
     discord_id = None
-    if buyer_roblox_id:
-        rev = await _robux_locker_call("roblox_reverse", roblox_id=buyer_roblox_id)
+    if buyer_roblox_id or buyer_name:
+        rev = await _robux_locker_call(
+            "roblox_reverse", roblox_id=buyer_roblox_id, roblox_username=buyer_name,
+        )
         discord_id = (rev or {}).get("discord_user_id")
     item_type = (sale.get("itemType") or "Item").strip()
     amount = int(sale.get("amount") or 0)
@@ -1109,7 +1168,7 @@ async def _log_group_sale(sale):
             when = None
     await log_purchase(
         None, discord_id=discord_id, roblox_username=buyer_name, roblox_id=buyer_roblox_id,
-        payment_type=f"Roblox {item_type}".strip(), amount=f"{amount} Robux",
+        payment_type=f"Roblox {item_type}".strip(), amount=f"R$ {amount}",
         payment_id=f"#{sale.get('id')}", when=when,
     )
 
