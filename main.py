@@ -1255,7 +1255,7 @@ async def _log_stripe_sale(pi):
     if name and email:
         customer = f"{name} ({email})"
     else:
-        customer = name or email or "Guest"
+        customer = name or email or "N/A"
     await log_purchase(
         None, customer_name=customer,
         payment_type="Stripe", amount=amount, payment_id=f"#{pi.get('id')}", when=when,
@@ -1264,8 +1264,9 @@ async def _log_stripe_sale(pi):
 
 @tasks.loop(seconds=30)
 async def poll_stripe_sales():
-    """Poll recent paid Stripe payments and log any new ones. Same dedup-cursor
-    approach as the Roblox group-sales poller (seeds silently on first run)."""
+    """Poll recent paid Stripe payments and log any new ones, deduped by a
+    persisted cursor. No first-run seeding — any paid customs payment we haven't
+    logged yet gets posted."""
     if not logging_config.get("purchase_log_channel_id"):
         return
     res = await _payments_call("stripe_recent")
@@ -1287,10 +1288,6 @@ async def poll_stripe_sales():
         return
     seen_list = list((st or {}).get("seen_ids") or [])
     seen = set(seen_list)
-    first_run = len(seen) == 0
-    # On the first run, seed only payments OLDER than 10 minutes so a fresh test
-    # payment still logs; genuinely old ones are marked seen without logging.
-    cutoff = int(discord.utils.utcnow().timestamp()) - 600
     to_log = []
     added = False
     for pi in sorted(sales, key=lambda p: int(p.get("created") or 0)):  # oldest first
@@ -1300,8 +1297,6 @@ async def poll_stripe_sales():
         seen.add(pid)
         seen_list.append(pid)
         added = True
-        if first_run and int(pi.get("created") or 0) < cutoff:
-            continue  # old payment on first run — seed silently
         to_log.append(pi)
     if to_log:
         print(f"[Purchase] {len(to_log)} new Stripe payment(s) to log")
