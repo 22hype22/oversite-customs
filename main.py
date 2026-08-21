@@ -2388,12 +2388,47 @@ def _packages_can_use(member):
     return has_any_role(member, packages_config.get("allowed_role_ids", []))
 
 
+_PKG_FILLER = "ㅤ"  # Hangul filler — an invisible, roughly fixed-width space.
+
+
+def _align_pipe_columns(text):
+    """Turn {|} columns into spread-out text using an invisible filler. Two
+    consecutive lines that both contain {|} (a labels line + a values line) are
+    padded per column so they line up; a lone {|} line falls back to ' | '.
+    (Discord's font is proportional, so alignment is close but not exact.)"""
+    lines = str(text or "").split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        nxt = lines[i + 1] if i + 1 < len(lines) else None
+        if "{|}" in line and nxt is not None and "{|}" in nxt:
+            a = [c.strip() for c in line.split("{|}")]
+            b = [c.strip() for c in nxt.split("{|}")]
+            if len(a) == len(b):
+                widths = [max(len(a[k]), len(b[k])) + 3 for k in range(len(a))]
+
+                def pad(cells):
+                    return "".join(
+                        cells[k] + (_PKG_FILLER * max(1, widths[k] - len(cells[k])) if k < len(cells) - 1 else "")
+                        for k in range(len(cells))
+                    )
+
+                out.append(pad(a))
+                out.append(pad(b))
+                i += 2
+                continue
+        out.append(line.replace("{|}", " | "))
+        i += 1
+    return "\n".join(out)
+
+
 def _flatten_pkg_fields(comps):
-    """Discord's Components V2 has no side-by-side columns, so convert the card's
-    column authoring into plain text before sending:
+    """Discord's Components V2 has no real columns, so convert the card's column
+    authoring into plain text before sending:
       - a {type:"fields"} component -> stacked '**Name** value' lines
-      - the {|} token inside a Text Display -> a ' | ' inline separator
-    Columns still show in the dashboard preview; the post falls back to inline."""
+      - {|} rows inside a Text Display -> invisible-filler padded columns
+    Columns still show in the dashboard preview; the post approximates them."""
     out = []
     for c in comps or []:
         if not isinstance(c, dict):
@@ -2409,7 +2444,7 @@ def _flatten_pkg_fields(comps):
                     lines.append(f"**{name}**\n{val}".strip() if name else val)
             out.append({"id": c.get("id") or "f", "type": "text", "text": "\n".join(lines)})
         elif t == "text":
-            out.append({**c, "text": str(c.get("text") or "").replace("{|}", " | ")})
+            out.append({**c, "text": _align_pipe_columns(c.get("text"))})
         elif t == "container" and isinstance(c.get("children"), list):
             out.append({**c, "children": _flatten_pkg_fields(c["children"])})
         else:
