@@ -1014,7 +1014,7 @@ async def log_credit_action(guild, text):
 
 
 async def log_purchase(guild, *, discord_id=None, roblox_username=None, roblox_id=None,
-                       payment_type="", amount="", payment_id="", when=None):
+                       payment_type="", amount="", payment_id="", when=None, customer_name=None):
     """Post a purchase to the Logging block's purchase-logs channel. If a message
     was designed in the dashboard, its tokens are filled in and it's posted;
     otherwise a default layout is used."""
@@ -1025,14 +1025,17 @@ async def log_purchase(guild, *, discord_id=None, roblox_username=None, roblox_i
         ts = int(when) if when else int(discord.utils.utcnow().timestamp())
     except Exception:
         ts = int(discord.utils.utcnow().timestamp())
-    # Customer must never be blank. Prefer the linked Discord user; if the buyer
-    # isn't verified, fall back to their Roblox account (name + profile link) so
-    # every box is filled out.
+    # Customer must never be blank. Prefer the linked Discord user; then an
+    # explicit name/email (Stripe payer); then their Roblox account (name +
+    # profile link) so every box is filled out.
     roblox_profile = f"https://www.roblox.com/users/{roblox_id}/profile" if roblox_id else ""
     if discord_id:
         cust = f"<@{discord_id}> ({discord_id})"
         cust_mention = f"<@{discord_id}>"
         cust_id = str(discord_id)
+    elif customer_name:
+        cust = cust_mention = str(customer_name)
+        cust_id = ""
     elif roblox_username or roblox_id:
         label = roblox_username or f"Roblox {roblox_id}"
         cust = f"[{label}]({roblox_profile})" if roblox_profile else label
@@ -1239,15 +1242,22 @@ async def _before_poll_group_sales():
 
 
 async def _log_stripe_sale(pi):
-    """Log one paid Stripe payment (from the Stripe poller) to the purchase channel."""
-    discord_id = pi.get("discord_id") or None
+    """Log one paid Stripe payment (from the Stripe poller) to the purchase channel.
+    Stripe never sees Discord identity, so Customer is the payer's name/email from
+    the Stripe charge's billing details."""
     cents = int(pi.get("amount") or 0)
     cur = str(pi.get("currency") or "usd").upper()
     sym = "$" if cur == "USD" else ""
     amount = f"{sym}{cents / 100:.2f}" + ("" if sym else f" {cur}")
     when = int(pi.get("created")) if pi.get("created") else None
+    name = (pi.get("customer_name") or "").strip()
+    email = (pi.get("customer_email") or "").strip()
+    if name and email:
+        customer = f"{name} ({email})"
+    else:
+        customer = name or email or "Guest"
     await log_purchase(
-        None, discord_id=discord_id, roblox_username=pi.get("customer_name") or None,
+        None, customer_name=customer,
         payment_type="Stripe", amount=amount, payment_id=f"#{pi.get('id')}", when=when,
     )
 
@@ -1312,45 +1322,9 @@ async def _before_poll_stripe_sales():
 bot.tree.add_command(credits_group)
 
 
-async def _handle_stripe_pay_click(interaction, price):
-    """A customer clicked a Stripe 'Pay' button. Create a link stamped with THEIR
-    Discord id and hand it to them privately, so the purchase log @'s whoever
-    actually paid — no staff picking a customer."""
-    try:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-    except Exception:
-        pass
-    result = await create_payment(
-        "stripe", 0, price,
-        discord_id=interaction.user.id,
-        guild_id=interaction.guild_id,
-        customer_name=str(interaction.user),
-    )
-    if isinstance(result, dict) and result.get("ok") and result.get("url"):
-        await interaction.followup.send(
-            embed=success_embed(
-                "Your payment link",
-                f"**${price:.2f}** — this link is yours, {interaction.user.mention}. "
-                f"Paying it logs the purchase to your account.\n{result['url']}",
-            ),
-            ephemeral=True,
-        )
-    else:
-        err = (result or {}).get("error") if isinstance(result, dict) else str(result)
-        await interaction.followup.send(embed=error_embed("Couldn't create link", err or "Unknown error"), ephemeral=True)
-
-
-async def create_payment(method, item, price, *, discord_id=None, guild_id=None, customer_name=None):
-    """Call the payment-create edge function (holds the Roblox cookie + Stripe key).
-    For Stripe, discord_id/customer_name attribute the payment to a customer so
-    the purchase-log poller can @ them once it's paid."""
+async def create_payment(method, item, price):
+    """Call the payment-create edge function (holds the Roblox cookie + Stripe key)."""
     payload = {"method": method, "item": item, "price": price}
-    if discord_id:
-        payload["discord_id"] = str(discord_id)
-    if guild_id:
-        payload["guild_id"] = str(guild_id)
-    if customer_name:
-        payload["customer_name"] = str(customer_name)
     try:
         async with httpx.AsyncClient() as client:
             r = await client.post(
@@ -1404,25 +1378,6 @@ class PaymentModal(discord.ui.Modal):
             price = float(str(self.price.value or "").replace("$", "").replace(",", "").strip())
         except Exception:
             price = 0
-        if method == "stripe":
-            # Post a Pay button instead of a raw link. Whoever CLICKS it gets a
-            # personalized Stripe link stamped with their Discord id, so the
-            # purchase log @'s the person who actually paid — no customer picking.
-            if not (price and price > 0):
-                await interaction.followup.send(embed=error_embed("Payment failed", "Enter a valid price above 0."))
-                return
-            cents = int(round(price * 100))
-            view = discord.ui.View(timeout=None)
-            view.add_item(discord.ui.Button(
-                label=f"Pay ${price:.2f}", style=discord.ButtonStyle.success,
-                custom_id=f"stripe_pay:{cents}", emoji="💳",
-            ))
-            await interaction.followup.send(
-                embed=success_embed("Payment", f"Click **Pay ${price:.2f}** below to check out with Stripe. "
-                                    "Whoever clicks is logged as the customer."),
-                view=view,
-            )
-            return
         result = await create_payment(method, item, price)
         if isinstance(result, dict) and result.get("ok") and result.get("url"):
             await interaction.followup.send(
@@ -3906,13 +3861,6 @@ async def on_interaction(interaction: discord.Interaction):
     cid = (interaction.data or {}).get("custom_id", "")
     if cid.startswith(("ticket_msg:", "ticket_form:", "eph:", "ticket_cat:")) or cid in ("ticket_select", "ticket_open"):
         print(f"[Tickets] interaction cid={cid!r} values={(interaction.data or {}).get('values')}")
-    if cid.startswith("stripe_pay:"):
-        try:
-            cents = int(cid.split(":", 1)[1])
-        except Exception:
-            cents = 0
-        await _handle_stripe_pay_click(interaction, cents / 100)
-        return
     if cid == "ticket_select":
         values = (interaction.data or {}).get("values") or []
         if values:
