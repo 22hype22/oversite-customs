@@ -2494,6 +2494,21 @@ def _pkg_build_embed(comps):
     buttons = []       # (label, url_or_None)
     gallery_images = []
     started = {"v": False}
+    # Discord embeds always render the description above every field. So once a
+    # columns/fields block appears, any text placed AFTER it in the design must
+    # also become a field (a headerless, full-width one) or it would jump above
+    # the columns. `fstarted` tracks that; `trailing` buffers the post-field text.
+    fstarted = {"v": False}
+    trailing = []
+
+    def flush_trailing():
+        txt = "\n".join(trailing).strip()
+        trailing.clear()
+        if txt:
+            efields.append(("​", txt[:1024], False))
+
+    def add_line(text):
+        (trailing if fstarted["v"] else desc).append(text)
 
     def take_title(line):
         nonlocal title, title_url
@@ -2528,38 +2543,43 @@ def _pkg_build_embed(comps):
                         names = [x.strip() for x in line.split("{|}")]
                         vals = [x.strip() for x in lines[i + 1].split("{|}")]
                         if len(names) == len(vals):
+                            flush_trailing()
                             for n, v in zip(names, vals):
                                 efields.append((n or "​", v or "​", True))
                             started["v"] = True
+                            fstarted["v"] = True
                             i += 2
                             continue
                     if not title and s.startswith("#"):
                         take_title(s)
                     elif "{|}" in line:
-                        desc.append(line.replace("{|}", " | "))
+                        add_line(line.replace("{|}", " | "))
                         started["v"] = True
                     else:
-                        desc.append(line)
+                        add_line(line)
                         if s:
                             started["v"] = True
                     i += 1
             elif t == "section":
                 if c.get("title"):
-                    desc.append(f"**{c['title']}**")
+                    add_line(f"**{c['title']}**")
                 if c.get("text"):
-                    desc.append(str(c["text"]))
+                    add_line(str(c["text"]))
                 started["v"] = True
             elif t == "fields":
+                flush_trailing()
                 for f in (c.get("fields") or []):
                     if isinstance(f, dict) and f.get("name"):
                         efields.append((str(f["name"]), str(f.get("value") or "​") or "​", bool(f.get("inline", True))))
                 started["v"] = True
+                fstarted["v"] = True
             elif t == "buttonRow":
                 for b in (c.get("buttons") or []):
                     if isinstance(b, dict) and b.get("label"):
                         buttons.append((str(b["label"]), b.get("url")))
 
     walk(comps or [])
+    flush_trailing()
     embed = discord.Embed(
         title=(title[:256] or None), url=(title_url or None),
         description=("\n".join(desc).strip()[:4096] or None),
