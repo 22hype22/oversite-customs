@@ -119,6 +119,10 @@ robux_locker_config = {"channel_id": "", "components": [], "panel_ref": None, "s
 # design to the configured channel.
 portfolio_config = {"channel_id": "", "components": [], "allowed_role_ids": []}
 
+# Panel designed in the dashboard "Packages" block (full designer). Running
+# /package channel:#x posts that design to the chosen channel.
+packages_config = {"panel_components": [], "allowed_role_ids": []}
+
 # ---- Payment ----
 # The dashboard "Payment" block only picks who may run /payment.
 payment_config = {"allowed_role_ids": []}
@@ -141,26 +145,6 @@ form_log_configs = {
     for d in FORM_LOG_DEFS.values()
 }
 form_log_titles = {d["key"]: d["title"] for d in FORM_LOG_DEFS.values()}
-
-# ---- Packages (Automatic Package System) ----
-# A Roblox package marketplace: packers submit (files + details), staff review
-# and Accept (game pass + forum listing) or Deny, buyers claim (ownership
-# verified via the bot's Roblox verification, ZIP DM'd). Configured in the
-# dashboard "Packages" block; records persist via the package-system edge fn.
-packages_config = {
-    "panel_channel_id": "",
-    "listings_channel_id": "",
-    "storage_channel_id": "",
-    "review_channel_id": "",
-    "qc_role_ids": [],
-    "staff_role_ids": [],
-    "types": {},          # {type_name: [tag, ...]}
-    "one_time_sell": True,
-    "panel_title": "Submit a Package",
-    "panel_description": "",
-    "terms": "",
-    "panel_ref": None,    # {channel_id, message_id} of the posted submission panel
-}
 
 # ---- Order Status ----
 # Configured in the dashboard "Order Status" block. An "Order Status" button
@@ -2394,6 +2378,34 @@ async def portfolio_cmd(interaction: discord.Interaction):
     await _do_portfolio_post(interaction)
 
 
+def _packages_can_use(member):
+    """Manage Server, or one of the roles picked in the dashboard Packages block."""
+    try:
+        if member.guild_permissions.manage_guild:
+            return True
+    except Exception:
+        pass
+    return has_any_role(member, packages_config.get("allowed_role_ids", []))
+
+
+@bot.tree.command(name="package", description="Post the designed package panel to a channel")
+@app_commands.describe(channel="Which channel to post the package panel in")
+async def package_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not _packages_can_use(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to run /package."), ephemeral=True)
+        return
+    comps = packages_config.get("panel_components") or []
+    if not comps:
+        await interaction.response.send_message(embed=error_embed("Nothing to post", "Design the Packages panel in the dashboard first, then run /package."), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        await send_v2_message(channel, comps)
+        await interaction.followup.send(embed=success_embed("Posted", f"Package panel posted in {channel.mention}."), ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(embed=error_embed("Couldn't post", str(e)[:300]), ephemeral=True)
+
+
 @tasks.loop(hours=24)
 async def portfolio_cleanup():
     """Once a day, delete any portfolio post whose owner has left the server.
@@ -2517,645 +2529,6 @@ async def infraction_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="promote", description="Log a promotion — fills in a quick form")
 async def promote_cmd(interaction: discord.Interaction):
     await _run_form_log(interaction, "promotion")
-
-
-# ===================== Packages (Automatic Package System) =====================
-
-async def _pkg_call(action, **kw):
-    """POST to the package-system edge function (drafts, submissions, terms, roblox)."""
-    payload = {"action": action}
-    for k, v in kw.items():
-        payload[k] = v
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.post(f"{SUPABASE_FN_URL}/package-system", headers=_fn_headers(), json=payload, timeout=30)
-            data = r.json() if r.content else {}
-            if r.status_code != 200 or (isinstance(data, dict) and data.get("error")):
-                # A 404 here means the 'package-system' edge function isn't deployed.
-                print(f"[Packages] {action} -> HTTP {r.status_code}: {str(data)[:200]}")
-            return data
-    except Exception as e:
-        print(f"[Packages] {action} call failed: {e}")
-        return {"error": str(e)[:200]}
-
-
-def _parse_pkg_types(raw):
-    """Parse 'Type: tag1, tag2' lines into {type_name: [tags]}."""
-    out = {}
-    for line in str(raw or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        name, sep, tags = line.partition(":")
-        name = name.strip()
-        if not name:
-            continue
-        out[name] = [t.strip() for t in tags.split(",") if t.strip()] if sep else []
-    return out
-
-
-def _pkg_can_manage(member):
-    try:
-        if member.guild_permissions.manage_guild:
-            return True
-    except Exception:
-        pass
-    return has_any_role(member, packages_config.get("staff_role_ids", []))
-
-
-# ---- raw Components-V2 helpers (buttons carry our own custom_ids) ----
-def _pkg_text(s):
-    return {"type": 10, "content": str(s)}
-
-
-def _pkg_container(children, accent=None):
-    obj = {"type": 17, "components": [c for c in children if c]}
-    if accent is not None:
-        obj["accent_color"] = accent
-    return obj
-
-
-def _pkg_btn(label, custom_id=None, style=2, url=None, disabled=False):
-    b = {"type": 2, "label": str(label)[:80]}
-    if url:
-        b["style"] = 5
-        b["url"] = url
-    else:
-        b["style"] = style
-        b["custom_id"] = (custom_id or "pkg_noop")[:100]
-    if disabled:
-        b["disabled"] = True
-    return b
-
-
-def _pkg_row(*comps):
-    return {"type": 1, "components": [c for c in comps if c]}
-
-
-def _pkg_image(url):
-    return {"type": 12, "items": [{"media": {"url": url}}]} if url else None
-
-
-async def _ix_callback(interaction, resp_type, data):
-    route = discord.http.Route("POST", "/interactions/{interaction_id}/{interaction_token}/callback",
-                               interaction_id=interaction.id, interaction_token=interaction.token)
-    await bot.http.request(route, json={"type": resp_type, "data": data})
-
-
-async def _pkg_v2_respond(interaction, blocks, ephemeral=True, update=False):
-    flags = 1 << 15
-    if ephemeral and not update:
-        flags |= 1 << 6
-    await _ix_callback(interaction, 7 if update else 4, {"components": blocks, "flags": flags})
-
-
-async def _pkg_modal(interaction, custom_id, title, labels):
-    await _ix_callback(interaction, 9, {"title": str(title)[:45], "custom_id": custom_id, "components": labels})
-
-
-async def _pkg_send(channel, blocks, content=None, allowed_mentions=None):
-    flags = 1 << 15
-    payload = {"components": blocks, "flags": flags}
-    if content:
-        payload["content"] = content
-    if allowed_mentions is not None:
-        payload["allowed_mentions"] = allowed_mentions
-    route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
-    resp = await bot.http.request(route, json=payload)
-    return str(resp["id"]) if isinstance(resp, dict) and resp.get("id") else True
-
-
-def _modal_uploaded_files(interaction, custom_id):
-    """[{url, filename}] for a modal file-upload component (type 19) by custom_id."""
-    data = interaction.data or {}
-    resolved = ((data.get("resolved") or {}).get("attachments")) or {}
-    out = []
-    for row in data.get("components") or []:
-        if not isinstance(row, dict):
-            continue
-        inner = row.get("component")
-        cands = ([inner] if isinstance(inner, dict) else []) + [c for c in (row.get("components") or []) if isinstance(c, dict)]
-        for c in cands:
-            if c.get("custom_id") == custom_id:
-                for aid in (c.get("values") or []):
-                    a = resolved.get(str(aid)) or {}
-                    if a.get("url"):
-                        out.append({"url": a["url"], "filename": a.get("filename") or "file"})
-    return out
-
-
-def _modal_select_values(interaction, custom_id):
-    """All selected values for a modal select component by custom_id."""
-    data = interaction.data or {}
-    out = []
-    for row in data.get("components") or []:
-        if not isinstance(row, dict):
-            continue
-        inner = row.get("component")
-        cands = ([inner] if isinstance(inner, dict) else []) + [c for c in (row.get("components") or []) if isinstance(c, dict)]
-        for c in cands:
-            if c.get("custom_id") == custom_id:
-                out.extend([str(v) for v in (c.get("values") or [])])
-    return out
-
-
-async def _pkg_archive_file(channel, url, filename):
-    """Re-upload a submitted attachment into the storage channel so we keep a
-    stable copy. Returns {url, channel_id, message_id} or None."""
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(url, timeout=90, follow_redirects=True)
-            if r.status_code != 200:
-                print(f"[Packages] archive fetch HTTP {r.status_code}")
-                return None
-            blob = r.content
-        msg = await channel.send(file=discord.File(io.BytesIO(blob), filename=filename))
-        att = msg.attachments[0] if msg.attachments else None
-        if not att:
-            return None
-        return {"url": att.url, "channel_id": str(channel.id), "message_id": str(msg.id)}
-    except Exception as e:
-        print(f"[Packages] archive failed: {e}")
-        return None
-
-
-async def post_packages_panel():
-    ch = await resolve_channel(packages_config.get("panel_channel_id"))
-    if not ch:
-        print("[Packages] no panel channel configured")
-        return
-    blocks = [_pkg_container([
-        _pkg_text(f"## {packages_config.get('panel_title') or 'Submit a Package'}"),
-        _pkg_text(packages_config.get("panel_description") or "Click below to submit a package for review."),
-        _pkg_row(_pkg_btn("Submit a Package", "pkg_submit", style=1)),
-    ])]
-    try:
-        old = packages_config.get("panel_ref") or {}
-        mid = await _pkg_send(ch, blocks)
-        packages_config["panel_ref"] = {"channel_id": str(ch.id), "message_id": str(mid)}
-        if old.get("message_id"):
-            try:
-                oldch = await resolve_channel(old.get("channel_id"))
-                if oldch:
-                    m = await oldch.fetch_message(int(old["message_id"]))
-                    await m.delete()
-            except Exception:
-                pass
-        print("[Packages] submission panel posted")
-    except Exception as e:
-        print(f"[Packages] panel post failed: {e}")
-
-
-# ---- submission flow ----
-async def _pkg_start(interaction):
-    blocks = [_pkg_container([
-        _pkg_text("Choose an option:"),
-        _pkg_row(_pkg_btn("Add New", "pkg_add", style=2), _pkg_btn("Edit Existing", "pkg_edit", style=1)),
-    ])]
-    await _pkg_v2_respond(interaction, blocks, ephemeral=True)
-
-
-def _pkg_select_label(cid, label, options, current=None):
-    opts = []
-    for o in options:
-        opt = {"label": str(o)[:100], "value": str(o)[:100]}
-        if current == o:
-            opt["default"] = True
-        opts.append(opt)
-    return {"type": 18, "label": label[:45],
-            "component": {"type": 3, "custom_id": cid, "placeholder": label[:150],
-                          "min_values": 1, "max_values": 1, "options": opts}}
-
-
-async def _pkg_open_step1(interaction, draft=None):
-    types = list(packages_config.get("types", {}).keys())
-    if not types:
-        await _pkg_v2_respond(interaction, [_pkg_container([_pkg_text("No package types are configured. Ask an admin to add them in the dashboard.")])])
-        return
-    d = draft or {}
-    labels = [
-        _pkg_select_label("pkg_type", "Type", types, d.get("type")),
-        _pkg_select_label("pkg_custom", "Customizable", ["Yes", "No"], d.get("customizable")),
-    ]
-    if packages_config.get("one_time_sell", True):
-        labels.append(_pkg_select_label("pkg_onetime", "One-Time-Sell", ["Yes", "No"], d.get("one_time_sell")))
-    await _pkg_modal(interaction, "pkg_step1", "Package Options", labels)
-
-
-async def _pkg_step1_submit(interaction):
-    vals = _modal_values((interaction.data or {}).get("components"))
-    t = vals.get("pkg_type") or ""
-    cz = vals.get("pkg_custom") or "No"
-    ot = vals.get("pkg_onetime") or "No"
-    if not t:
-        await _pkg_v2_respond(interaction, [_pkg_container([_pkg_text("Please pick a type, then try again.")])])
-        return
-    await _pkg_call("draft_set", user_id=interaction.user.id, draft={"type": t, "customizable": cz, "one_time_sell": ot})
-    blocks = [_pkg_container([
-        _pkg_text("### Package Request"),
-        _pkg_text(f"**Type:** {t}\n**Customizable:** {cz}\n**One-Time-Sell:** {ot}\n\nClick Continue to enter the details."),
-        _pkg_row(_pkg_btn("Continue", "pkg_cont2", style=1)),
-    ])]
-    await _pkg_v2_respond(interaction, blocks, ephemeral=True)
-
-
-async def _pkg_open_step2(interaction):
-    res = await _pkg_call("draft_get", user_id=interaction.user.id)
-    d = (res or {}).get("draft") or {}
-    if not d:
-        await _pkg_v2_respond(interaction, [_pkg_container([_pkg_text("Your draft expired — start again with Submit a Package.")])])
-        return
-    tags = packages_config.get("types", {}).get(d.get("type"), [])
-    labels = [
-        {"type": 18, "label": "Package Name",
-         "component": {"type": 4, "custom_id": "pkg_name", "style": 1, "required": True, "max_length": 100, **({"value": d["name"]} if d.get("name") else {})}},
-        {"type": 18, "label": "Items (one per line)",
-         "component": {"type": 4, "custom_id": "pkg_items", "style": 2, "required": True, "max_length": 2000, **({"value": "\n".join(d.get("items") or [])} if d.get("items") else {})}},
-        {"type": 18, "label": "Price in Robux (e.g. 200)",
-         "component": {"type": 4, "custom_id": "pkg_price", "style": 1, "required": True, "max_length": 10, **({"value": str(d["price"])} if d.get("price") is not None else {})}},
-    ]
-    if tags:
-        labels.append(_pkg_select_label("pkg_tag", "Tag", tags, d.get("tag")))
-    await _pkg_modal(interaction, "pkg_step2", "Package Details", labels)
-
-
-async def _pkg_step2_submit(interaction):
-    vals = _modal_values((interaction.data or {}).get("components"))
-    name = (vals.get("pkg_name") or "").strip()
-    items = [x.strip() for x in (vals.get("pkg_items") or "").split("\n") if x.strip()]
-    price_raw = re.sub(r"[^0-9]", "", vals.get("pkg_price") or "")
-    tag = vals.get("pkg_tag") or ""
-    if not name or not items or not price_raw:
-        await _pkg_v2_respond(interaction, [_pkg_container([_pkg_text("Name, at least one item, and a numeric price are required. Click Continue again to retry.")])])
-        return
-    price = int(price_raw)
-    await _pkg_call("draft_set", user_id=interaction.user.id, draft={"name": name, "items": items, "price": price, "tag": tag})
-    blocks = [_pkg_container([
-        _pkg_text("### Package Details"),
-        _pkg_text(f"**Name:** {name}\n**Price:** {price} Robux\n**Tag:** {tag or '—'}\n\n**Items:**\n" + "\n".join(f"• {i}" for i in items) + "\n\nClick Continue to upload the files."),
-        _pkg_row(_pkg_btn("Continue", "pkg_cont3", style=1)),
-    ])]
-    await _pkg_v2_respond(interaction, blocks, ephemeral=True)
-
-
-async def _pkg_open_step3(interaction):
-    res = await _pkg_call("draft_get", user_id=interaction.user.id)
-    d = (res or {}).get("draft") or {}
-    editing = bool(d.get("editing_submission_id"))
-    labels = [
-        {"type": 18, "label": ("ZIP File (leave empty to keep current)" if editing else "ZIP File"),
-         "component": {"type": 19, "custom_id": "pkg_zip", "min_values": (0 if editing else 1), "max_values": 1}},
-        {"type": 18, "label": ("Preview Image (leave empty to keep current)" if editing else "Preview Image"),
-         "component": {"type": 19, "custom_id": "pkg_preview", "min_values": (0 if editing else 1), "max_values": 1}},
-    ]
-    await _pkg_modal(interaction, "pkg_step3", "Package Media", labels)
-
-
-async def _pkg_step3_submit(interaction):
-    try:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-    except Exception:
-        pass
-    res = await _pkg_call("draft_get", user_id=interaction.user.id)
-    d = (res or {}).get("draft") or {}
-    if not d or not d.get("name"):
-        await interaction.followup.send(embed=error_embed("Draft expired", "Please start again with Submit a Package."), ephemeral=True)
-        return
-    editing = bool(d.get("editing_submission_id"))
-    zip_files = _modal_uploaded_files(interaction, "pkg_zip")
-    prev_files = _modal_uploaded_files(interaction, "pkg_preview")
-    if not editing and (not zip_files or not prev_files):
-        await interaction.followup.send(embed=error_embed("Files required", "Upload both a ZIP file and a preview image, then submit again."), ephemeral=True)
-        return
-    storage = await resolve_channel(packages_config.get("storage_channel_id"))
-    if not storage:
-        await interaction.followup.send(embed=error_embed("Not configured", "No file storage channel is set in the dashboard."), ephemeral=True)
-        return
-    zip_arch = await _pkg_archive_file(storage, zip_files[0]["url"], f"{d['name']}.zip"[:90]) if zip_files else None
-    prev_arch = await _pkg_archive_file(storage, prev_files[0]["url"], f"preview-{d['name']}.png"[:90]) if prev_files else None
-    if zip_files and not zip_arch:
-        await interaction.followup.send(embed=error_embed("Upload failed", "Couldn't store the ZIP. Please try again."), ephemeral=True)
-        return
-    media = {
-        "zip_url": (zip_arch or {}).get("url") or d.get("existing_zip_url"),
-        "zip_channel_id": (zip_arch or {}).get("channel_id") or d.get("existing_zip_channel_id"),
-        "zip_message_id": (zip_arch or {}).get("message_id") or d.get("existing_zip_message_id"),
-        "preview_url": (prev_arch or {}).get("url") or d.get("existing_preview_url"),
-        "preview_channel_id": (prev_arch or {}).get("channel_id") or d.get("existing_preview_channel_id"),
-        "preview_message_id": (prev_arch or {}).get("message_id") or d.get("existing_preview_message_id"),
-    }
-    fields = {
-        "user_id": str(interaction.user.id), "type": d.get("type"), "customizable": d.get("customizable"),
-        "one_time_sell": d.get("one_time_sell"), "name": d.get("name"), "items": d.get("items"),
-        "price": d.get("price"), "tag": d.get("tag"), **media,
-    }
-    if editing:
-        r = await _pkg_call("pkg_update", submission_id=d["editing_submission_id"], pkg=fields)
-    else:
-        r = await _pkg_call("pkg_create", pkg=fields)
-    pkg = (r or {}).get("pkg")
-    await _pkg_call("draft_delete", user_id=interaction.user.id)
-    if not pkg:
-        await interaction.followup.send(embed=error_embed("Couldn't save", "Something went wrong saving your package. Please contact staff."), ephemeral=True)
-        return
-    await _pkg_post_review(interaction.guild, pkg, edited=editing)
-    await interaction.followup.send(
-        embed=success_embed("Package Updated" if editing else "Package Submitted",
-                            f"**{pkg.get('name')}** is awaiting review by our team."),
-        ephemeral=True)
-
-
-async def _pkg_edit(interaction):
-    r = await _pkg_call("pkg_list")
-    mine = [p for p in (r or {}).get("packages", []) if str(p.get("user_id")) == str(interaction.user.id)]
-    if not mine:
-        await _pkg_v2_respond(interaction, [_pkg_container([_pkg_text("You don't have any packages to edit yet.")])])
-        return
-    opts = [{"label": f"#{p['submission_id']} — {p.get('name')}"[:100], "value": str(p["submission_id"])} for p in mine[:25]]
-    row = {"type": 1, "components": [{"type": 3, "custom_id": "pkg_editpick", "placeholder": "Pick a package to edit", "options": opts}]}
-    await _pkg_v2_respond(interaction, [_pkg_container([_pkg_text("Select a package to edit:")]), row], ephemeral=True)
-
-
-async def _pkg_editpick(interaction, sid):
-    r = await _pkg_call("pkg_get", submission_id=sid)
-    pkg = (r or {}).get("pkg")
-    if not pkg:
-        await _pkg_v2_respond(interaction, [_pkg_container([_pkg_text("That package could not be found.")])], update=True)
-        return
-    await _pkg_call("draft_set", user_id=interaction.user.id, draft={
-        "editing_submission_id": pkg["submission_id"], "type": pkg.get("type"), "customizable": pkg.get("customizable"),
-        "one_time_sell": pkg.get("one_time_sell"), "name": pkg.get("name"), "items": pkg.get("items"),
-        "price": pkg.get("price"), "tag": pkg.get("tag"),
-        "existing_zip_url": pkg.get("zip_url"), "existing_zip_channel_id": pkg.get("zip_channel_id"), "existing_zip_message_id": pkg.get("zip_message_id"),
-        "existing_preview_url": pkg.get("preview_url"), "existing_preview_channel_id": pkg.get("preview_channel_id"), "existing_preview_message_id": pkg.get("preview_message_id"),
-    })
-    await _pkg_open_step1(interaction, draft=pkg)
-
-
-# ---- review flow ----
-def _pkg_review_blocks(pkg, edited=False):
-    items = pkg.get("items") or []
-    children = [
-        _pkg_text(f"### Package Review — #{pkg['submission_id']}" + (" (edited)" if edited else "")),
-        _pkg_text(
-            f"**Name:** {pkg.get('name')}\n**Packer:** <@{pkg.get('user_id')}>\n"
-            f"**Type:** {pkg.get('type')} · **Tag:** {pkg.get('tag') or '—'}\n"
-            f"**Price:** {pkg.get('price')} Robux\n"
-            f"**Customizable:** {pkg.get('customizable')} · **One-Time-Sell:** {pkg.get('one_time_sell')}\n\n"
-            "**Items:**\n" + "\n".join(f"• {i}" for i in items)
-        ),
-    ]
-    img = _pkg_image(pkg.get("preview_url"))
-    if img:
-        children.append(img)
-    if pkg.get("zip_url"):
-        children.append(_pkg_row(_pkg_btn("Download ZIP", url=pkg["zip_url"])))
-    children.append(_pkg_row(
-        _pkg_btn("Accept", f"pkg_accept:{pkg['submission_id']}", style=3),
-        _pkg_btn("Deny", f"pkg_deny:{pkg['submission_id']}", style=4),
-    ))
-    return [_pkg_container(children)]
-
-
-async def _pkg_post_review(guild, pkg, edited=False):
-    review = await resolve_channel(packages_config.get("review_channel_id"))
-    if not review:
-        print("[Packages] no review channel configured")
-        return
-    blocks = _pkg_review_blocks(pkg, edited)
-    qc = packages_config.get("qc_role_ids") or []
-    content = " ".join(f"<@&{r}>" for r in qc) if qc else None
-    am = {"parse": [], "roles": [str(r) for r in qc]} if qc else {"parse": []}
-    # If editing and a review message exists, edit it in place; else post fresh.
-    if edited and pkg.get("review_channel_id") and pkg.get("review_message_id"):
-        try:
-            rch = await resolve_channel(pkg["review_channel_id"])
-            if rch:
-                msg = await rch.fetch_message(int(pkg["review_message_id"]))
-                await msg.edit(components=[])  # clear old (V2 edit via raw below)
-        except Exception:
-            pass
-    mid = await _pkg_send(review, blocks, content=content, allowed_mentions=am)
-    if mid:
-        await _pkg_call("pkg_update", submission_id=pkg["submission_id"],
-                        pkg={"review_channel_id": str(review.id), "review_message_id": str(mid)})
-
-
-async def _pkg_accept(interaction, sid):
-    if not _pkg_can_manage(interaction.user):
-        await _pkg_v2_respond(interaction, [_pkg_container([_pkg_text("You don't have permission to review packages.")])])
-        return
-    # No Open Cloud key configured — staff pastes the game pass id (create it once
-    # in Studio). Auto-creation can be added when an Open Cloud key is set.
-    labels = [{"type": 18, "label": "Game Pass ID",
-               "component": {"type": 4, "custom_id": "pkg_gpid", "style": 1, "required": True, "max_length": 30, "placeholder": "e.g. 123456789"}}]
-    await _pkg_modal(interaction, f"pkg_gamepass:{sid}", "Accept — Game Pass ID", labels)
-
-
-async def _pkg_post_listing(forum, pkg, gpid):
-    items = pkg.get("items") or []
-    children = [
-        _pkg_text(f"### {pkg.get('name')}"),
-        _pkg_text("Once purchased, click **Claim Package** to receive your files."),
-        _pkg_text(f"**Package ID:** {pkg['submission_id']}\n**Packer:** <@{pkg.get('user_id')}>\n**Price:** {pkg.get('price')} Robux\n\n**Contents:**\n" + "\n".join(f"• {i}" for i in items)),
-    ]
-    img = _pkg_image(pkg.get("preview_url"))
-    if img:
-        children.append(img)
-    children.append(_pkg_row(
-        _pkg_btn("Claim Package", f"pkg_claim:{pkg['submission_id']}", style=2),
-        _pkg_btn("Buy Game Pass", url=f"https://www.roblox.com/game-pass/{gpid}"),
-    ))
-    payload = {"name": (pkg.get("name") or "Package")[:100], "message": {"components": [_pkg_container(children)], "flags": 1 << 15}}
-    tag = (pkg.get("tag") or "").lower()
-    tag_ids = [str(t.id) for t in getattr(forum, "available_tags", []) if t.name.lower() == tag]
-    if tag_ids:
-        payload["applied_tags"] = [tag_ids[0]]
-    try:
-        route = discord.http.Route("POST", "/channels/{channel_id}/threads", channel_id=forum.id)
-        resp = await bot.http.request(route, json=payload)
-        return str(resp["id"]) if isinstance(resp, dict) and resp.get("id") else None
-    except Exception as e:
-        print(f"[Packages] listing post failed: {e}")
-        return None
-
-
-async def _pkg_accept_submit(interaction, sid):
-    try:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-    except Exception:
-        pass
-    vals = _modal_values((interaction.data or {}).get("components"))
-    gpid = re.sub(r"[^0-9]", "", vals.get("pkg_gpid") or "")
-    if not gpid:
-        await interaction.followup.send(embed=error_embed("Invalid ID", "Enter a numeric game pass id."), ephemeral=True)
-        return
-    r = await _pkg_call("pkg_get", submission_id=sid)
-    pkg = (r or {}).get("pkg")
-    if not pkg:
-        await interaction.followup.send(embed=error_embed("Not found", "Package not found."), ephemeral=True)
-        return
-    listing = await resolve_channel(packages_config.get("listings_channel_id"))
-    thread_id = None
-    if isinstance(listing, discord.ForumChannel):
-        thread_id = await _pkg_post_listing(listing, pkg, gpid)
-    upd = {"status": "accepted", "resolved_by": str(interaction.user.id), "game_pass_id": gpid}
-    if thread_id:
-        upd["listing_channel_id"] = str(thread_id)
-    await _pkg_call("pkg_update", submission_id=sid, pkg=upd)
-    # Clear the review buttons.
-    try:
-        if pkg.get("review_channel_id") and pkg.get("review_message_id"):
-            rch = await resolve_channel(pkg["review_channel_id"])
-            if rch:
-                msg = await rch.fetch_message(int(pkg["review_message_id"]))
-                await _pkg_edit_message(rch, msg.id, [_pkg_container([_pkg_text(f"### Package #{sid} — Accepted\nAccepted by <@{interaction.user.id}>. Listing posted.")])])
-    except Exception as e:
-        print(f"[Packages] review edit after accept failed: {e}")
-    where = "the listings forum" if thread_id else "— but the listings forum isn't set, so post it manually"
-    await interaction.followup.send(embed=success_embed("Accepted", f"Game pass linked and listing posted in {where}."), ephemeral=True)
-
-
-async def _pkg_edit_message(channel, message_id, blocks):
-    """Edit a message to new raw V2 components."""
-    route = discord.http.Route("PATCH", "/channels/{channel_id}/messages/{message_id}",
-                               channel_id=channel.id, message_id=message_id)
-    await bot.http.request(route, json={"components": blocks, "flags": 1 << 15})
-
-
-async def _pkg_deny(interaction, sid):
-    if not _pkg_can_manage(interaction.user):
-        await _pkg_v2_respond(interaction, [_pkg_container([_pkg_text("You don't have permission to review packages.")])])
-        return
-    r = await _pkg_call("pkg_update", submission_id=sid, pkg={"status": "denied", "resolved_by": str(interaction.user.id)})
-    pkg = (r or {}).get("pkg")
-    await _pkg_v2_respond(interaction, [_pkg_container([_pkg_text(f"### Package #{sid} — Denied\nDenied by <@{interaction.user.id}>.")])], update=True)
-    if pkg and pkg.get("user_id"):
-        try:
-            u = await bot.fetch_user(int(pkg["user_id"]))
-            await u.send(f"Your package **{pkg.get('name')}** was denied.")
-        except Exception:
-            pass
-
-
-# ---- claim flow ----
-async def _pkg_owns_gamepass(roblox_id, gpid):
-    try:
-        async with httpx.AsyncClient() as c:
-            r = await c.get(f"https://inventory.roblox.com/v1/users/{roblox_id}/items/GamePass/{gpid}/is-owned", timeout=15)
-            if r.status_code == 200:
-                return r.json() is True
-            print(f"[Packages] ownership check HTTP {r.status_code}")
-    except Exception as e:
-        print(f"[Packages] ownership check failed: {e}")
-    return False
-
-
-async def _pkg_dm_receipt(user, pkg):
-    try:
-        children = [
-            _pkg_text("### 📦 Package Receipt"),
-            {"type": 14, "divider": True, "spacing": 1},
-            _pkg_text(f"Thanks for purchasing **{pkg.get('name')}** for **{pkg.get('price')} Robux**. Download your files below."),
-        ]
-        img = _pkg_image(pkg.get("preview_url"))
-        if img:
-            children.append(img)
-        if pkg.get("zip_url"):
-            children.append(_pkg_row(_pkg_btn("Download", url=pkg["zip_url"])))
-        dm = user.dm_channel or await user.create_dm()
-        await _pkg_send(dm, [_pkg_container(children, accent=0xE67E22)])
-        return True
-    except Exception as e:
-        print(f"[Packages] DM receipt failed: {e}")
-        return False
-
-
-async def _pkg_claim(interaction, sid):
-    tr = await _pkg_call("terms_get", user_id=interaction.user.id)
-    if not (tr or {}).get("agreed") and packages_config.get("terms"):
-        blocks = [_pkg_container([
-            _pkg_text("### Terms"),
-            _pkg_text(packages_config.get("terms")),
-            _pkg_row(_pkg_btn("I Agree", f"pkg_terms:{sid}", style=3)),
-        ])]
-        await _pkg_v2_respond(interaction, blocks, ephemeral=True)
-        return
-    await _pkg_open_recipient(interaction, sid)
-
-
-async def _pkg_terms_agree(interaction, sid):
-    await _pkg_call("terms_set", user_id=interaction.user.id)
-    await _pkg_open_recipient(interaction, sid)
-
-
-async def _pkg_open_recipient(interaction, sid):
-    labels = [
-        _pkg_select_label("pkg_recipwho", "Recipient", ["Myself", "Gift someone"], "Myself"),
-        {"type": 18, "label": "Gift recipient (only if gifting)",
-         "component": {"type": 5, "custom_id": "pkg_recipuser", "min_values": 0, "max_values": 1}},
-    ]
-    await _pkg_modal(interaction, f"pkg_recip:{sid}", "Claim Package", labels)
-
-
-async def _pkg_recip_submit(interaction, sid):
-    try:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-    except Exception:
-        pass
-    vals = _modal_values((interaction.data or {}).get("components"))
-    who = vals.get("pkg_recipwho") or "Myself"
-    recipient_id = interaction.user.id
-    if who == "Gift someone":
-        gift = _modal_select_values(interaction, "pkg_recipuser")
-        if not gift:
-            await interaction.followup.send(embed=error_embed("Pick a recipient", "Select someone to gift, or choose Myself. Click Claim again to retry."), ephemeral=True)
-            return
-        recipient_id = int(gift[0])
-    await _pkg_do_claim(interaction, sid, recipient_id)
-
-
-async def _pkg_do_claim(interaction, sid, recipient_id):
-    r = await _pkg_call("pkg_get", submission_id=sid)
-    pkg = (r or {}).get("pkg")
-    if not pkg or pkg.get("status") != "accepted" or not pkg.get("game_pass_id"):
-        await interaction.followup.send(embed=error_embed("Unavailable", "This package isn't available."), ephemeral=True)
-        return
-    one_time = str(pkg.get("one_time_sell")).lower() in ("yes", "true", "1")
-    claimed = pkg.get("claimed_by") or []
-    buyer = str(interaction.user.id)
-    if one_time and claimed and buyer not in claimed:
-        await interaction.followup.send(embed=error_embed("Sold out", "This one-time-sell package has already been claimed by someone else."), ephemeral=True)
-        return
-    rl = await _pkg_call("roblox_lookup", user_id=interaction.user.id)
-    roblox_id = (rl or {}).get("roblox_id")
-    if not roblox_id:
-        await interaction.followup.send(embed=error_embed("Not linked", "Link your Roblox account with the bot's verification first, then click Claim again."), ephemeral=True)
-        return
-    if buyer not in claimed:
-        if not await _pkg_owns_gamepass(roblox_id, pkg["game_pass_id"]):
-            await interaction.followup.send(
-                embed=error_embed("Not owned yet", f"You don't own this game pass yet.\nBuy it: https://www.roblox.com/game-pass/{pkg['game_pass_id']}\nThen click Claim again."),
-                ephemeral=True)
-            return
-    recipient = await bot.fetch_user(recipient_id)
-    if not await _pkg_dm_receipt(recipient, pkg):
-        await interaction.followup.send(embed=error_embed("Couldn't DM", f"I couldn't DM {recipient.mention}. They need to allow DMs from server members, then claim again."), ephemeral=True)
-        return
-    if buyer not in claimed:
-        claimed.append(buyer)
-        await _pkg_call("pkg_update", submission_id=sid, pkg={"claimed_by": claimed})
-        # Log the purchase (first claim only) to the Logging block's channel.
-        try:
-            await log_purchase(
-                interaction.guild, discord_id=interaction.user.id,
-                roblox_username=(rl or {}).get("roblox_username"), roblox_id=roblox_id,
-                payment_type="Roblox Game Pass", amount=f"R$ {pkg.get('price')}",
-                payment_id=f"#{sid}",
-            )
-        except Exception as e:
-            print(f"[Purchase] package log failed: {e}")
-    await interaction.followup.send(embed=success_embed("Sent", f"Ownership verified — sent to {recipient.mention}'s DMs."), ephemeral=True)
 
 
 # ===================== Pricing =====================
@@ -3840,16 +3213,6 @@ async def on_interaction(interaction: discord.Interaction):
             except Exception:
                 si, ii = -1, -1
             await _joinsetup_one_submit(interaction, si, ii)
-        elif cid == "pkg_step1":
-            await _pkg_step1_submit(interaction)
-        elif cid == "pkg_step2":
-            await _pkg_step2_submit(interaction)
-        elif cid == "pkg_step3":
-            await _pkg_step3_submit(interaction)
-        elif cid.startswith("pkg_gamepass:"):
-            await _pkg_accept_submit(interaction, int(cid.split(":", 1)[1]) if cid.split(":", 1)[1].isdigit() else -1)
-        elif cid.startswith("pkg_recip:"):
-            await _pkg_recip_submit(interaction, int(cid.split(":", 1)[1]) if cid.split(":", 1)[1].isdigit() else -1)
         return
     if interaction.type != discord.InteractionType.component:
         return
@@ -3960,31 +3323,6 @@ async def on_interaction(interaction: discord.Interaction):
         await _joinsetup_open_one(interaction, si, ii)
     elif cid == "joinsetup_done":
         await _joinsetup_done(interaction)
-    elif cid == "pkg_submit":
-        await _pkg_start(interaction)
-    elif cid == "pkg_add":
-        await _pkg_open_step1(interaction)
-    elif cid == "pkg_edit":
-        await _pkg_edit(interaction)
-    elif cid == "pkg_editpick":
-        vals = (interaction.data or {}).get("values") or []
-        try:
-            sid = int(vals[0]) if vals else -1
-        except Exception:
-            sid = -1
-        await _pkg_editpick(interaction, sid)
-    elif cid == "pkg_cont2":
-        await _pkg_open_step2(interaction)
-    elif cid == "pkg_cont3":
-        await _pkg_open_step3(interaction)
-    elif cid.startswith("pkg_accept:"):
-        await _pkg_accept(interaction, int(cid.split(":", 1)[1]) if cid.split(":", 1)[1].isdigit() else -1)
-    elif cid.startswith("pkg_deny:"):
-        await _pkg_deny(interaction, int(cid.split(":", 1)[1]) if cid.split(":", 1)[1].isdigit() else -1)
-    elif cid.startswith("pkg_claim:"):
-        await _pkg_claim(interaction, int(cid.split(":", 1)[1]) if cid.split(":", 1)[1].isdigit() else -1)
-    elif cid.startswith("pkg_terms:"):
-        await _pkg_terms_agree(interaction, int(cid.split(":", 1)[1]) if cid.split(":", 1)[1].isdigit() else -1)
 
 
 def _ticket_topic(opener_id, category, base=""):
@@ -5435,6 +4773,11 @@ async def apply_config(feature, cfg, post_panel=False):
         portfolio_config["components"] = comps if isinstance(comps, list) else []
         portfolio_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
         print(f"[Config] portfolio — channel {portfolio_config['channel_id']} design {len(portfolio_config['components'])} roles {portfolio_config['allowed_role_ids']}")
+    elif feature in ("packages", "customs-packages"):
+        comps = cfg.get("panel_components")
+        packages_config["panel_components"] = comps if isinstance(comps, list) else []
+        packages_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
+        print(f"[Config] packages — design {len(packages_config['panel_components'])} roles {packages_config['allowed_role_ids']}")
     elif feature in FORM_LOG_DEFS:
         # Form logs (/orderlog, /infraction, /promote): pop a form from the
         # {Question:} tokens in the design, then post the completed message to the
@@ -5459,21 +4802,6 @@ async def apply_config(feature, cfg, post_panel=False):
         comps = cfg.get("purchase_components")
         logging_config["purchase_components"] = comps if isinstance(comps, list) else []
         print(f"[Config] logging — purchase_log {logging_config['purchase_log_channel_id']} design {len(logging_config['purchase_components'])}")
-    elif feature in ("packages", "customs-packages"):
-        packages_config["panel_channel_id"] = str(cfg.get("panel_channel_id") or "")
-        packages_config["listings_channel_id"] = str(cfg.get("listings_channel_id") or "")
-        packages_config["storage_channel_id"] = str(cfg.get("storage_channel_id") or "")
-        packages_config["review_channel_id"] = str(cfg.get("review_channel_id") or "")
-        packages_config["qc_role_ids"] = [str(x) for x in (cfg.get("qc_role_ids") or []) if x]
-        packages_config["staff_role_ids"] = [str(x) for x in (cfg.get("staff_role_ids") or []) if x]
-        packages_config["types"] = _parse_pkg_types(cfg.get("types"))
-        packages_config["one_time_sell"] = bool(cfg.get("one_time_sell", True))
-        packages_config["panel_title"] = str(cfg.get("panel_title") or "Submit a Package")
-        packages_config["panel_description"] = str(cfg.get("panel_description") or "")
-        packages_config["terms"] = str(cfg.get("terms") or "")
-        print(f"[Config] packages — panel {packages_config['panel_channel_id']} listings {packages_config['listings_channel_id']} types {list(packages_config['types'].keys())}")
-        if post_panel:
-            await post_packages_panel()
     elif feature in ("order-status", "customs-order-status"):
         order_status_config["title"] = str(cfg.get("title") or "Order Status")
         try:
@@ -6043,7 +5371,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-payment", "customs-logging", "customs-packages", "customs-order-status", "customs-pricing"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
