@@ -2440,7 +2440,8 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
     def _answer_repl(m):
         kind = m.group(1).lower()
         label = (m.group(2) or "").strip()
-        return _js("" if kind == "file" else mapping.get(label, ""))
+        # {File:}/{SFile:} tokens carry no inline text — the files render separately.
+        return _js("" if kind in ("file", "sfile") else mapping.get(label, ""))
 
     raw = _FIELD_RE.sub(_answer_repl, json.dumps(comps or []))
     for tok, val in (
@@ -2455,15 +2456,20 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
     except Exception:
         final = comps
     final = _flatten_pkg_fields(final)
+
+    # {SFile:} files render ABOVE the card (a leading image gallery); {File:}
+    # files post as attachments after it.
+    all_files = files or []
+    before_files = [f for f in all_files if isinstance(f, dict) and f.get("before")]
+    after_files = [f for f in all_files if isinstance(f, dict) and not f.get("before")]
+    before_imgs = [f.get("url") for f in before_files if f.get("url")]
+    if before_imgs:
+        final = [{"id": "sfile", "type": "gallery", "images": before_imgs}] + list(final)
+
     _V2_LAST_ERROR["msg"] = ""
-    if files:
-        mid = await _send_v2_with_files(ch, final, files, allowed_mentions={"parse": []})
-        if not mid:
-            mid = await send_v2_message(ch, final, allowed_mentions={"parse": []})
-            if mid:
-                await _post_form_files(ch, files)
-    else:
-        mid = await send_v2_message(ch, final, allowed_mentions={"parse": []})
+    mid = await send_v2_message(ch, final, allowed_mentions={"parse": []})
+    if mid and after_files:
+        await _post_form_files(ch, after_files)
     if mid:
         await interaction.followup.send(embed=success_embed("Posted", f"Package card posted in {ch.mention}."), ephemeral=True)
     else:
@@ -3465,7 +3471,7 @@ def _ticket_first_word(open_comps):
 _QUESTION_RE = re.compile(r"\{Question:\s*(.*?)\}", re.IGNORECASE)
 # A form field is either a {Question: Label} (text input) or a {File: Label}
 # (file upload — Discord modals support file components now).
-_FIELD_RE = re.compile(r"\{(Question|File):\s*(.*?)\}", re.IGNORECASE)
+_FIELD_RE = re.compile(r"\{(LQuestion|Question|SFile|File):\s*(.*?)\}", re.IGNORECASE)
 
 
 def _existing_ticket_for(guild, user_id):
@@ -3549,12 +3555,14 @@ def _parse_form_fields(open_comps, limit=10):
     seen = set()
     fields = []
     for m in _FIELD_RE.finditer(raw):
-        kind = "file" if m.group(1).lower() == "file" else "q"
+        g = m.group(1).lower()
+        kind = "file" if g in ("file", "sfile") else "q"
         label = (m.group(2) or "").strip()
         sig = (kind, label.lower())
         if label and sig not in seen:
             seen.add(sig)
-            fields.append({"kind": kind, "label": label})
+            # long = paragraph text input; before = file rendered above the message.
+            fields.append({"kind": kind, "label": label, "long": g == "lquestion", "before": g == "sfile"})
     return fields[:limit]
 
 
@@ -3692,9 +3700,10 @@ async def _open_form_page(interaction, key, page):
                 "component": {"type": 19, "custom_id": f"f{idx}", "min_values": 1, "max_values": 10},
             })
         else:
+            style = 2 if f.get("long") else _form_input_style(f["label"])
             components.append({
                 "type": 18, "label": label,
-                "component": {"type": 4, "custom_id": f"q{idx}", "style": _form_input_style(f["label"]),
+                "component": {"type": 4, "custom_id": f"q{idx}", "style": style,
                               "required": True, "max_length": 1000},
             })
     title = (form_titles.get(key) or "Application")
@@ -3768,7 +3777,7 @@ def _apply_answers(open_comps, mapping):
         kind = m.group(1).lower()
         label = (m.group(2) or "").strip()
         clean = _clean_label(label)
-        if kind == "file":
+        if kind in ("file", "sfile"):
             out = f"**{clean}**"
         else:
             answer = mapping.get(label, "")
@@ -3837,7 +3846,7 @@ async def handle_ticket_form_submit(interaction, key, page=0):
         idx = start + j
         if f["kind"] == "file":
             for up in _modal_uploaded_files(interaction, f"f{idx}"):
-                pend_files.append({"label": f["label"], "url": up["url"], "filename": up.get("filename")})
+                pend_files.append({"label": f["label"], "url": up["url"], "filename": up.get("filename"), "before": bool(f.get("before"))})
         else:
             pend[f["label"]] = (vals.get(f"q{idx}") or "").strip()
 
