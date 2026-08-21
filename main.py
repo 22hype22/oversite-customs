@@ -548,6 +548,8 @@ async def on_ready():
         portfolio_cleanup.start()
     if not poll_group_sales.is_running():
         poll_group_sales.start()
+    if not poll_stripe_sales.is_running():
+        poll_stripe_sales.start()
     await refresh_status()
 
     try:
@@ -1176,7 +1178,7 @@ async def _log_group_sale(sale):
 _sales_diag = {"top": None}
 
 
-@tasks.loop(minutes=2)
+@tasks.loop(seconds=30)
 async def poll_group_sales():
     """Poll the Roblox group's recent sales and log any new ones. Dedups via a
     persisted seen-id cursor. On the first run it seeds the cursor WITHOUT logging
@@ -1236,17 +1238,91 @@ async def _before_poll_group_sales():
     await bot.wait_until_ready()
 
 
+async def _log_stripe_sale(pi):
+    """Log one paid Stripe payment (from the Stripe poller) to the purchase channel."""
+    discord_id = pi.get("discord_id") or None
+    cents = int(pi.get("amount") or 0)
+    cur = str(pi.get("currency") or "usd").upper()
+    sym = "$" if cur == "USD" else ""
+    amount = f"{sym}{cents / 100:.2f}" + ("" if sym else f" {cur}")
+    when = int(pi.get("created")) if pi.get("created") else None
+    await log_purchase(
+        None, discord_id=discord_id, roblox_username=pi.get("customer_name") or None,
+        payment_type="Stripe", amount=amount, payment_id=f"#{pi.get('id')}", when=when,
+    )
+
+
+@tasks.loop(seconds=30)
+async def poll_stripe_sales():
+    """Poll recent paid Stripe payments and log any new ones. Same dedup-cursor
+    approach as the Roblox group-sales poller (seeds silently on first run)."""
+    if not logging_config.get("purchase_log_channel_id"):
+        return
+    res = await _payments_call("stripe_recent")
+    if not (isinstance(res, dict) and res.get("ok")):
+        if isinstance(res, dict) and res.get("error"):
+            print(f"[Purchase] stripe poll: {str(res.get('error'))[:200]}")
+        return
+    sales = res.get("sales") or []
+    if not sales:
+        return
+    st = await _payments_call("stripe_state_get")
+    if not (isinstance(st, dict) and st.get("ok")):
+        if isinstance(st, dict) and st.get("error"):
+            print(f"[Purchase] stripe_state read: {str(st.get('error'))[:200]}")
+        return
+    seen_list = list((st or {}).get("seen_ids") or [])
+    seen = set(seen_list)
+    first_run = len(seen) == 0
+    to_log = []
+    added = False
+    for pi in sorted(sales, key=lambda p: int(p.get("created") or 0)):  # oldest first
+        pid = str(pi.get("id") or "")
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        seen_list.append(pid)
+        added = True
+        if not first_run:
+            to_log.append(pi)
+    if first_run:
+        print(f"[Purchase] seeded {len(seen_list)} existing Stripe payment(s) (first run — not logging these)")
+    elif to_log:
+        print(f"[Purchase] {len(to_log)} new Stripe payment(s) to log")
+    if added:
+        await _payments_call("stripe_state_set", seen_ids=seen_list[-500:])
+    for pi in to_log:
+        try:
+            await _log_stripe_sale(pi)
+        except Exception as e:
+            print(f"[Purchase] stripe sale log failed: {e}")
+
+
+@poll_stripe_sales.before_loop
+async def _before_poll_stripe_sales():
+    await bot.wait_until_ready()
+
+
 bot.tree.add_command(credits_group)
 
 
-async def create_payment(method, item, price):
-    """Call the payment-create edge function (holds the Roblox cookie + Stripe key)."""
+async def create_payment(method, item, price, *, discord_id=None, guild_id=None, customer_name=None):
+    """Call the payment-create edge function (holds the Roblox cookie + Stripe key).
+    For Stripe, discord_id/customer_name attribute the payment to a customer so
+    the purchase-log poller can @ them once it's paid."""
+    payload = {"method": method, "item": item, "price": price}
+    if discord_id:
+        payload["discord_id"] = str(discord_id)
+    if guild_id:
+        payload["guild_id"] = str(guild_id)
+    if customer_name:
+        payload["customer_name"] = str(customer_name)
     try:
         async with httpx.AsyncClient() as client:
             r = await client.post(
                 f"{SUPABASE_FN_URL}/payments-create",
                 headers=_fn_headers(),
-                json={"method": method, "item": item, "price": price},
+                json=payload,
                 timeout=30,
             )
             try:
@@ -1265,8 +1341,9 @@ async def create_payment(method, item, price):
 
 
 class PaymentModal(discord.ui.Modal):
-    def __init__(self):
+    def __init__(self, customer=None):
         super().__init__(title="Create Payment", timeout=300)
+        self.customer = customer  # discord.Member the Stripe payment is for (optional)
         self.method = discord.ui.Select(min_values=1, max_values=1, options=[
             discord.SelectOption(label="Stripe (USD)", value="stripe", default=True),
             discord.SelectOption(label="Gamepass (Robux)", value="gamepass"),
@@ -1294,10 +1371,18 @@ class PaymentModal(discord.ui.Modal):
             price = float(str(self.price.value or "").replace("$", "").replace(",", "").strip())
         except Exception:
             price = 0
-        result = await create_payment(method, item, price)
+        # Stripe payments can be attributed to a customer (for purchase logs).
+        cust = self.customer if method == "stripe" else None
+        result = await create_payment(
+            method, item, price,
+            discord_id=(cust.id if cust else None),
+            guild_id=(interaction.guild_id if cust else None),
+            customer_name=(str(cust) if cust else None),
+        )
         if isinstance(result, dict) and result.get("ok") and result.get("url"):
+            extra = f"\nCustomer: {cust.mention}" if cust else ""
             await interaction.followup.send(
-                embed=success_embed("Payment ready", f"**{result.get('label', 'Payment')}**\n{result['url']}"),
+                embed=success_embed("Payment ready", f"**{result.get('label', 'Payment')}**{extra}\n{result['url']}"),
             )
         else:
             err = (result or {}).get("error") if isinstance(result, dict) else str(result)
@@ -1319,12 +1404,13 @@ def _payment_can_use(member):
 
 
 @bot.tree.command(name="payment", description="Create a payment — Stripe, gamepass, or shirt")
-async def payment_cmd(interaction: discord.Interaction):
+@app_commands.describe(customer="Who this Stripe payment is for (so the purchase log @'s them). Optional.")
+async def payment_cmd(interaction: discord.Interaction, customer: discord.Member = None):
     if not _payment_can_use(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to create payments."), ephemeral=True)
         return
     try:
-        await interaction.response.send_modal(PaymentModal())
+        await interaction.response.send_modal(PaymentModal(customer=customer))
     except Exception as e:
         print(f"[Payment] modal open failed: {e!r}")
         try:
@@ -3071,7 +3157,7 @@ async def _pkg_do_claim(interaction, sid, recipient_id):
             await log_purchase(
                 interaction.guild, discord_id=interaction.user.id,
                 roblox_username=(rl or {}).get("roblox_username"), roblox_id=roblox_id,
-                payment_type="Roblox Game Pass", amount=f"{pkg.get('price')} Robux",
+                payment_type="Roblox Game Pass", amount=f"R$ {pkg.get('price')}",
                 payment_id=f"#{sid}",
             )
         except Exception as e:
@@ -5685,6 +5771,28 @@ async def _robux_locker_call(action, amount=0, time_frame=None, **extra):
         async with httpx.AsyncClient() as client:
             r = await client.post(
                 f"{SUPABASE_FN_URL}/robux-locker",
+                headers=_fn_headers(),
+                json=payload,
+                timeout=20,
+            )
+            data = r.json() if r.content else {}
+            if r.status_code == 200:
+                return data
+            return {"error": data.get("error") or f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
+async def _payments_call(action, **extra):
+    """POST an action to the payments-create edge function (Stripe purchase-log
+    poller: stripe_recent / stripe_state_get / stripe_state_set)."""
+    payload = {"action": action}
+    for k, v in extra.items():
+        payload[k] = v
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{SUPABASE_FN_URL}/payments-create",
                 headers=_fn_headers(),
                 json=payload,
                 timeout=20,
