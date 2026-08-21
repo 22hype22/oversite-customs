@@ -3630,6 +3630,31 @@ def _collect_modal_values(components):
     return vals
 
 
+def _modal_uploaded_files(interaction, custom_id):
+    """Return [{url, filename}] for each file uploaded in the modal's file-upload
+    component (type 19) with this custom_id. Discord lists the attachment ids in
+    the component's `values`; the file objects live under data.resolved.attachments."""
+    data = interaction.data or {}
+    resolved = ((data.get("resolved") or {}).get("attachments")) or {}
+    files = []
+
+    def collect(c):
+        if isinstance(c, dict) and c.get("custom_id") == custom_id:
+            for aid in (c.get("values") or []):
+                att = resolved.get(str(aid)) or {}
+                if att.get("url"):
+                    files.append({"url": att["url"], "filename": att.get("filename")})
+
+    for row in (data.get("components") or []):
+        if not isinstance(row, dict):
+            continue
+        collect(row)
+        collect(row.get("component"))
+        for c in (row.get("components") or []):
+            collect(c)
+    return files
+
+
 def _apply_answers(open_comps, mapping):
     """Replace each {Question: LABEL} token with '**LABEL** answer', and each
     {File: LABEL} token with '**LABEL**' (the file itself is posted separately)."""
