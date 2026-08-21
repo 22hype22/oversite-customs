@@ -2388,14 +2388,15 @@ def _packages_can_use(member):
     return has_any_role(member, packages_config.get("allowed_role_ids", []))
 
 
-_PKG_FILLER = "ㅤ"  # Hangul filler — an invisible, roughly fixed-width space.
+_MENTION_RE = re.compile(r"<@!?\d+>")
 
 
 def _align_pipe_columns(text):
-    """Turn {|} columns into spread-out text using an invisible filler. Two
-    consecutive lines that both contain {|} (a labels line + a values line) are
-    padded per column so they line up; a lone {|} line falls back to ' | '.
-    (Discord's font is proportional, so alignment is close but not exact.)"""
+    """Turn {|} columns into a real aligned table using a monospace code block
+    (the only way columns actually line up in a V2 message). Two consecutive
+    lines that both contain {|} (a labels line + a values line) become one code
+    block padded per column; a lone {|} line falls back to ' | '. Mentions can't
+    render inside a code block, so they're shown as plain text there."""
     lines = str(text or "").split("\n")
     out = []
     i = 0
@@ -2403,19 +2404,19 @@ def _align_pipe_columns(text):
         line = lines[i]
         nxt = lines[i + 1] if i + 1 < len(lines) else None
         if "{|}" in line and nxt is not None and "{|}" in nxt:
-            a = [c.strip() for c in line.split("{|}")]
+            # Strip mention syntax so the code block shows a name, not <@id>.
+            a = [_MENTION_RE.sub(lambda m: "", c).strip() or c.strip() for c in line.split("{|}")]
             b = [c.strip() for c in nxt.split("{|}")]
             if len(a) == len(b):
-                widths = [max(len(a[k]), len(b[k])) + 3 for k in range(len(a))]
+                widths = [max(len(a[k]), len(b[k])) for k in range(len(a))]
 
-                def pad(cells):
-                    return "".join(
-                        cells[k] + (_PKG_FILLER * max(1, widths[k] - len(cells[k])) if k < len(cells) - 1 else "")
-                        for k in range(len(cells))
-                    )
+                def row(cells):
+                    return "   ".join(cells[k].ljust(widths[k]) for k in range(len(cells))).rstrip()
 
-                out.append(pad(a))
-                out.append(pad(b))
+                out.append("```")
+                out.append(row(a))
+                out.append(row(b))
+                out.append("```")
                 i += 2
                 continue
         out.append(line.replace("{|}", " | "))
