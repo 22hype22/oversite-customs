@@ -2730,6 +2730,16 @@ async def package_cmd(interaction: discord.Interaction, channel: typing.Union[di
     if not comps:
         await interaction.response.send_message(embed=error_embed("Nothing to post", "Build the Packages card in the dashboard first, then run /package."), ephemeral=True)
         return
+    # Posting to a forum requires a tag — enforce it here (the option can't be
+    # marked required at the Discord level without also blocking text channels).
+    if isinstance(channel, discord.ForumChannel):
+        avail = getattr(channel, "available_tags", None) or []
+        if not tag:
+            await interaction.response.send_message(embed=error_embed("Pick a tag", f"{channel.mention} is a forum — pick a tag in the `tag` option before running /package."), ephemeral=True)
+            return
+        if not any(str(t.id) == str(tag) for t in avail):
+            await interaction.response.send_message(embed=error_embed("Unknown tag", "That tag isn't on this forum. Open the `tag` option and pick one from the list."), ephemeral=True)
+            return
     # Register the design for the shared form pager, and stash the target channel
     # + payment/link so they survive the modal round-trip.
     form_msgs[PKG_FORM_KEY] = comps
