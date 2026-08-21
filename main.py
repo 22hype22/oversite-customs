@@ -2504,8 +2504,15 @@ def _pkg_build_embed(comps):
     def flush_trailing():
         txt = "\n".join(trailing).strip()
         trailing.clear()
-        if txt:
-            efields.append(("​", txt[:1024], False))
+        if not txt:
+            return
+        # Use the first line as the field NAME (a blank name renders as an extra
+        # empty line above the text). Field names don't parse markdown, so strip
+        # leading #/** from it; the rest of the text stays as the value.
+        parts = txt.split("\n")
+        name = parts[0].strip().strip("#").strip().strip("*").strip() or "​"
+        value = "\n".join(parts[1:]).strip() or "​"
+        efields.append((name[:256], value[:1024], False))
 
     def add_line(text):
         (trailing if fstarted["v"] else desc).append(text)
