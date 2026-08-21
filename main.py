@@ -2605,19 +2605,10 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
         final = comps
 
     all_files = files or []
-    sfile_imgs = [f.get("url") for f in all_files if isinstance(f, dict) and f.get("before") and f.get("url")]
+    sfile_files = [f for f in all_files if isinstance(f, dict) and f.get("before") and f.get("url")]
     after_files = [f for f in all_files if isinstance(f, dict) and not f.get("before")]
 
     embed, buttons = _pkg_build_embed(final)
-
-    def _img_embed(url):
-        e = discord.Embed(color=embed.color)
-        e.set_image(url=url)
-        return e
-
-    # {SFile} Preview → its own image embeds ABOVE the card; the Media Gallery
-    # photo is already inside `embed` at the bottom via set_image.
-    embeds = ([_img_embed(u) for u in sfile_imgs] + [embed])[:10]
 
     view = None
     if buttons:
@@ -2628,7 +2619,19 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
             else:
                 view.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.success, custom_id="pkg_claim"))
     try:
-        await ch.send(embeds=embeds, view=view, allowed_mentions=discord.AllowedMentions.none())
+        # 1) The {SFile} Preview banner posts on its own as a normal native image.
+        for f in sfile_files:
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.get(f["url"], timeout=90, follow_redirects=True)
+                if r.status_code == 200:
+                    await ch.send(file=discord.File(io.BytesIO(r.content),
+                                  filename=_san_filename(f.get("filename"), "preview.png")))
+            except Exception as e:
+                print(f"[Package] preview post failed: {e}")
+        # 2) The embed — with the Media Gallery photo inside it — as its own message.
+        await ch.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+        # 3) {File} attachments underneath.
         if after_files:
             await _post_form_files(ch, after_files)
         await interaction.followup.send(embed=success_embed("Posted", f"Package card posted in {ch.mention}."), ephemeral=True)
