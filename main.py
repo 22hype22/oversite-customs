@@ -2421,11 +2421,107 @@ PKG_FORM_KEY = "customs-package"
 _pending_pkg_ctx = {}  # user_id -> {channel_id, payment, link}
 
 
+def _parse_hex_color(raw):
+    """'#7B2D8E' / '7B2D8E' -> discord.Color, or None."""
+    s = str(raw or "").strip().lstrip("#")
+    if len(s) == 6:
+        try:
+            return discord.Color(int(s, 16))
+        except Exception:
+            return None
+    return None
+
+
+_PKG_HEADING_LINK = re.compile(r"^\[(.*?)\]\((.*?)\)$")
+
+
+def _pkg_build_embed(comps, image_url=""):
+    """Render the package design as a real Discord embed so it looks like the
+    reference: a heading becomes the title, {|} rows (a labels line + a values
+    line, or the Fields component) become aligned inline fields, container accent
+    becomes the color bar, and the SFile image sits inside. Returns (embed, buttons)
+    where buttons is [(label, url_or_None)]."""
+    color = None
+    title = ""
+    title_url = ""
+    desc = []
+    efields = []   # (name, value, inline)
+    buttons = []   # (label, url_or_None)
+
+    def take_title(line):
+        nonlocal title, title_url
+        h = line.lstrip("#").strip()
+        m = _PKG_HEADING_LINK.match(h)
+        if m:
+            title = m.group(1).strip()
+            title_url = m.group(2).strip().strip("<>")
+        else:
+            title = h
+
+    def walk(items):
+        nonlocal color
+        for c in items:
+            if not isinstance(c, dict):
+                continue
+            t = c.get("type")
+            if t == "container":
+                if color is None:
+                    color = _parse_hex_color(c.get("accentColor"))
+                walk(c.get("children") or [])
+            elif t == "text":
+                lines = str(c.get("text") or "").split("\n")
+                i = 0
+                while i < len(lines):
+                    line = lines[i]
+                    s = line.strip()
+                    # A labels line + a values line (both with {|}) -> inline fields.
+                    if "{|}" in line and i + 1 < len(lines) and "{|}" in lines[i + 1]:
+                        names = [x.strip() for x in line.split("{|}")]
+                        vals = [x.strip() for x in lines[i + 1].split("{|}")]
+                        if len(names) == len(vals):
+                            for n, v in zip(names, vals):
+                                efields.append((n or "​", v or "​", True))
+                            i += 2
+                            continue
+                    if not title and s.startswith("#"):
+                        take_title(s)
+                    elif "{|}" in line:
+                        desc.append(line.replace("{|}", " | "))
+                    else:
+                        desc.append(line)
+                    i += 1
+            elif t == "section":
+                if c.get("title"):
+                    desc.append(f"**{c['title']}**")
+                if c.get("text"):
+                    desc.append(str(c["text"]))
+            elif t == "fields":
+                for f in (c.get("fields") or []):
+                    if isinstance(f, dict) and f.get("name"):
+                        efields.append((str(f["name"]), str(f.get("value") or "​") or "​", bool(f.get("inline", True))))
+            elif t == "buttonRow":
+                for b in (c.get("buttons") or []):
+                    if isinstance(b, dict) and b.get("label"):
+                        buttons.append((str(b["label"]), b.get("url")))
+
+    walk(comps or [])
+    embed = discord.Embed(
+        title=(title[:256] or None), url=(title_url or None),
+        description=("\n".join(desc).strip()[:4096] or None),
+        color=color, timestamp=discord.utils.utcnow(),
+    )
+    for (n, v, inl) in efields[:25]:
+        embed.add_field(name=(n or "​")[:256], value=(v or "​")[:1024], inline=inl)
+    if image_url:
+        embed.set_image(url=image_url)
+    return embed, buttons
+
+
 async def _post_package_form(interaction, comps, mapping=None, files=None):
-    """Post the finished package card to the channel picked on /package. Fills
-    {Question: LABEL} with just the answer, {File: LABEL} with '', plus
-    {user}/{payment}/{payment_link}, then flattens Fields/{|} to text. Assumes the
-    interaction is already deferred."""
+    """Post the finished package card (as a real embed) to the channel picked on
+    /package. Fills {Question}/{LQuestion} answers, {user}/{payment}/{payment_link},
+    puts the {SFile} image inside the embed and {File} attachments after. Assumes
+    the interaction is already deferred."""
     ctx = _pending_pkg_ctx.pop(interaction.user.id, {})
     ch = await resolve_channel(ctx.get("channel_id"))
     if not ch:
@@ -2440,8 +2536,12 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
     def _answer_repl(m):
         kind = m.group(1).lower()
         label = (m.group(2) or "").strip()
-        # {File:}/{SFile:} tokens carry no inline text — the files render separately.
-        return _js("" if kind in ("file", "sfile") else mapping.get(label, ""))
+        if kind in ("file", "sfile"):
+            return _js("")  # files render separately
+        answer = mapping.get(label, "")
+        if kind == "lquestion":  # keep the label as a bold header above the answer
+            return _js(f"**{_clean_label(label)}**\n{answer}".rstrip())
+        return _js(answer)      # short question -> value only (header labels it)
 
     raw = _FIELD_RE.sub(_answer_repl, json.dumps(comps or []))
     for tok, val in (
@@ -2455,26 +2555,27 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
         final = json.loads(raw)
     except Exception:
         final = comps
-    final = _flatten_pkg_fields(final)
 
-    # {SFile:} files render ABOVE the card (a leading image gallery); {File:}
-    # files post as attachments after it.
     all_files = files or []
-    before_files = [f for f in all_files if isinstance(f, dict) and f.get("before")]
+    before_imgs = [f.get("url") for f in all_files if isinstance(f, dict) and f.get("before") and f.get("url")]
     after_files = [f for f in all_files if isinstance(f, dict) and not f.get("before")]
-    before_imgs = [f.get("url") for f in before_files if f.get("url")]
-    if before_imgs:
-        final = [{"id": "sfile", "type": "gallery", "images": before_imgs}] + list(final)
 
-    _V2_LAST_ERROR["msg"] = ""
-    mid = await send_v2_message(ch, final, allowed_mentions={"parse": []})
-    if mid and after_files:
-        await _post_form_files(ch, after_files)
-    if mid:
+    embed, buttons = _pkg_build_embed(final, image_url=(before_imgs[0] if before_imgs else ""))
+    view = None
+    if buttons:
+        view = discord.ui.View(timeout=None)
+        for (label, url) in buttons[:5]:
+            if url:
+                view.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.link, url=url))
+            else:
+                view.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.success, custom_id="pkg_claim"))
+    try:
+        await ch.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+        if after_files:
+            await _post_form_files(ch, after_files)
         await interaction.followup.send(embed=success_embed("Posted", f"Package card posted in {ch.mention}."), ephemeral=True)
-    else:
-        reason = _V2_LAST_ERROR.get("msg") or "unknown error"
-        await interaction.followup.send(embed=error_embed("Couldn't post", f"Discord rejected the message: {reason}"), ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(embed=error_embed("Couldn't post", str(e)[:300]), ephemeral=True)
 
 
 @bot.tree.command(name="package", description="Post the package card to a channel")
