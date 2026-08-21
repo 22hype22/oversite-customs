@@ -1312,6 +1312,34 @@ async def _before_poll_stripe_sales():
 bot.tree.add_command(credits_group)
 
 
+async def _handle_stripe_pay_click(interaction, price):
+    """A customer clicked a Stripe 'Pay' button. Create a link stamped with THEIR
+    Discord id and hand it to them privately, so the purchase log @'s whoever
+    actually paid — no staff picking a customer."""
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except Exception:
+        pass
+    result = await create_payment(
+        "stripe", 0, price,
+        discord_id=interaction.user.id,
+        guild_id=interaction.guild_id,
+        customer_name=str(interaction.user),
+    )
+    if isinstance(result, dict) and result.get("ok") and result.get("url"):
+        await interaction.followup.send(
+            embed=success_embed(
+                "Your payment link",
+                f"**${price:.2f}** — this link is yours, {interaction.user.mention}. "
+                f"Paying it logs the purchase to your account.\n{result['url']}",
+            ),
+            ephemeral=True,
+        )
+    else:
+        err = (result or {}).get("error") if isinstance(result, dict) else str(result)
+        await interaction.followup.send(embed=error_embed("Couldn't create link", err or "Unknown error"), ephemeral=True)
+
+
 async def create_payment(method, item, price, *, discord_id=None, guild_id=None, customer_name=None):
     """Call the payment-create edge function (holds the Roblox cookie + Stripe key).
     For Stripe, discord_id/customer_name attribute the payment to a customer so
@@ -1347,9 +1375,8 @@ async def create_payment(method, item, price, *, discord_id=None, guild_id=None,
 
 
 class PaymentModal(discord.ui.Modal):
-    def __init__(self, customer=None):
+    def __init__(self):
         super().__init__(title="Create Payment", timeout=300)
-        self.customer = customer  # discord.Member the Stripe payment is for (optional)
         self.method = discord.ui.Select(min_values=1, max_values=1, options=[
             discord.SelectOption(label="Stripe (USD)", value="stripe", default=True),
             discord.SelectOption(label="Gamepass (Robux)", value="gamepass"),
@@ -1377,18 +1404,29 @@ class PaymentModal(discord.ui.Modal):
             price = float(str(self.price.value or "").replace("$", "").replace(",", "").strip())
         except Exception:
             price = 0
-        # Stripe payments can be attributed to a customer (for purchase logs).
-        cust = self.customer if method == "stripe" else None
-        result = await create_payment(
-            method, item, price,
-            discord_id=(cust.id if cust else None),
-            guild_id=(interaction.guild_id if cust else None),
-            customer_name=(str(cust) if cust else None),
-        )
-        if isinstance(result, dict) and result.get("ok") and result.get("url"):
-            extra = f"\nCustomer: {cust.mention}" if cust else ""
+        if method == "stripe":
+            # Post a Pay button instead of a raw link. Whoever CLICKS it gets a
+            # personalized Stripe link stamped with their Discord id, so the
+            # purchase log @'s the person who actually paid — no customer picking.
+            if not (price and price > 0):
+                await interaction.followup.send(embed=error_embed("Payment failed", "Enter a valid price above 0."))
+                return
+            cents = int(round(price * 100))
+            view = discord.ui.View(timeout=None)
+            view.add_item(discord.ui.Button(
+                label=f"Pay ${price:.2f}", style=discord.ButtonStyle.success,
+                custom_id=f"stripe_pay:{cents}", emoji="💳",
+            ))
             await interaction.followup.send(
-                embed=success_embed("Payment ready", f"**{result.get('label', 'Payment')}**{extra}\n{result['url']}"),
+                embed=success_embed("Payment", f"Click **Pay ${price:.2f}** below to check out with Stripe. "
+                                    "Whoever clicks is logged as the customer."),
+                view=view,
+            )
+            return
+        result = await create_payment(method, item, price)
+        if isinstance(result, dict) and result.get("ok") and result.get("url"):
+            await interaction.followup.send(
+                embed=success_embed("Payment ready", f"**{result.get('label', 'Payment')}**\n{result['url']}"),
             )
         else:
             err = (result or {}).get("error") if isinstance(result, dict) else str(result)
@@ -1410,13 +1448,12 @@ def _payment_can_use(member):
 
 
 @bot.tree.command(name="payment", description="Create a payment — Stripe, gamepass, or shirt")
-@app_commands.describe(customer="Who this Stripe payment is for (so the purchase log @'s them). Optional.")
-async def payment_cmd(interaction: discord.Interaction, customer: discord.Member = None):
+async def payment_cmd(interaction: discord.Interaction):
     if not _payment_can_use(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to create payments."), ephemeral=True)
         return
     try:
-        await interaction.response.send_modal(PaymentModal(customer=customer))
+        await interaction.response.send_modal(PaymentModal())
     except Exception as e:
         print(f"[Payment] modal open failed: {e!r}")
         try:
@@ -3869,6 +3906,13 @@ async def on_interaction(interaction: discord.Interaction):
     cid = (interaction.data or {}).get("custom_id", "")
     if cid.startswith(("ticket_msg:", "ticket_form:", "eph:", "ticket_cat:")) or cid in ("ticket_select", "ticket_open"):
         print(f"[Tickets] interaction cid={cid!r} values={(interaction.data or {}).get('values')}")
+    if cid.startswith("stripe_pay:"):
+        try:
+            cents = int(cid.split(":", 1)[1])
+        except Exception:
+            cents = 0
+        await _handle_stripe_pay_click(interaction, cents / 100)
+        return
     if cid == "ticket_select":
         values = (interaction.data or {}).get("values") or []
         if values:
