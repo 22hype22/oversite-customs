@@ -119,12 +119,9 @@ robux_locker_config = {"channel_id": "", "components": [], "panel_ref": None, "s
 # design to the configured channel.
 portfolio_config = {"channel_id": "", "components": [], "allowed_role_ids": []}
 
-# Package card built in the dashboard "Packages" block (an embed with
-# side-by-side fields). Running /package channel:#x posts it to the chosen channel.
-packages_config = {
-    "title": "", "description": "", "color": "", "image_url": "",
-    "fields": "", "button_label": "", "allowed_role_ids": [],
-}
+# Package card built in the dashboard "Packages" block (the same message builder
+# as Messages). Running /package channel:#x posts that design to the channel.
+packages_config = {"panel_components": [], "allowed_role_ids": []}
 
 # ---- Payment ----
 # The dashboard "Payment" block only picks who may run /payment.
@@ -2391,61 +2388,19 @@ def _packages_can_use(member):
     return has_any_role(member, packages_config.get("allowed_role_ids", []))
 
 
-def _parse_hex_color(raw):
-    """'#7B2D8E' / '7B2D8E' -> discord.Color, or None."""
-    s = str(raw or "").strip().lstrip("#")
-    if len(s) == 6:
-        try:
-            return discord.Color(int(s, 16))
-        except Exception:
-            return None
-    return None
-
-
-def _build_package_embed():
-    """Build the package card embed from packages_config. Fields are one per line
-    as 'Name | Value | inline' ('full' = own row)."""
-    cfg = packages_config
-    embed = discord.Embed(
-        title=(cfg.get("title") or None),
-        description=(cfg.get("description") or None),
-        color=_parse_hex_color(cfg.get("color")),
-        timestamp=discord.utils.utcnow(),
-    )
-    for line in str(cfg.get("fields") or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = [p.strip() for p in line.split("|")]
-        name = parts[0] if parts else ""
-        value = parts[1] if len(parts) > 1 else "​"
-        mode = parts[2].lower() if len(parts) > 2 else "inline"
-        if not name:
-            continue
-        embed.add_field(name=name, value=(value or "​"), inline=(mode != "full"))
-    if cfg.get("image_url"):
-        embed.set_image(url=cfg["image_url"])
-    return embed
-
-
 @bot.tree.command(name="package", description="Post the package card to a channel")
 @app_commands.describe(channel="Which channel to post the package card in")
 async def package_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
     if not _packages_can_use(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to run /package."), ephemeral=True)
         return
-    if not (packages_config.get("title") or packages_config.get("description") or packages_config.get("fields")):
-        await interaction.response.send_message(embed=error_embed("Nothing to post", "Set up the Packages card in the dashboard first, then run /package."), ephemeral=True)
+    comps = packages_config.get("panel_components") or []
+    if not comps:
+        await interaction.response.send_message(embed=error_embed("Nothing to post", "Build the Packages card in the dashboard first, then run /package."), ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
-    embed = _build_package_embed()
-    view = None
-    label = (packages_config.get("button_label") or "").strip()
-    if label:
-        view = discord.ui.View(timeout=None)
-        view.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.success, custom_id="pkg_claim"))
     try:
-        await channel.send(embed=embed, view=view)
+        await send_v2_message(channel, comps)
         await interaction.followup.send(embed=success_embed("Posted", f"Package card posted in {channel.mention}."), ephemeral=True)
     except Exception as e:
         await interaction.followup.send(embed=error_embed("Couldn't post", str(e)[:300]), ephemeral=True)
@@ -4853,14 +4808,10 @@ async def apply_config(feature, cfg, post_panel=False):
         portfolio_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
         print(f"[Config] portfolio — channel {portfolio_config['channel_id']} design {len(portfolio_config['components'])} roles {portfolio_config['allowed_role_ids']}")
     elif feature in ("packages", "customs-packages"):
-        packages_config["title"] = str(cfg.get("title") or "")
-        packages_config["description"] = str(cfg.get("description") or "")
-        packages_config["color"] = str(cfg.get("color") or "")
-        packages_config["image_url"] = str(cfg.get("image_url") or "")
-        packages_config["fields"] = str(cfg.get("fields") or "")
-        packages_config["button_label"] = str(cfg.get("button_label") or "")
+        comps = cfg.get("panel_components")
+        packages_config["panel_components"] = comps if isinstance(comps, list) else []
         packages_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
-        print(f"[Config] packages — title {packages_config['title']!r} fields {len([l for l in packages_config['fields'].splitlines() if l.strip()])} roles {packages_config['allowed_role_ids']}")
+        print(f"[Config] packages — design {len(packages_config['panel_components'])} roles {packages_config['allowed_role_ids']}")
     elif feature in FORM_LOG_DEFS:
         # Form logs (/orderlog, /infraction, /promote): pop a form from the
         # {Question:} tokens in the design, then post the completed message to the
