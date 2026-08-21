@@ -2417,9 +2417,67 @@ def _flatten_pkg_fields(comps):
     return out
 
 
+PKG_FORM_KEY = "customs-package"
+_pending_pkg_ctx = {}  # user_id -> {channel_id, payment, link}
+
+
+async def _post_package_form(interaction, comps, mapping=None, files=None):
+    """Post the finished package card to the channel picked on /package. Fills
+    {Question: LABEL} with just the answer, {File: LABEL} with '', plus
+    {user}/{payment}/{payment_link}, then flattens Fields/{|} to text. Assumes the
+    interaction is already deferred."""
+    ctx = _pending_pkg_ctx.pop(interaction.user.id, {})
+    ch = await resolve_channel(ctx.get("channel_id"))
+    if not ch:
+        await interaction.followup.send(embed=error_embed("No channel", "That channel is gone — run /package again."), ephemeral=True)
+        return
+
+    def _js(s):
+        return json.dumps(str(s))[1:-1]
+
+    mapping = mapping or {}
+
+    def _answer_repl(m):
+        kind = m.group(1).lower()
+        label = (m.group(2) or "").strip()
+        return _js("" if kind == "file" else mapping.get(label, ""))
+
+    raw = _FIELD_RE.sub(_answer_repl, json.dumps(comps or []))
+    for tok, val in (
+        ("{user}", interaction.user.mention),
+        ("{username}", interaction.user.display_name),
+        ("{payment}", ctx.get("payment") or ""),
+        ("{payment_link}", ctx.get("link") or ""),
+    ):
+        raw = raw.replace(tok, _js(val))
+    try:
+        final = json.loads(raw)
+    except Exception:
+        final = comps
+    final = _flatten_pkg_fields(final)
+    _V2_LAST_ERROR["msg"] = ""
+    if files:
+        mid = await _send_v2_with_files(ch, final, files, allowed_mentions={"parse": []})
+        if not mid:
+            mid = await send_v2_message(ch, final, allowed_mentions={"parse": []})
+            if mid:
+                await _post_form_files(ch, files)
+    else:
+        mid = await send_v2_message(ch, final, allowed_mentions={"parse": []})
+    if mid:
+        await interaction.followup.send(embed=success_embed("Posted", f"Package card posted in {ch.mention}."), ephemeral=True)
+    else:
+        reason = _V2_LAST_ERROR.get("msg") or "unknown error"
+        await interaction.followup.send(embed=error_embed("Couldn't post", f"Discord rejected the message: {reason}"), ephemeral=True)
+
+
 @bot.tree.command(name="package", description="Post the package card to a channel")
-@app_commands.describe(channel="Which channel to post the package card in")
-async def package_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+@app_commands.describe(
+    channel="Which channel to post the package card in",
+    payment="What the payment is — e.g. Gamepass, Roblox Select, Stripe. Fills {payment}.",
+    link="The payment link. Fills {payment_link} — e.g. [{payment}]({payment_link}).",
+)
+async def package_cmd(interaction: discord.Interaction, channel: discord.TextChannel, payment: str = "", link: str = ""):
     if not _packages_can_use(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to run /package."), ephemeral=True)
         return
@@ -2427,12 +2485,20 @@ async def package_cmd(interaction: discord.Interaction, channel: discord.TextCha
     if not comps:
         await interaction.response.send_message(embed=error_embed("Nothing to post", "Build the Packages card in the dashboard first, then run /package."), ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    try:
-        await send_v2_message(channel, _flatten_pkg_fields(comps))
-        await interaction.followup.send(embed=success_embed("Posted", f"Package card posted in {channel.mention}."), ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(embed=error_embed("Couldn't post", str(e)[:300]), ephemeral=True)
+    # Register the design for the shared form pager, and stash the target channel
+    # + payment/link so they survive the modal round-trip.
+    form_msgs[PKG_FORM_KEY] = comps
+    form_titles[PKG_FORM_KEY] = "Package"
+    _pending_pkg_ctx[interaction.user.id] = {"channel_id": str(channel.id), "payment": payment or "", "link": link or ""}
+    _pending_form_answers.pop((interaction.user.id, PKG_FORM_KEY), None)
+    _pending_form_files.pop((interaction.user.id, PKG_FORM_KEY), None)
+    fields = _parse_form_fields(comps, limit=FORM_MAX_QUESTIONS)
+    if not fields:
+        # No {Question:}/{File:} tokens — post straight away.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await _post_package_form(interaction, comps)
+        return
+    await _open_form_page(interaction, PKG_FORM_KEY, 0)
 
 
 @tasks.loop(hours=24)
@@ -3802,6 +3868,11 @@ async def handle_ticket_form_submit(interaction, key, page=0):
     try:
         mapping = dict(_pending_form_answers.pop((interaction.user.id, key), {}))
         files = list(_pending_form_files.pop((interaction.user.id, key), []))
+        if key == PKG_FORM_KEY:
+            # Packages fill {Question: LABEL} with just the answer (no bold label),
+            # since the card's own header labels the columns.
+            await _post_package_form(interaction, open_comps, mapping, files=files)
+            return
         substituted = _apply_answers(open_comps, mapping)
         if key in form_log_configs:
             await _post_form_log(interaction, key, substituted, files=files)
