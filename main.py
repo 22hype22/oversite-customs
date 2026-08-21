@@ -2646,12 +2646,19 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
             # The banner is the thread's starter message; the embed follows inside.
             thread_name = ((embed.title or ctx.get("payment") or "Package") or "Package")[:100]
             banners = [b for b in [await _banner_file(f) for f in sfile_files] if b]
-            # If the forum requires a tag, apply the first available one so the
+            # Apply the tag the runner picked on /package. If none was picked but
+            # the forum requires one, fall back to the first available tag so the
             # post isn't silently rejected.
             tag_kwargs = {}
             tags = getattr(ch, "available_tags", None) or []
-            if getattr(getattr(ch, "flags", None), "require_tag", False) and tags:
-                tag_kwargs["applied_tags"] = [tags[0]]
+            chosen_tag = ctx.get("tag")
+            applied = []
+            if chosen_tag:
+                applied = [t for t in tags if str(t.id) == str(chosen_tag)]
+            if not applied and getattr(getattr(ch, "flags", None), "require_tag", False) and tags:
+                applied = [tags[0]]
+            if applied:
+                tag_kwargs["applied_tags"] = applied
 
             async def _make_thread(**kw):
                 if banners:
@@ -2690,13 +2697,32 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
         await interaction.followup.send(embed=error_embed("Couldn't post", str(e)[:300]), ephemeral=True)
 
 
+async def _package_tag_autocomplete(interaction: discord.Interaction, current: str):
+    """Offer the tags of the forum picked in the `channel` option. Reads the
+    channel already chosen on the command so the tag list matches that forum."""
+    ch_opt = getattr(interaction.namespace, "channel", None)
+    ch = bot.get_channel(ch_opt.id) if ch_opt is not None else None
+    tags = getattr(ch, "available_tags", None) or []
+    cur = (current or "").lower()
+    out = []
+    for t in tags:
+        name = f"{t.emoji} {t.name}".strip() if getattr(t, "emoji", None) else t.name
+        if cur in t.name.lower():
+            out.append(app_commands.Choice(name=name[:100], value=str(t.id)))
+        if len(out) >= 25:
+            break
+    return out
+
+
 @bot.tree.command(name="package", description="Post the package card to a channel")
 @app_commands.describe(
     channel="Which channel to post the package card in",
+    tag="Forum tag to apply (pick the channel first — this lists that forum's tags).",
     payment="What the payment is — e.g. Gamepass, Roblox Select, Stripe. Fills {payment}.",
     link="The payment link. Fills {payment_link} — e.g. [{payment}]({payment_link}).",
 )
-async def package_cmd(interaction: discord.Interaction, channel: typing.Union[discord.TextChannel, discord.ForumChannel], payment: str = "", link: str = ""):
+@app_commands.autocomplete(tag=_package_tag_autocomplete)
+async def package_cmd(interaction: discord.Interaction, channel: typing.Union[discord.TextChannel, discord.ForumChannel], tag: str = "", payment: str = "", link: str = ""):
     if not _packages_can_use(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to run /package."), ephemeral=True)
         return
@@ -2708,7 +2734,7 @@ async def package_cmd(interaction: discord.Interaction, channel: typing.Union[di
     # + payment/link so they survive the modal round-trip.
     form_msgs[PKG_FORM_KEY] = comps
     form_titles[PKG_FORM_KEY] = "Package"
-    _pending_pkg_ctx[interaction.user.id] = {"channel_id": str(channel.id), "payment": payment or "", "link": link or ""}
+    _pending_pkg_ctx[interaction.user.id] = {"channel_id": str(channel.id), "payment": payment or "", "link": link or "", "tag": tag or ""}
     _pending_form_answers.pop((interaction.user.id, PKG_FORM_KEY), None)
     _pending_form_files.pop((interaction.user.id, PKG_FORM_KEY), None)
     fields = _parse_form_fields(comps, limit=FORM_MAX_QUESTIONS)
