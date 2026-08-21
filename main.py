@@ -2389,15 +2389,18 @@ def _packages_can_use(member):
 
 
 def _flatten_pkg_fields(comps):
-    """The dashboard 'Fields (side by side)' component isn't a real V2 component
-    (Components V2 has no inline fields), so convert any {type:"fields"} into a
-    plain Text Display of stacked '**Name** value' lines before sending."""
+    """Discord's Components V2 has no side-by-side columns, so convert the card's
+    column authoring into plain text before sending:
+      - a {type:"fields"} component -> stacked '**Name** value' lines
+      - the {|} token inside a Text Display -> a ' | ' inline separator
+    Columns still show in the dashboard preview; the post falls back to inline."""
     out = []
     for c in comps or []:
         if not isinstance(c, dict):
             out.append(c)
             continue
-        if c.get("type") == "fields":
+        t = c.get("type")
+        if t == "fields":
             lines = []
             for f in (c.get("fields") or []):
                 if isinstance(f, dict) and (f.get("name") or f.get("value")):
@@ -2405,7 +2408,9 @@ def _flatten_pkg_fields(comps):
                     val = str(f.get("value") or "").strip()
                     lines.append(f"**{name}**\n{val}".strip() if name else val)
             out.append({"id": c.get("id") or "f", "type": "text", "text": "\n".join(lines)})
-        elif c.get("type") == "container" and isinstance(c.get("children"), list):
+        elif t == "text":
+            out.append({**c, "text": str(c.get("text") or "").replace("{|}", " | ")})
+        elif t == "container" and isinstance(c.get("children"), list):
             out.append({**c, "children": _flatten_pkg_fields(c["children"])})
         else:
             out.append(c)
