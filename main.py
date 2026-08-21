@@ -2476,16 +2476,15 @@ def _pkg_build_embed(comps):
     """Render the package design as a real Discord embed: a heading becomes the
     linked title, {|} rows (a labels line + a values line) and Fields components
     become aligned inline fields, the container accent becomes the color bar, and
-    galleries placed before the text sit above / after sit below. Returns
-    (embed, buttons, top_images, bottom_images)."""
+    a Media Gallery photo sits INSIDE the embed at the bottom (embed image).
+    Returns (embed, buttons)."""
     color = None
     title = ""
     title_url = ""
     desc = []
     efields = []       # (name, value, inline)
     buttons = []       # (label, url_or_None)
-    top_images = []
-    bottom_images = []
+    gallery_images = []
     started = {"v": False}
 
     def take_title(line):
@@ -2510,7 +2509,7 @@ def _pkg_build_embed(comps):
                 walk(c.get("children") or [])
             elif t == "gallery":
                 imgs = [u for u in (c.get("images") or []) if isinstance(u, str) and u.strip()]
-                (bottom_images if started["v"] else top_images).extend(imgs)
+                gallery_images.extend(imgs)
             elif t == "text":
                 lines = str(c.get("text") or "").split("\n")
                 i = 0
@@ -2560,14 +2559,17 @@ def _pkg_build_embed(comps):
     )
     for (n, v, inl) in efields[:25]:
         embed.add_field(name=(n or "​")[:256], value=(v or "​")[:1024], inline=inl)
-    return embed, buttons, top_images, bottom_images
+    if gallery_images:
+        embed.set_image(url=gallery_images[0])
+    return embed, buttons
 
 
 async def _post_package_form(interaction, comps, mapping=None, files=None):
     """Post the finished package card as a real embed to the channel picked on
-    /package. Fills {Question}/{LQuestion} answers, {user}/{payment}/{payment_link};
-    {SFile} + galleries-before render above, galleries-after below, {File}
-    attachments under it. Interaction already deferred."""
+    /package. Fills {Question}/{LQuestion} answers, {user}/{payment}/{payment_link}.
+    Layout: the {SFile} Preview posts as its own image OUTSIDE the embed, the
+    Media Gallery photo sits INSIDE the embed at the bottom, and {File} attachments
+    post separately underneath. Interaction already deferred."""
     ctx = _pending_pkg_ctx.pop(interaction.user.id, {})
     ch = await resolve_channel(ctx.get("channel_id"))
     if not ch:
@@ -2606,16 +2608,16 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
     sfile_imgs = [f.get("url") for f in all_files if isinstance(f, dict) and f.get("before") and f.get("url")]
     after_files = [f for f in all_files if isinstance(f, dict) and not f.get("before")]
 
-    embed, buttons, top_gallery, bottom_gallery = _pkg_build_embed(final)
-    top = list(sfile_imgs) + list(top_gallery)
-    bottom = list(bottom_gallery)
+    embed, buttons = _pkg_build_embed(final)
 
     def _img_embed(url):
         e = discord.Embed(color=embed.color)
         e.set_image(url=url)
         return e
 
-    embeds = ([_img_embed(u) for u in top] + [embed] + [_img_embed(u) for u in bottom])[:10]
+    # {SFile} Preview → its own image embeds ABOVE the card; the Media Gallery
+    # photo is already inside `embed` at the bottom via set_image.
+    embeds = ([_img_embed(u) for u in sfile_imgs] + [embed])[:10]
 
     view = None
     if buttons:
