@@ -2639,13 +2639,30 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
             # The banner is the thread's starter message; the embed follows inside.
             thread_name = ((embed.title or ctx.get("payment") or "Package") or "Package")[:100]
             banners = [b for b in [await _banner_file(f) for f in sfile_files] if b]
-            if banners:
-                created = await ch.create_thread(name=thread_name, files=banners, allowed_mentions=none_mentions)
-                target = getattr(created, "thread", created)
-                await target.send(embed=embed, view=view, allowed_mentions=none_mentions)
-            else:
-                created = await ch.create_thread(name=thread_name, embed=embed, view=view, allowed_mentions=none_mentions)
-                target = getattr(created, "thread", created)
+            # If the forum requires a tag, apply the first available one so the
+            # post isn't silently rejected.
+            tag_kwargs = {}
+            tags = getattr(ch, "available_tags", None) or []
+            if getattr(getattr(ch, "flags", None), "require_tag", False) and tags:
+                tag_kwargs["applied_tags"] = [tags[0]]
+
+            async def _make_thread(**kw):
+                if banners:
+                    c = await ch.create_thread(name=thread_name, files=banners, allowed_mentions=none_mentions, **kw)
+                    t = getattr(c, "thread", c)
+                    await t.send(embed=embed, view=view, allowed_mentions=none_mentions)
+                    return t
+                c = await ch.create_thread(name=thread_name, embed=embed, view=view, allowed_mentions=none_mentions, **kw)
+                return getattr(c, "thread", c)
+
+            try:
+                target = await _make_thread(**tag_kwargs)
+            except discord.HTTPException as e:
+                # Retry once applying a tag if Discord complains a tag is required.
+                if tags and not tag_kwargs and "tag" in str(e).lower():
+                    target = await _make_thread(applied_tags=[tags[0]])
+                else:
+                    raise
             if after_files:
                 await _post_form_files(target, after_files)
             link = f"https://discord.com/channels/{ch.guild.id}/{target.id}"
