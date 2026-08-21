@@ -2388,6 +2388,30 @@ def _packages_can_use(member):
     return has_any_role(member, packages_config.get("allowed_role_ids", []))
 
 
+def _flatten_pkg_fields(comps):
+    """The dashboard 'Fields (side by side)' component isn't a real V2 component
+    (Components V2 has no inline fields), so convert any {type:"fields"} into a
+    plain Text Display of stacked '**Name** value' lines before sending."""
+    out = []
+    for c in comps or []:
+        if not isinstance(c, dict):
+            out.append(c)
+            continue
+        if c.get("type") == "fields":
+            lines = []
+            for f in (c.get("fields") or []):
+                if isinstance(f, dict) and (f.get("name") or f.get("value")):
+                    name = str(f.get("name") or "").strip()
+                    val = str(f.get("value") or "").strip()
+                    lines.append(f"**{name}**\n{val}".strip() if name else val)
+            out.append({"id": c.get("id") or "f", "type": "text", "text": "\n".join(lines)})
+        elif c.get("type") == "container" and isinstance(c.get("children"), list):
+            out.append({**c, "children": _flatten_pkg_fields(c["children"])})
+        else:
+            out.append(c)
+    return out
+
+
 @bot.tree.command(name="package", description="Post the package card to a channel")
 @app_commands.describe(channel="Which channel to post the package card in")
 async def package_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -2400,7 +2424,7 @@ async def package_cmd(interaction: discord.Interaction, channel: discord.TextCha
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        await send_v2_message(channel, comps)
+        await send_v2_message(channel, _flatten_pkg_fields(comps))
         await interaction.followup.send(embed=success_embed("Posted", f"Package card posted in {channel.mention}."), ephemeral=True)
     except Exception as e:
         await interaction.followup.send(embed=error_embed("Couldn't post", str(e)[:300]), ephemeral=True)
