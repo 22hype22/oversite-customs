@@ -2435,7 +2435,7 @@ def _parse_hex_color(raw):
 _PKG_HEADING_LINK = re.compile(r"^\[(.*?)\]\((.*?)\)$")
 
 
-def _pkg_build_embed(comps, image_url=""):
+def _pkg_build_embed(comps):
     """Render the package design as a real Discord embed so it looks like the
     reference: a heading becomes the title, {|} rows (a labels line + a values
     line, or the Fields component) become aligned inline fields, container accent
@@ -2445,8 +2445,11 @@ def _pkg_build_embed(comps, image_url=""):
     title = ""
     title_url = ""
     desc = []
-    efields = []   # (name, value, inline)
-    buttons = []   # (label, url_or_None)
+    efields = []       # (name, value, inline)
+    buttons = []       # (label, url_or_None)
+    top_images = []    # gallery images before any text/fields -> above the embed
+    bottom_images = [] # gallery images after -> below the embed
+    started = {"v": False}  # have we added any text/fields yet?
 
     def take_title(line):
         nonlocal title, title_url
@@ -2468,6 +2471,9 @@ def _pkg_build_embed(comps, image_url=""):
                 if color is None:
                     color = _parse_hex_color(c.get("accentColor"))
                 walk(c.get("children") or [])
+            elif t == "gallery":
+                imgs = [u for u in (c.get("images") or []) if isinstance(u, str) and u.strip()]
+                (bottom_images if started["v"] else top_images).extend(imgs)
             elif t == "text":
                 lines = str(c.get("text") or "").split("\n")
                 i = 0
@@ -2481,24 +2487,30 @@ def _pkg_build_embed(comps, image_url=""):
                         if len(names) == len(vals):
                             for n, v in zip(names, vals):
                                 efields.append((n or "​", v or "​", True))
+                            started["v"] = True
                             i += 2
                             continue
                     if not title and s.startswith("#"):
                         take_title(s)
                     elif "{|}" in line:
                         desc.append(line.replace("{|}", " | "))
+                        started["v"] = True
                     else:
                         desc.append(line)
+                        if s:
+                            started["v"] = True
                     i += 1
             elif t == "section":
                 if c.get("title"):
                     desc.append(f"**{c['title']}**")
                 if c.get("text"):
                     desc.append(str(c["text"]))
+                started["v"] = True
             elif t == "fields":
                 for f in (c.get("fields") or []):
                     if isinstance(f, dict) and f.get("name"):
                         efields.append((str(f["name"]), str(f.get("value") or "​") or "​", bool(f.get("inline", True))))
+                started["v"] = True
             elif t == "buttonRow":
                 for b in (c.get("buttons") or []):
                     if isinstance(b, dict) and b.get("label"):
@@ -2512,9 +2524,7 @@ def _pkg_build_embed(comps, image_url=""):
     )
     for (n, v, inl) in efields[:25]:
         embed.add_field(name=(n or "​")[:256], value=(v or "​")[:1024], inline=inl)
-    if image_url:
-        embed.set_image(url=image_url)
-    return embed, buttons
+    return embed, buttons, top_images, bottom_images
 
 
 async def _post_package_form(interaction, comps, mapping=None, files=None):
@@ -2557,10 +2567,24 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
         final = comps
 
     all_files = files or []
-    before_imgs = [f.get("url") for f in all_files if isinstance(f, dict) and f.get("before") and f.get("url")]
+    sfile_imgs = [f.get("url") for f in all_files if isinstance(f, dict) and f.get("before") and f.get("url")]
     after_files = [f for f in all_files if isinstance(f, dict) and not f.get("before")]
 
-    embed, buttons = _pkg_build_embed(final, image_url=(before_imgs[0] if before_imgs else ""))
+    embed, buttons, top_gallery, bottom_gallery = _pkg_build_embed(final)
+
+    # Layout: [top images] -> [card embed] -> [bottom images]. SFile + galleries
+    # placed before the text go on top; galleries after go on the bottom; {File:}
+    # attachments post under it. Discord stacks up to 10 embeds in one message.
+    top = list(sfile_imgs) + list(top_gallery)
+    bottom = list(bottom_gallery)
+
+    def _img_embed(url):
+        e = discord.Embed(color=embed.color)
+        e.set_image(url=url)
+        return e
+
+    embeds = ([_img_embed(u) for u in top] + [embed] + [_img_embed(u) for u in bottom])[:10]
+
     view = None
     if buttons:
         view = discord.ui.View(timeout=None)
@@ -2570,7 +2594,7 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
             else:
                 view.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.success, custom_id="pkg_claim"))
     try:
-        await ch.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+        await ch.send(embeds=embeds, view=view, allowed_mentions=discord.AllowedMentions.none())
         if after_files:
             await _post_form_files(ch, after_files)
         await interaction.followup.send(embed=success_embed("Posted", f"Package card posted in {ch.mention}."), ephemeral=True)
