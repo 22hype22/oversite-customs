@@ -1260,8 +1260,12 @@ async def poll_stripe_sales():
         return
     res = await _payments_call("stripe_recent")
     if not (isinstance(res, dict) and res.get("ok")):
-        if isinstance(res, dict) and res.get("error"):
-            print(f"[Purchase] stripe poll: {str(res.get('error'))[:200]}")
+        err = str((res or {}).get("error") or "")
+        if "valid price" in err or "Unknown" in err or "method" in err:
+            print("[Purchase] stripe poll: payments-create isn't deployed with stripe_recent yet "
+                  "(merge the edge function to the redesign branch).")
+        elif err:
+            print(f"[Purchase] stripe poll: {err[:200]}")
         return
     sales = res.get("sales") or []
     if not sales:
@@ -1274,6 +1278,9 @@ async def poll_stripe_sales():
     seen_list = list((st or {}).get("seen_ids") or [])
     seen = set(seen_list)
     first_run = len(seen) == 0
+    # On the first run, seed only payments OLDER than 10 minutes so a fresh test
+    # payment still logs; genuinely old ones are marked seen without logging.
+    cutoff = int(discord.utils.utcnow().timestamp()) - 600
     to_log = []
     added = False
     for pi in sorted(sales, key=lambda p: int(p.get("created") or 0)):  # oldest first
@@ -1283,11 +1290,10 @@ async def poll_stripe_sales():
         seen.add(pid)
         seen_list.append(pid)
         added = True
-        if not first_run:
-            to_log.append(pi)
-    if first_run:
-        print(f"[Purchase] seeded {len(seen_list)} existing Stripe payment(s) (first run — not logging these)")
-    elif to_log:
+        if first_run and int(pi.get("created") or 0) < cutoff:
+            continue  # old payment on first run — seed silently
+        to_log.append(pi)
+    if to_log:
         print(f"[Purchase] {len(to_log)} new Stripe payment(s) to log")
     if added:
         await _payments_call("stripe_state_set", seen_ids=seen_list[-500:])
