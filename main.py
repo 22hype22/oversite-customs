@@ -2711,21 +2711,22 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
                 if banners:
                     c = await ch.create_thread(name=thread_name, files=banners, allowed_mentions=none_mentions, **kw)
                     t = getattr(c, "thread", c)
-                    await t.send(embed=embed, view=view, allowed_mentions=none_mentions)
-                    return t
+                    m = await t.send(embed=embed, view=view, allowed_mentions=none_mentions)
+                    return t, m
                 c = await ch.create_thread(name=thread_name, embed=embed, view=view, allowed_mentions=none_mentions, **kw)
-                return getattr(c, "thread", c)
+                t = getattr(c, "thread", c)
+                m = getattr(c, "message", None)
+                return t, m
 
             try:
-                target = await _make_thread(**tag_kwargs)
+                target, posted = await _make_thread(**tag_kwargs)
             except discord.HTTPException as e:
                 # Retry once applying a tag if Discord complains a tag is required.
                 if tags and not tag_kwargs and "tag" in str(e).lower():
-                    target = await _make_thread(applied_tags=[tags[0]])
+                    target, posted = await _make_thread(applied_tags=[tags[0]])
                 else:
                     raise
-            if after_files:
-                await _post_form_files(target, after_files)
+            await _pkg_store_receipt(posted, target, embed, ctx, after_files)
             link = f"https://discord.com/channels/{ch.guild.id}/{target.id}"
             await interaction.followup.send(embed=success_embed("Posted", f"Package post created: {link}"), ephemeral=True)
             return
@@ -2735,13 +2736,42 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
             if bf:
                 await ch.send(file=bf, allowed_mentions=none_mentions)
         # 2) The embed — with the Media Gallery photo inside it — as its own message.
-        await ch.send(embed=embed, view=view, allowed_mentions=none_mentions)
-        # 3) {File} attachments underneath.
-        if after_files:
-            await _post_form_files(ch, after_files)
+        posted = await ch.send(embed=embed, view=view, allowed_mentions=none_mentions)
+        # 3) The {File} Finished Product is NEVER posted publicly — it's stashed
+        #    privately and delivered to the buyer on claim.
+        await _pkg_store_receipt(posted, ch, embed, ctx, after_files)
         await interaction.followup.send(embed=success_embed("Posted", f"Package card posted in {ch.mention}."), ephemeral=True)
     except Exception as e:
         await interaction.followup.send(embed=error_embed("Couldn't post", str(e)[:300]), ephemeral=True)
+
+
+async def _pkg_store_receipt(posted, ch, embed, ctx, after_files):
+    """Persist the receipt record for a package post (keyed by the post's message
+    id): the private Finished Product files (re-hosted to the delivery channel so
+    their URLs never expire), the product name, banner image, thread link, and
+    price — so a buyer's claim can DM them a receipt with a working Download."""
+    if posted is None:
+        return
+    delivery_ch = None
+    did = ctx.get("delivery_id")
+    if did:
+        delivery_ch = await resolve_channel(did)
+    file_refs = await _pkg_vault_files(delivery_ch, after_files)
+    price_field = ""
+    for f in (embed.fields or []):
+        if str(f.name or "").strip().lower() == "price":
+            price_field = str(f.value or "")
+            break
+    guild = getattr(ch, "guild", None)
+    record = {
+        "product": str(embed.title or "your package"),
+        "image": (embed.image.url if embed.image else "") or "",
+        "thread_url": getattr(posted, "jump_url", ""),
+        "price_field": price_field,
+        "guild_id": str(guild.id) if guild else "",
+        "files": file_refs,
+    }
+    await _pkg_files_set(str(posted.id), record)
 
 
 async def _package_tag_autocomplete(interaction: discord.Interaction, current: str):
@@ -2765,11 +2795,12 @@ async def _package_tag_autocomplete(interaction: discord.Interaction, current: s
 @app_commands.describe(
     channel="Which channel to post the package card in",
     tag="Forum tag to apply (pick the channel first — this lists that forum's tags).",
+    delivery="Private channel to stash the Finished Product file (so Download never expires).",
     payment="What the payment is — e.g. Gamepass, Roblox Select, Stripe. Fills {payment}.",
     link="The payment link. Fills {payment_link} — e.g. [{payment}]({payment_link}).",
 )
 @app_commands.autocomplete(tag=_package_tag_autocomplete)
-async def package_cmd(interaction: discord.Interaction, channel: typing.Union[discord.TextChannel, discord.ForumChannel], tag: str = "", payment: str = "", link: str = ""):
+async def package_cmd(interaction: discord.Interaction, channel: typing.Union[discord.TextChannel, discord.ForumChannel], tag: str = "", delivery: typing.Optional[discord.TextChannel] = None, payment: str = "", link: str = ""):
     if not _packages_can_use(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to run /package."), ephemeral=True)
         return
@@ -2791,7 +2822,7 @@ async def package_cmd(interaction: discord.Interaction, channel: typing.Union[di
     # + payment/link so they survive the modal round-trip.
     form_msgs[PKG_FORM_KEY] = comps
     form_titles[PKG_FORM_KEY] = "Package"
-    _pending_pkg_ctx[interaction.user.id] = {"channel_id": str(channel.id), "payment": payment or "", "link": link or "", "tag": tag or ""}
+    _pending_pkg_ctx[interaction.user.id] = {"channel_id": str(channel.id), "payment": payment or "", "link": link or "", "tag": tag or "", "delivery_id": str(delivery.id) if delivery else ""}
     _pending_form_answers.pop((interaction.user.id, PKG_FORM_KEY), None)
     _pending_form_files.pop((interaction.user.id, PKG_FORM_KEY), None)
     fields = _parse_form_fields(comps, limit=FORM_MAX_QUESTIONS)
@@ -3596,6 +3627,8 @@ async def on_interaction(interaction: discord.Interaction):
             await handle_robux_stock_submit(interaction, funds)
         elif cid == "robuxbuyform":
             await handle_robux_buy_submit(interaction)
+        elif cid.startswith("pkgreview:"):
+            await _pkg_review_submit(interaction, cid.split(":", 1)[1])
         elif cid.startswith("setprice_one:"):
             parts = cid.split(":")
             try:
@@ -3723,11 +3756,18 @@ async def on_interaction(interaction: discord.Interaction):
     elif cid.startswith("pkg_buy:"):
         await _pkg_handle_buy(interaction, cid.split(":", 1)[1])
     elif cid.startswith("pkg_claim:gp:"):
-        await _pkg_claim_gamepass(interaction, cid.split(":", 2)[2])
+        parts = cid.split(":")  # pkg_claim:gp:{gpid}:{pkgmsg}
+        await _pkg_claim_gamepass(interaction, parts[2], parts[3] if len(parts) > 3 else "")
     elif cid.startswith("pkg_claim:shirt:"):
-        await _pkg_claim_shirt(interaction, cid.split(":", 2)[2])
-    elif cid == "pkg_claim:stripe":
-        await _pkg_claim_stripe(interaction)
+        parts = cid.split(":")  # pkg_claim:shirt:{assetid}:{pkgmsg}
+        await _pkg_claim_shirt(interaction, parts[2], parts[3] if len(parts) > 3 else "")
+    elif cid.startswith("pkg_claim:stripe"):
+        parts = cid.split(":")  # pkg_claim:stripe:{pkgmsg}
+        await _pkg_claim_stripe(interaction, parts[2] if len(parts) > 2 else "")
+    elif cid.startswith("pkg_dl:"):
+        await _pkg_download(interaction, cid.split(":", 1)[1])
+    elif cid.startswith("pkg_review:"):
+        await _pkg_review(interaction, cid.split(":", 1)[1])
     elif cid == "pkg_claim":
         # Package card "Claim" button. Behavior is a simple acknowledgement for
         # now — the real claim flow can be wired later.
@@ -5741,14 +5781,161 @@ def _pkg_help_mention(guild):
     return "the dashboard channel"
 
 
-def _pkg_thankyou_embed(roblox_username, item_name):
+async def _pkg_files_set(msg_id, record):
+    await _robux_locker_call("pkg_files_set", msg_id=str(msg_id), record=record)
+
+
+async def _pkg_files_get(msg_id):
+    res = await _robux_locker_call("pkg_files_get", msg_id=str(msg_id))
+    if isinstance(res, dict) and res.get("ok"):
+        return res.get("record") or {}
+    return {}
+
+
+async def _pkg_vault_files(delivery_ch, after_files):
+    """Re-host each Finished Product file. With a delivery channel we post it
+    there and remember the message (its URL can always be refreshed by re-fetching
+    the message, so Download never dies). Without one we keep the raw upload URL
+    (works ~24h)."""
+    refs = []
+    for f in (after_files or []):
+        if not (isinstance(f, dict) and f.get("url")):
+            continue
+        fname = _san_filename(f.get("filename"), "file")
+        if delivery_ch:
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.get(f["url"], timeout=90, follow_redirects=True)
+                if r.status_code != 200:
+                    continue
+                msg = await delivery_ch.send(
+                    content=f"Finished product — {_clean_label(f.get('label') or 'File')}",
+                    file=discord.File(io.BytesIO(r.content), filename=fname))
+                refs.append({"channel_id": str(delivery_ch.id), "message_id": str(msg.id), "filename": fname})
+            except Exception as e:
+                print(f"[Package] vault failed: {e}")
+        else:
+            refs.append({"url": f["url"], "filename": fname})
+    return refs
+
+
+async def _pkg_ref_to_file(ref):
+    """Turn a stored file ref back into a fresh discord.File for delivery."""
+    try:
+        if ref.get("message_id") and ref.get("channel_id"):
+            ch = bot.get_channel(int(ref["channel_id"])) or await bot.fetch_channel(int(ref["channel_id"]))
+            msg = await ch.fetch_message(int(ref["message_id"]))
+            if msg.attachments:
+                data = await msg.attachments[0].read()
+                return discord.File(io.BytesIO(data), filename=ref.get("filename") or msg.attachments[0].filename)
+        elif ref.get("url"):
+            async with httpx.AsyncClient() as client:
+                r = await client.get(ref["url"], timeout=90, follow_redirects=True)
+            if r.status_code == 200:
+                return discord.File(io.BytesIO(r.content), filename=ref.get("filename") or "file")
+    except Exception as e:
+        print(f"[Package] file rebuild failed: {e}")
+    return None
+
+
+def _pkg_receipt_embed(roblox_username, roblox_id, price_str, product, product_url, image):
     e = discord.Embed(
-        title="Thank you for your purchase!",
-        description=(f"Thanks for purchasing from **Oversite**, **{roblox_username}**!\n\n"
-                     f"Your **{item_name}** is on the way. If you need anything, open a ticket and our team will help."),
+        title="Purchase Receipt",
+        description=("Thank you for your recent purchase! Our software will automatically "
+                     "deliver your product to your account, if an issue persists, contact "
+                     "support. View your receipt below:"),
         color=discord.Color(0x2b2d31), timestamp=discord.utils.utcnow(),
     )
+    acct = f"[{roblox_username}](https://www.roblox.com/users/{roblox_id}/profile)" if roblox_id else (roblox_username or "—")
+    e.add_field(name="Roblox Account", value=acct, inline=True)
+    e.add_field(name="Price", value=price_str or "—", inline=True)
+    e.add_field(name="Product Received", value=(f"[{product}]({product_url})" if product_url else (product or "—")), inline=True)
+    if image:
+        e.set_image(url=image)
     return e
+
+
+async def _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, product_url):
+    """DM the buyer the Purchase Receipt with Download / Leave a Review / View
+    Package Thread. Returns True if the DM sent."""
+    rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
+    product = (rec.get("product") if rec else "") or "your package"
+    image = (rec.get("image") if rec else "") or ""
+    thread_url = (rec.get("thread_url") if rec else "") or ""
+    files = (rec.get("files") if rec else []) or []
+    embed = _pkg_receipt_embed(acct["roblox_username"], acct.get("roblox_id"), price_str, product, product_url or thread_url, image)
+    view = discord.ui.View(timeout=None)
+    if files:
+        view.add_item(discord.ui.Button(label="Download", style=discord.ButtonStyle.success, custom_id=f"pkg_dl:{pkg_msg_id}"))
+    view.add_item(discord.ui.Button(label="Leave a Review", style=discord.ButtonStyle.secondary, custom_id=f"pkg_review:{pkg_msg_id}"))
+    if thread_url:
+        view.add_item(discord.ui.Button(label="View Package Thread", style=discord.ButtonStyle.link, url=thread_url))
+    try:
+        await interaction.user.send(embed=embed, view=view)
+        return True
+    except Exception:
+        return False
+
+
+async def _pkg_download(interaction, pkg_msg_id):
+    """Download button on the receipt — (re)send the Finished Product file(s)."""
+    await interaction.response.defer(thinking=True)
+    rec = await _pkg_files_get(pkg_msg_id)
+    refs = (rec or {}).get("files") or []
+    files = [f for f in [await _pkg_ref_to_file(r) for r in refs] if f]
+    if not files:
+        await interaction.followup.send(embed=error_embed("Nothing to download", "That file isn't available anymore — please open a ticket for help."))
+        return
+    await interaction.followup.send(content="Here's your finished product:", files=files)
+
+
+class _PkgReviewModal(discord.ui.Modal):
+    def __init__(self, pkg_msg_id):
+        super().__init__(title="Leave a Review", custom_id=f"pkgreview:{pkg_msg_id}", timeout=None)
+        self.add_item(discord.ui.TextInput(label="Rating (1–5)", custom_id="rating", style=discord.TextStyle.short, max_length=1, required=True))
+        self.add_item(discord.ui.TextInput(label="Your review", custom_id="comment", style=discord.TextStyle.paragraph, max_length=1000, required=False))
+
+
+async def _pkg_review(interaction, pkg_msg_id):
+    """Leave a Review button — open the review modal."""
+    try:
+        await interaction.response.send_modal(_PkgReviewModal(pkg_msg_id))
+    except Exception as e:
+        print(f"[Package] review modal failed: {e}")
+
+
+async def _pkg_review_submit(interaction, pkg_msg_id):
+    """Review modal submitted — post it to a #reviews-style channel in the origin
+    guild (if one exists) and thank the reviewer."""
+    vals = _collect_modal_values((interaction.data or {}).get("components"))
+    rating = "".join(ch for ch in str(vals.get("rating", "")) if ch.isdigit())[:1]
+    comment = str(vals.get("comment", "")).strip()
+    acct = await _pkg_lookup_roblox(interaction.user.id)
+    who = acct["roblox_username"] if acct else interaction.user.display_name
+    rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
+    product = (rec or {}).get("product") or "a package"
+    posted = False
+    guild = bot.get_guild(int(rec["guild_id"])) if (rec or {}).get("guild_id") else None
+    if guild:
+        rch = next((c for c in guild.text_channels if "review" in c.name.lower()), None)
+        if rch:
+            stars = "⭐" * (int(rating) if rating.isdigit() and 1 <= int(rating) <= 5 else 0)
+            e = discord.Embed(title="New Review", color=discord.Color(0x2b2d31), timestamp=discord.utils.utcnow())
+            e.add_field(name="Reviewer", value=who, inline=True)
+            e.add_field(name="Product", value=product, inline=True)
+            e.add_field(name="Rating", value=(stars or (rating or "—")), inline=True)
+            if comment:
+                e.add_field(name="Review", value=comment[:1024], inline=False)
+            try:
+                await rch.send(embed=e)
+                posted = True
+            except Exception as e2:
+                print(f"[Package] review post failed: {e2}")
+    try:
+        await interaction.response.send_message(
+            embed=success_embed("Thanks for the review!", "Your feedback has been recorded." if posted else "Your feedback has been recorded."))
+    except Exception:
+        pass
 
 
 async def _pkg_handle_buy(interaction, kind):
@@ -5785,16 +5972,18 @@ async def _pkg_flow_gamepass(interaction, acct):
         return
     res = await _robux_locker_call("gamepass_find", place_ids=PKG_GAMEPASS_PLACE_IDS, title=title)
     if not (isinstance(res, dict) and res.get("ok") and res.get("found")):
+        print(f"[Package] gamepass_find title={title!r} -> {res if not isinstance(res, dict) else res.get('debug', res)}")
         # No gamepass named after this package yet — auto-creation is the next
         # step; for now route them to staff.
         await interaction.followup.send(embed=error_embed(
             "No matching gamepass", f"No gamepass named **{title}** exists yet. Open a ticket in {help_to} and we'll create it."), ephemeral=True)
         return
     gp = res["gamepass"]
+    pkg_id = interaction.message.id if interaction.message else 0
     link = f"https://www.roblox.com/game-pass/{gp['id']}"
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(label="Buy Gamepass", style=discord.ButtonStyle.link, url=link))
-    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:gp:{gp['id']}"))
+    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:gp:{gp['id']}:{pkg_id}"))
     await interaction.followup.send(embed=info_embed(
         "Your Gamepass",
         f"Buy **{gp['name']}** (R$ {gp['price']}) with the button below.\nAfter you've bought it, click **Claim Package** and I'll deliver it."),
@@ -5815,9 +6004,10 @@ async def _pkg_flow_stripe(interaction, acct):
         await interaction.followup.send(embed=error_embed(
             "Stripe unavailable", f"Couldn't create a checkout link{f' — {err}' if err else ''}. Open a ticket in {help_to}."), ephemeral=True)
         return
+    pkg_id = interaction.message.id if interaction.message else 0
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(label="Pay with Stripe", style=discord.ButtonStyle.link, url=res["url"]))
-    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id="pkg_claim:stripe"))
+    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:stripe:{pkg_id}"))
     await interaction.followup.send(embed=info_embed(
         "Your Stripe checkout",
         f"Pay **${dollars:.2f}** with the button below. After paying, click **Claim Package**."),
@@ -5844,31 +6034,30 @@ async def _pkg_flow_select(interaction, acct):
     url = res["url"]
     m = re.search(r"catalog/(\d+)", url)
     asset_id = m.group(1) if m else ""
+    pkg_id = interaction.message.id if interaction.message else 0
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(label="Buy Shirt", style=discord.ButtonStyle.link, url=url))
-    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:shirt:{asset_id}"))
+    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:shirt:{asset_id}:{pkg_id}"))
     await interaction.followup.send(embed=info_embed(
         "Your Roblox Select shirt",
         f"Buy the shirt (R$ {robux}) with the button below.\nAfter you've bought it, click **Claim Package** and I'll deliver it."),
         view=view, ephemeral=True)
 
 
-async def _pkg_claim_stripe(interaction):
+async def _pkg_claim_stripe(interaction, pkg_msg_id=""):
     """Claim for a Stripe purchase — Stripe can't be tied to a Roblox account, so
-    we simply DM the thank-you (the purchase-log poller records the sale)."""
+    we simply DM the receipt (the purchase-log poller records the sale)."""
     await interaction.response.defer(ephemeral=True, thinking=True)
-    acct = await _pkg_lookup_roblox(interaction.user.id)
-    name = acct["roblox_username"] if acct else interaction.user.display_name
-    dm_ok = True
-    try:
-        await interaction.user.send(embed=_pkg_thankyou_embed(name, "Stripe package"))
-    except Exception:
-        dm_ok = False
-    msg = "Thanks! Check your DMs for the details." if dm_ok else "Thanks! (I couldn't DM you — enable DMs to get the receipt.)"
+    acct = await _pkg_lookup_roblox(interaction.user.id) or {"roblox_username": interaction.user.display_name, "roblox_id": ""}
+    rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
+    usd = _pkg_parse_usd((rec or {}).get("price_field") or "")
+    price_str = f"${usd:.2f}" if usd else ""
+    dm_ok = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, None)
+    msg = "Thanks! Check your DMs for the receipt." if dm_ok else "Thanks! (I couldn't DM you — enable DMs to get the receipt.)"
     await interaction.followup.send(embed=success_embed("Claimed", msg), ephemeral=True)
 
 
-async def _pkg_claim_shirt(interaction, asset_id):
+async def _pkg_claim_shirt(interaction, asset_id, pkg_msg_id=""):
     """Claim for a Roblox Select shirt: confirm the buyer owns the asset, DM them."""
     await interaction.response.defer(ephemeral=True, thinking=True)
     acct = await _pkg_lookup_roblox(interaction.user.id)
@@ -5891,16 +6080,15 @@ async def _pkg_claim_shirt(interaction, asset_id):
         await interaction.followup.send(embed=error_embed(
             "Not owned yet", "I don't see that shirt on your account yet. Buy it with the link, then click **Claim Package** again."), ephemeral=True)
         return
-    dm_ok = True
-    try:
-        await interaction.user.send(embed=_pkg_thankyou_embed(acct["roblox_username"], "Roblox Select package"))
-    except Exception:
-        dm_ok = False
-    msg = "Purchase confirmed — check your DMs for the details!" if dm_ok else "Purchase confirmed! (I couldn't DM you — enable DMs to get the receipt.)"
+    rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
+    robux = _pkg_parse_robux((rec or {}).get("price_field") or "")
+    price_str = f"R$ {robux}" if robux else ""
+    dm_ok = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, f"https://www.roblox.com/catalog/{asset_id}")
+    msg = "Purchase confirmed — check your DMs for the receipt!" if dm_ok else "Purchase confirmed! (I couldn't DM you — enable DMs to get the receipt.)"
     await interaction.followup.send(embed=success_embed("Claimed", msg), ephemeral=True)
 
 
-async def _pkg_claim_gamepass(interaction, gamepass_id):
+async def _pkg_claim_gamepass(interaction, gamepass_id, pkg_msg_id=""):
     """Claim button for a gamepass: confirm the buyer now owns it, then DM them."""
     await interaction.response.defer(ephemeral=True, thinking=True)
     acct = await _pkg_lookup_roblox(interaction.user.id)
@@ -5920,12 +6108,11 @@ async def _pkg_claim_gamepass(interaction, gamepass_id):
         await interaction.followup.send(embed=error_embed(
             "Not owned yet", "I don't see that gamepass on your account yet. Buy it with the link, then click **Claim Package** again."), ephemeral=True)
         return
-    dm_ok = True
-    try:
-        await interaction.user.send(embed=_pkg_thankyou_embed(acct["roblox_username"], "Gamepass package"))
-    except Exception:
-        dm_ok = False
-    msg = "Purchase confirmed — check your DMs for the details!" if dm_ok else "Purchase confirmed! (I couldn't DM you — enable DMs to get the receipt.)"
+    rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
+    robux = _pkg_parse_robux((rec or {}).get("price_field") or "")
+    price_str = f"R$ {robux}" if robux else ""
+    dm_ok = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, f"https://www.roblox.com/game-pass/{gamepass_id}")
+    msg = "Purchase confirmed — check your DMs for the receipt!" if dm_ok else "Purchase confirmed! (I couldn't DM you — enable DMs to get the receipt.)"
     await interaction.followup.send(embed=success_embed("Claimed", msg), ephemeral=True)
 
 
