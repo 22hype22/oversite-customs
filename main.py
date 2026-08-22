@@ -7128,9 +7128,15 @@ async def _music_announce(guild, track=None, error=None):
         pass
 
 
-async def _music_play_next(guild):
+_MUSIC_MAX_FAILS = 3  # consecutive rapid failures before we stop (anti-runaway)
+
+
+async def _music_play_next(guild, _depth=0):
     """Advance the queue: pick the next track (respecting loop/radio), re-resolve a
-    fresh stream URL, and play it. Chained via the FFmpeg `after` callback."""
+    fresh stream URL, and play it. Chained via the FFmpeg `after` callback.
+
+    Guarded against the runaway respawn loop: a source that dies almost instantly
+    is counted, and after a few in a row we stop instead of spawning ffmpeg forever."""
     st = _music_state(guild.id)
     vc = guild.voice_client
     if not vc or not vc.is_connected():
@@ -7151,8 +7157,20 @@ async def _music_play_next(guild):
     else:
         resolved, err = await _yt_resolve(track.get("webpage_url") or track.get("title"))
     if not (resolved and resolved.get("url")):
-        await _music_announce(guild, error=f"Skipped **{track.get('title')}** — {err or 'no stream'}")
-        return await _music_play_next(guild)
+        # Bounded skip through the queue — never recurse for radio/loop (that's an
+        # infinite loop) and cap depth so a bad queue can't blow the stack.
+        if not st.get("radio") and not st.get("loop") and st["queue"] and _depth < 5:
+            await _music_announce(guild, error=f"Skipped **{track.get('title')}** — {err or 'no stream'}")
+            return await _music_play_next(guild, _depth + 1)
+        st["current"] = None
+        await _music_announce(guild, error=f"Couldn't play **{track.get('title')}** — {err or 'no stream'}")
+        return
+    # Never stack ffmpeg processes: stop whatever is playing first.
+    try:
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+    except Exception:
+        pass
     try:
         vol = max(0.0, min(2.0, float(st.get("volume", 0.5))))
         # ffmpeg applies the volume filter and encodes straight to Opus, so no
@@ -7161,12 +7179,36 @@ async def _music_play_next(guild):
             resolved["url"], executable=_FFMPEG_EXE,
             before_options=_FFMPEG_BEFORE, options=f"-vn -af volume={vol:.2f}")
     except Exception as e:
+        st["current"] = None
         await _music_announce(guild, error=f"Couldn't play **{track.get('title')}**: {str(e)[:150]}")
-        return await _music_play_next(guild)
+        return
+
+    st["play_started"] = time.monotonic()
 
     def _after(e):
         if e:
             print(f"[Music] playback error: {e}")
+        # Circuit breaker: a source that errored after < 8s counts as a rapid
+        # failure. A few in a row and we stop, rather than respawning forever.
+        elapsed = time.monotonic() - st.get("play_started", 0)
+        if e and elapsed < 8:
+            st["fail_count"] = st.get("fail_count", 0) + 1
+        else:
+            st["fail_count"] = 0
+        if st.get("fail_count", 0) >= _MUSIC_MAX_FAILS:
+            st["fail_count"] = 0
+            st["radio"] = False
+            st["loop"] = False
+            st["current"] = None
+            print("[Music] too many rapid failures — stopping to avoid a respawn loop")
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    _music_announce(guild, error="This source keeps failing to play — stopped. "
+                                    "Try again, a different song, or another `/radio` genre."),
+                    bot.loop)
+            except Exception:
+                pass
+            return
         try:
             asyncio.run_coroutine_threadsafe(_music_play_next(guild), bot.loop)
         except Exception as ex:
@@ -7175,6 +7217,7 @@ async def _music_play_next(guild):
     try:
         vc.play(source, after=_after)
     except Exception as e:
+        st["current"] = None
         await _music_announce(guild, error=f"Playback failed: {str(e)[:150]}")
         return
     if not st.get("radio"):
@@ -7447,6 +7490,7 @@ async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
     st["text_id"] = interaction.channel_id
     st["radio"] = True
     st["loop"] = False
+    st["fail_count"] = 0
     st["queue"].clear()
     st["current"] = track
     if vc.is_playing() or vc.is_paused():
