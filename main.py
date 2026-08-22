@@ -6889,15 +6889,25 @@ def _resolve_cookiefile():
 
 _YT_COOKIEFILE = _resolve_cookiefile()
 
-# With cookies present, prefer the web clients (they actually use the cookies).
+# With cookies present, lead with web clients (they authenticate via the cookies
+# and clear the bot-check) but ALSO include the app clients (ios/tv) because the
+# web clients now gate their audio behind a PO token (SABR) and yt-dlp filters
+# those out — the app clients still return plain downloadable audio formats.
 # Without cookies, use the clients most likely to skip the bot-check anonymously.
 _YT_PLAYER_CLIENTS = [
     c.strip() for c in (
         os.environ.get("YTDLP_PLAYER_CLIENT")
-        or ("web_safari,web,mweb" if _YT_COOKIEFILE
+        or ("web_safari,web,ios,tv,mweb" if _YT_COOKIEFILE
             else "default,tv,ios,mweb,android")
     ).split(",") if c.strip()
 ]
+
+
+def _yt_extractor_args(clients):
+    # formats=missing_pot lets yt-dlp select formats that lack a PO token instead
+    # of discarding them (fixes "Requested format is not available" on web clients).
+    return {"youtube": {"player_client": list(clients), "formats": ["missing_pot"]}}
+
 
 _YTDL_OPTS = {
     "format": "bestaudio/best",
@@ -6908,7 +6918,7 @@ _YTDL_OPTS = {
     "source_address": "0.0.0.0",
     "cachedir": False,
     "skip_download": True,
-    "extractor_args": {"youtube": {"player_client": _YT_PLAYER_CLIENTS}},
+    "extractor_args": _yt_extractor_args(_YT_PLAYER_CLIENTS),
 }
 if _YT_COOKIEFILE:
     _YTDL_OPTS["cookiefile"] = _YT_COOKIEFILE
@@ -6967,13 +6977,12 @@ def _fmt_duration(sec):
 # ("page needs to be reloaded", player errors). With cookies we MUST stay on web
 # clients — the app clients (tv/ios/android) ignore cookies and get bot-flagged
 # from datacenter IPs. Without cookies, the app clients are the best anonymous bet.
-_YT_FALLBACK_CLIENTS = (["mweb", "web", "web_safari"] if _YT_COOKIEFILE
-                        else ["tv", "ios", "android", "mweb"])
+_YT_FALLBACK_CLIENTS = ["ios", "tv", "android", "mweb"]
 
 
 def _ytdl_opts_with_clients(clients):
     opts = dict(_YTDL_OPTS)
-    opts["extractor_args"] = {"youtube": {"player_client": list(clients)}}
+    opts["extractor_args"] = _yt_extractor_args(clients)
     return opts
 
 
@@ -7015,7 +7024,9 @@ async def _yt_resolve(query):
                         "`YOUTUBE_COOKIES`.")
                 return None, f"YouTube requires verification. {hint}"
             retryable = ("reload" in low or "player" in low or "unavailable" in low
-                         or "temporarily" in low or "failed to extract" in low)
+                         or "temporarily" in low or "failed to extract" in low
+                         or "requested format" in low or "not available" in low
+                         or "no video formats" in low)
             if not retryable:
                 return None, last_msg[:200]
             # else fall through to the next client set
