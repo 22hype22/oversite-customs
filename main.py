@@ -6865,12 +6865,6 @@ except Exception:
 #   2) Cookies — the reliable fix. Provide a Netscape cookies.txt either as a path
 #      (env YOUTUBE_COOKIEFILE) or inline content (env YOUTUBE_COOKIES); we write
 #      the inline form to a temp file at boot.
-_YT_PLAYER_CLIENTS = [
-    c.strip() for c in (os.environ.get("YTDLP_PLAYER_CLIENT")
-                        or "default,tv,ios,mweb,android").split(",") if c.strip()
-]
-
-
 def _resolve_cookiefile():
     path = (os.environ.get("YOUTUBE_COOKIEFILE") or "").strip()
     if path and os.path.exists(path):
@@ -6892,6 +6886,16 @@ def _resolve_cookiefile():
 
 
 _YT_COOKIEFILE = _resolve_cookiefile()
+
+# With cookies present, prefer the web clients (they actually use the cookies).
+# Without cookies, use the clients most likely to skip the bot-check anonymously.
+_YT_PLAYER_CLIENTS = [
+    c.strip() for c in (
+        os.environ.get("YTDLP_PLAYER_CLIENT")
+        or ("web_safari,web,mweb,default" if _YT_COOKIEFILE
+            else "default,tv,ios,mweb,android")
+    ).split(",") if c.strip()
+]
 
 _YTDL_OPTS = {
     "format": "bestaudio/best",
