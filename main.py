@@ -2647,14 +2647,12 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
 
     embed, buttons = _pkg_build_embed(final)
 
-    view = None
-    if buttons:
-        view = discord.ui.View(timeout=None)
-        for (label, url) in buttons[:5]:
-            if url:
-                view.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.link, url=url))
-            else:
-                view.add_item(discord.ui.Button(label=label[:80], style=discord.ButtonStyle.success, custom_id="pkg_claim"))
+    # Every package card gets the three purchase buttons. Each one gates the
+    # buyer behind Roblox verification, then runs its flow (built in phases).
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="Gamepass", style=discord.ButtonStyle.primary, custom_id="pkg_buy:gamepass", emoji="🎮"))
+    view.add_item(discord.ui.Button(label="Roblox Select", style=discord.ButtonStyle.primary, custom_id="pkg_buy:select", emoji="👕"))
+    view.add_item(discord.ui.Button(label="Stripe", style=discord.ButtonStyle.primary, custom_id="pkg_buy:stripe", emoji="💳"))
 
     async def _banner_file(f):
         """Download an {SFile} Preview so it can post as a real native image."""
@@ -3702,6 +3700,8 @@ async def on_interaction(interaction: discord.Interaction):
         await _joinsetup_open_one(interaction, si, ii)
     elif cid == "joinsetup_done":
         await _joinsetup_done(interaction)
+    elif cid.startswith("pkg_buy:"):
+        await _pkg_handle_buy(interaction, cid.split(":", 1)[1])
     elif cid == "pkg_claim":
         # Package card "Claim" button. Behavior is a simple acknowledgement for
         # now — the real claim flow can be wired later.
@@ -5632,6 +5632,45 @@ async def _post_one_panel(ch, comps):
         await _replace_ticket_panel(ch.id, msg.id)
     except Exception as e:
         print(f"[Tickets] panel post failed: {e}")
+
+
+async def _pkg_lookup_roblox(discord_id):
+    """Return {roblox_id, roblox_username} for a verified member, or None."""
+    try:
+        session = await get_poll_session()
+        async with session.post(
+            f"{SUPABASE_FN_URL}/roblox-verify",
+            headers=_fn_headers(),
+            json={"action": "lookup", "bot_id": BOT_ORDER_ID, "discord_user_id": str(discord_id)},
+        ) as r:
+            data = await r.json()
+        if isinstance(data, dict) and data.get("ok") and data.get("verified"):
+            return {"roblox_id": str(data.get("roblox_id") or ""),
+                    "roblox_username": str(data.get("roblox_username") or "")}
+    except Exception as e:
+        print(f"[Package] verify lookup failed: {e}")
+    return None
+
+
+async def _pkg_handle_buy(interaction, kind):
+    """A buyer clicked Gamepass / Roblox Select / Stripe on a package card.
+    Everyone is gated behind Roblox verification first; if they're not linked
+    we point them at the verification channel."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    acct = await _pkg_lookup_roblox(interaction.user.id)
+    if not acct:
+        vch = str(roblox_config.get("channel_id") or "").strip()
+        where = f"<#{vch}>" if vch else "the verification channel"
+        await interaction.followup.send(
+            embed=error_embed("Verify first", f"Link your Roblox account before buying — head to {where}, verify, then try again."),
+            ephemeral=True)
+        return
+    # Per-flow purchase logic (gamepass match / shirt assign / stripe checkout)
+    # is built in the next phases; for now confirm the linked account.
+    label = {"gamepass": "Gamepass", "select": "Roblox Select", "stripe": "Stripe"}.get(kind, kind)
+    await interaction.followup.send(
+        embed=info_embed("Almost there", f"Linked as **{acct['roblox_username']}**. The **{label}** purchase flow is being finished — hang tight."),
+        ephemeral=True)
 
 
 async def apply_roblox_verification(payload):
