@@ -6963,35 +6963,66 @@ def _fmt_duration(sec):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+# Clients to fall back to when the primary set hits a transient YouTube error
+# ("page needs to be reloaded", live-stream reload, player errors). These are
+# resilient for actual playback and don't need a PO token.
+_YT_FALLBACK_CLIENTS = ["tv", "ios", "android", "mweb"]
+
+
+def _ytdl_opts_with_clients(clients):
+    opts = dict(_YTDL_OPTS)
+    opts["extractor_args"] = {"youtube": {"player_client": list(clients)}}
+    return opts
+
+
 async def _yt_resolve(query):
-    """Resolve a search term / URL into a track dict via yt-dlp (off-thread)."""
+    """Resolve a search term / URL into a track dict via yt-dlp (off-thread).
+
+    Retries once with fallback player clients on transient YouTube errors like
+    'The page needs to be reloaded' (common on live streams / stale sessions)."""
     if yt_dlp is None:
         return None, "yt-dlp isn't installed."
 
-    def _extract():
-        with yt_dlp.YoutubeDL(_YTDL_OPTS) as ydl:
+    def _extract(opts):
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(query, download=False)
             if isinstance(info, dict) and "entries" in info:
                 entries = [e for e in (info.get("entries") or []) if e]
                 info = entries[0] if entries else None
             return info
 
-    try:
-        info = await asyncio.to_thread(_extract)
-    except Exception as e:
-        msg = str(e)
-        print(f"[Music] yt-dlp extract failed: {msg[:300]}")
-        low = msg.lower()
-        if "sign in to confirm" in low or "not a bot" in low or "cookies" in low:
-            hint = ("YouTube is blocking this server's IP. Add a `YOUTUBE_COOKIES` "
-                    "env var (exported cookies.txt from a logged-in browser) on the "
-                    "host and redeploy." if not _YT_COOKIEFILE else
-                    "YouTube rejected the request even with cookies — the cookies may "
-                    "be expired. Re-export a fresh cookies.txt and update `YOUTUBE_COOKIES`.")
-            return None, f"YouTube requires verification. {hint}"
-        return None, msg[:200]
+    info = None
+    last_msg = ""
+    attempts = [(_YTDL_OPTS, _YT_PLAYER_CLIENTS),
+                (_ytdl_opts_with_clients(_YT_FALLBACK_CLIENTS), _YT_FALLBACK_CLIENTS)]
+    for opts, clients in attempts:
+        try:
+            info = await asyncio.to_thread(_extract, opts)
+            if info:
+                break
+        except Exception as e:
+            last_msg = str(e)
+            low = last_msg.lower()
+            print(f"[Music] yt-dlp extract failed (clients={clients}): {last_msg[:280]}")
+            if "sign in to confirm" in low or "not a bot" in low:
+                hint = ("YouTube is blocking this server's IP. Add a `YOUTUBE_COOKIES` "
+                        "env var (exported cookies.txt from a logged-in browser) on the "
+                        "host and redeploy." if not _YT_COOKIEFILE else
+                        "YouTube rejected the request even with cookies — the cookies "
+                        "may be expired. Re-export a fresh cookies.txt and update "
+                        "`YOUTUBE_COOKIES`.")
+                return None, f"YouTube requires verification. {hint}"
+            retryable = ("reload" in low or "player" in low or "unavailable" in low
+                         or "temporarily" in low or "failed to extract" in low)
+            if not retryable:
+                return None, last_msg[:200]
+            # else fall through to the next client set
     if not info:
-        return None, "No results."
+        low = last_msg.lower()
+        if "reload" in low:
+            return None, ("YouTube returned a reload error for that video (common with "
+                          "live streams). Try a normal song, or a different search.")
+        return None, (last_msg[:200] or "No results.")
     return {
         "title": info.get("title") or "Unknown",
         "url": info.get("url"),
@@ -7299,7 +7330,16 @@ async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
         await interaction.followup.send(embed=err, ephemeral=True)
         return
     g = (genre or music_config.get("radio_genre") or "pop").strip()
-    track, terr = await _yt_resolve(f"ytsearch1:{g} music 24/7 radio live")
+    # Use a long uploaded mix rather than a live 24/7 broadcast — live streams
+    # frequently fail with "The page needs to be reloaded". The radio flag loops
+    # the current track, so a long mix keeps playing continuously.
+    track = None
+    for q in (f"ytsearch1:{g} music mix 1 hour",
+              f"ytsearch1:{g} songs playlist mix",
+              f"ytsearch1:{g} music"):
+        track, terr = await _yt_resolve(q)
+        if track:
+            break
     if not track:
         await interaction.followup.send(embed=error_embed("Couldn't start radio", terr or "No stream found."), ephemeral=True)
         return
