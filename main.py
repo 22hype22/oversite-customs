@@ -6057,7 +6057,7 @@ class _PkgBuyModal(discord.ui.Modal):
         self.agree = discord.ui.Checkbox(custom_id="agree")
         self.add_item(discord.ui.Label(text="Recipient", description="Buy for yourself, or gift it to someone.", component=self.recipient))
         self.add_item(discord.ui.Label(text="Gift Recipient (required if gifting)", component=self.ruser))
-        self.add_item(discord.ui.Label(text="I agree to the Oversite Customs Sales & Refund Policy", description="Required before checkout.", component=self.agree))
+        self.add_item(discord.ui.Label(text="Oversite Customs Sales & Refund Policy", description="Check to agree — required before checkout.", component=self.agree))
 
     async def on_submit(self, interaction):
         if not self.agree.value:
