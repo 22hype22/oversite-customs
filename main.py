@@ -2587,10 +2587,12 @@ def _pkg_build_embed(comps):
 
     walk(comps or [])
     flush_trailing()
+    # Blend the accent bar into the embed background so there's no visible side
+    # bar (matches the "invisible bar" look). 0x2b2d31 = Discord dark embed bg.
     embed = discord.Embed(
         title=(title[:256] or None), url=(title_url or None),
         description=("\n".join(desc).strip()[:4096] or None),
-        color=color, timestamp=discord.utils.utcnow(),
+        color=discord.Color(0x2b2d31), timestamp=discord.utils.utcnow(),
     )
     for (n, v, inl) in efields[:25]:
         embed.add_field(name=(n or "​")[:256], value=(v or "​")[:1024], inline=inl)
