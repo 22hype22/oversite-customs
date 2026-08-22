@@ -124,6 +124,22 @@ portfolio_config = {"channel_id": "", "components": [], "allowed_role_ids": []}
 # as Messages). Running /package channel:#x posts that design to the channel.
 packages_config = {"panel_components": [], "allowed_role_ids": []}
 
+# ---- Music / DJ (dashboard "Music Add-On" + "Auto Radio" blocks) ----
+# Voice playback via yt-dlp + FFmpeg. `enabled` flips true once the dashboard
+# saves the Music Add-On config. Needs PyNaCl + yt-dlp (requirements.txt) and the
+# ffmpeg binary on the host (nixpacks.toml).
+music_config = {
+    "enabled": False,
+    "dj_role_ids": [],
+    "everyone_can_queue": True,
+    "max_queue_length": 100,
+    "default_volume": 50,
+    "auto_leave": True,
+    "now_playing_v2": False,
+    "radio_channel_id": "",
+    "radio_genre": "pop",
+}
+
 # ---- Payment ----
 # The dashboard "Payment" block only picks who may run /payment.
 payment_config = {"allowed_role_ids": []}
@@ -5317,6 +5333,26 @@ async def apply_config(feature, cfg, post_panel=False):
         packages_config["panel_components"] = comps if isinstance(comps, list) else []
         packages_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
         print(f"[Config] packages — design {len(packages_config['panel_components'])} roles {packages_config['allowed_role_ids']}")
+    elif feature in ("music-addon", "customs-music-addon"):
+        music_config["enabled"] = True
+        music_config["dj_role_ids"] = [str(x) for x in (cfg.get("dj_role_ids") or []) if x]
+        music_config["everyone_can_queue"] = bool(cfg.get("everyone_can_queue", True))
+        try:
+            music_config["max_queue_length"] = max(1, int(cfg.get("max_queue_length") or 100))
+        except Exception:
+            music_config["max_queue_length"] = 100
+        try:
+            music_config["default_volume"] = max(1, min(100, int(cfg.get("default_volume") or 50)))
+        except Exception:
+            music_config["default_volume"] = 50
+        music_config["auto_leave"] = bool(cfg.get("auto_leave", True))
+        music_config["now_playing_v2"] = bool(cfg.get("now_playing_v2", False))
+        print(f"[Config] music — dj_roles {music_config['dj_role_ids']} everyone_queue {music_config['everyone_can_queue']} maxq {music_config['max_queue_length']} vol {music_config['default_volume']} yt_dlp {'yes' if yt_dlp else 'MISSING'}")
+    elif feature in ("auto-radio", "customs-auto-radio"):
+        music_config["enabled"] = True  # radio implies the music engine is on
+        music_config["radio_channel_id"] = str(cfg.get("voice_channel_id") or "")
+        music_config["radio_genre"] = str(cfg.get("genre") or "pop")
+        print(f"[Config] auto-radio — channel {music_config['radio_channel_id']} genre {music_config['radio_genre']}")
     elif feature in FORM_LOG_DEFS:
         # Form logs (/orderlog, /infraction, /promote): pop a form from the
         # {Question:} tokens in the design, then post the completed message to the
@@ -6491,7 +6527,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
@@ -6771,6 +6807,415 @@ async def record_metrics_loop():
 @record_metrics_loop.before_loop
 async def before_metrics():
     await bot.wait_until_ready()
+
+
+# ============================ Music / DJ ============================
+# On-demand music (/play, /skip, /queue, …) + a simple genre radio, gated by the
+# DJ roles from the dashboard. Audio comes from yt-dlp streams played through
+# FFmpeg over Discord voice.
+try:
+    import yt_dlp
+except Exception:
+    yt_dlp = None
+
+_YTDL_OPTS = {
+    "format": "bestaudio/best",
+    "noplaylist": True,
+    "quiet": True,
+    "no_warnings": True,
+    "default_search": "ytsearch",
+    "source_address": "0.0.0.0",
+    "cachedir": False,
+    "skip_download": True,
+}
+_FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+_FFMPEG_OPTS = "-vn"
+
+# guild_id(str) -> {"queue":[track], "current":track, "volume":0-1, "loop":bool,
+#                   "radio":bool, "text_id":int}
+_music = {}
+
+
+def _music_state(guild_id):
+    gid = str(guild_id)
+    st = _music.get(gid)
+    if st is None:
+        vol = max(1, min(100, int(music_config.get("default_volume") or 50)))
+        st = _music[gid] = {"queue": [], "current": None, "volume": vol / 100.0,
+                            "loop": False, "radio": False, "text_id": None}
+    return st
+
+
+def _music_is_dj(member):
+    try:
+        if member.guild_permissions.manage_guild:
+            return True
+    except Exception:
+        pass
+    return has_any_role(member, music_config.get("dj_role_ids", []))
+
+
+def _music_gate(interaction, need_dj=False):
+    """(ok, error_embed). Checks the addon is enabled, deps are present, and the
+    caller may control playback."""
+    if not music_config.get("enabled"):
+        return False, error_embed("Music is off", "The Music Add-On isn't enabled in the dashboard.")
+    if yt_dlp is None:
+        return False, error_embed("Music unavailable", "The host is missing `yt-dlp` — add it to requirements and redeploy.")
+    if need_dj and not _music_is_dj(interaction.user):
+        return False, error_embed("DJ only", "Only a DJ (or Manage Server) can control playback.")
+    return True, None
+
+
+def _fmt_duration(sec):
+    try:
+        sec = int(sec or 0)
+    except Exception:
+        return ""
+    if sec <= 0:
+        return "🔴 live"
+    m, s = divmod(sec, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+async def _yt_resolve(query):
+    """Resolve a search term / URL into a track dict via yt-dlp (off-thread)."""
+    if yt_dlp is None:
+        return None, "yt-dlp isn't installed."
+
+    def _extract():
+        with yt_dlp.YoutubeDL(_YTDL_OPTS) as ydl:
+            info = ydl.extract_info(query, download=False)
+            if isinstance(info, dict) and "entries" in info:
+                entries = [e for e in (info.get("entries") or []) if e]
+                info = entries[0] if entries else None
+            return info
+
+    try:
+        info = await asyncio.to_thread(_extract)
+    except Exception as e:
+        return None, str(e)[:200]
+    if not info:
+        return None, "No results."
+    return {
+        "title": info.get("title") or "Unknown",
+        "url": info.get("url"),
+        "webpage_url": info.get("webpage_url") or query,
+        "duration": info.get("duration") or 0,
+        "thumbnail": info.get("thumbnail") or "",
+    }, None
+
+
+def _music_np_embed(track, st):
+    e = discord.Embed(title="Now Playing",
+                      description=f"[{track.get('title', 'Unknown')}]({track.get('webpage_url') or ''})",
+                      color=ACCENT)
+    if track.get("requester_name"):
+        e.add_field(name="Requested by", value=track["requester_name"], inline=True)
+    dur = _fmt_duration(track.get("duration"))
+    if dur:
+        e.add_field(name="Length", value=dur, inline=True)
+    e.add_field(name="Volume", value=f"{int(st.get('volume', 0.5) * 100)}%", inline=True)
+    if track.get("thumbnail"):
+        e.set_thumbnail(url=track["thumbnail"])
+    return e
+
+
+async def _music_announce(guild, track=None, error=None):
+    st = _music_state(guild.id)
+    ch = guild.get_channel(int(st["text_id"])) if st.get("text_id") else None
+    if not ch:
+        return
+    try:
+        if error:
+            await ch.send(embed=error_embed("Music", error))
+        elif track:
+            await ch.send(embed=_music_np_embed(track, st))
+    except Exception:
+        pass
+
+
+async def _music_play_next(guild):
+    """Advance the queue: pick the next track (respecting loop/radio), re-resolve a
+    fresh stream URL, and play it. Chained via the FFmpeg `after` callback."""
+    st = _music_state(guild.id)
+    vc = guild.voice_client
+    if not vc or not vc.is_connected():
+        st["current"] = None
+        return
+    if (st.get("loop") or st.get("radio")) and st.get("current"):
+        track = st["current"]
+    elif st["queue"]:
+        track = st["queue"].pop(0)
+    else:
+        st["current"] = None
+        return
+    st["current"] = track
+    resolved, err = await _yt_resolve(track.get("webpage_url") or track.get("title"))
+    if not (resolved and resolved.get("url")):
+        await _music_announce(guild, error=f"Skipped **{track.get('title')}** — {err or 'no stream'}")
+        return await _music_play_next(guild)
+    try:
+        source = discord.FFmpegPCMAudio(resolved["url"], before_options=_FFMPEG_BEFORE, options=_FFMPEG_OPTS)
+        source = discord.PCMVolumeTransformer(source, volume=st["volume"])
+    except Exception as e:
+        await _music_announce(guild, error=f"Couldn't play **{track.get('title')}**: {str(e)[:150]}")
+        return await _music_play_next(guild)
+
+    def _after(e):
+        if e:
+            print(f"[Music] playback error: {e}")
+        try:
+            asyncio.run_coroutine_threadsafe(_music_play_next(guild), bot.loop)
+        except Exception as ex:
+            print(f"[Music] after-hook failed: {ex}")
+
+    try:
+        vc.play(source, after=_after)
+    except Exception as e:
+        await _music_announce(guild, error=f"Playback failed: {str(e)[:150]}")
+        return
+    if not st.get("radio"):
+        await _music_announce(guild, track=track)
+
+
+async def _music_connect(interaction):
+    """Join the caller's voice channel (or move to it). Returns (vc, err_embed)."""
+    member = interaction.user
+    voice = getattr(member, "voice", None)
+    if not (voice and voice.channel):
+        return None, error_embed("Join voice first", "Hop into a voice channel, then try again.")
+    guild = interaction.guild
+    vc = guild.voice_client
+    try:
+        if vc and vc.is_connected():
+            if vc.channel != voice.channel:
+                await vc.move_to(voice.channel)
+        else:
+            vc = await voice.channel.connect()
+    except Exception as e:
+        return None, error_embed("Couldn't join", f"I couldn't connect to voice: {str(e)[:150]}")
+    return vc, None
+
+
+@bot.tree.command(name="play", description="Play a song in your voice channel")
+@app_commands.describe(query="A song name, or a YouTube/SoundCloud link")
+async def play_cmd(interaction: discord.Interaction, query: str):
+    ok, err = _music_gate(interaction)
+    if not ok:
+        await interaction.response.send_message(embed=err, ephemeral=True)
+        return
+    if not music_config.get("everyone_can_queue", True) and not _music_is_dj(interaction.user):
+        await interaction.response.send_message(embed=error_embed("DJ only", "Only a DJ can add songs right now."), ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    st = _music_state(interaction.guild_id)
+    if len(st["queue"]) >= int(music_config.get("max_queue_length") or 100):
+        await interaction.followup.send(embed=error_embed("Queue full", f"The queue is capped at {music_config.get('max_queue_length')} songs."), ephemeral=True)
+        return
+    vc, err = await _music_connect(interaction)
+    if not vc:
+        await interaction.followup.send(embed=err, ephemeral=True)
+        return
+    st["text_id"] = interaction.channel_id
+    st["radio"] = False
+    track, terr = await _yt_resolve(query)
+    if not track:
+        await interaction.followup.send(embed=error_embed("Couldn't find it", terr or "No results."), ephemeral=True)
+        return
+    track["requester_id"] = str(interaction.user.id)
+    track["requester_name"] = interaction.user.display_name
+    st["queue"].append(track)
+    pos = len(st["queue"])
+    if not vc.is_playing() and not vc.is_paused() and st.get("current") is None:
+        await _music_play_next(interaction.guild)
+        await interaction.followup.send(embed=success_embed("Playing", f"**{track['title']}**"), ephemeral=True)
+    else:
+        await interaction.followup.send(embed=success_embed("Added to queue", f"**{track['title']}** — #{pos} in queue"), ephemeral=True)
+
+
+@bot.tree.command(name="skip", description="Skip the current song")
+async def skip_cmd(interaction: discord.Interaction):
+    ok, err = _music_gate(interaction)
+    if not ok:
+        await interaction.response.send_message(embed=err, ephemeral=True)
+        return
+    st = _music_state(interaction.guild_id)
+    cur = st.get("current")
+    is_requester = cur and str(cur.get("requester_id")) == str(interaction.user.id)
+    if not (_music_is_dj(interaction.user) or is_requester):
+        await interaction.response.send_message(embed=error_embed("Can't skip", "Only a DJ or the person who queued this can skip it."), ephemeral=True)
+        return
+    vc = interaction.guild.voice_client
+    if not (vc and (vc.is_playing() or vc.is_paused())):
+        await interaction.response.send_message(embed=error_embed("Nothing playing", "There's nothing to skip."), ephemeral=True)
+        return
+    st["loop"] = False
+    vc.stop()  # triggers _after -> next track
+    await interaction.response.send_message(embed=success_embed("Skipped", "Playing the next song…"), ephemeral=True)
+
+
+@bot.tree.command(name="stop", description="Stop the music and clear the queue (DJ)")
+async def stop_cmd(interaction: discord.Interaction):
+    ok, err = _music_gate(interaction, need_dj=True)
+    if not ok:
+        await interaction.response.send_message(embed=err, ephemeral=True)
+        return
+    st = _music_state(interaction.guild_id)
+    st["queue"].clear()
+    st["current"] = None
+    st["loop"] = False
+    st["radio"] = False
+    vc = interaction.guild.voice_client
+    if vc:
+        try:
+            vc.stop()
+            await vc.disconnect()
+        except Exception:
+            pass
+    await interaction.response.send_message(embed=success_embed("Stopped", "Queue cleared and left the channel."), ephemeral=True)
+
+
+@bot.tree.command(name="pause", description="Pause the music (DJ)")
+async def pause_cmd(interaction: discord.Interaction):
+    ok, err = _music_gate(interaction, need_dj=True)
+    if not ok:
+        await interaction.response.send_message(embed=err, ephemeral=True)
+        return
+    vc = interaction.guild.voice_client
+    if vc and vc.is_playing():
+        vc.pause()
+        await interaction.response.send_message(embed=success_embed("Paused", "Use /resume to continue."), ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=error_embed("Nothing playing", "There's nothing to pause."), ephemeral=True)
+
+
+@bot.tree.command(name="resume", description="Resume the music (DJ)")
+async def resume_cmd(interaction: discord.Interaction):
+    ok, err = _music_gate(interaction, need_dj=True)
+    if not ok:
+        await interaction.response.send_message(embed=err, ephemeral=True)
+        return
+    vc = interaction.guild.voice_client
+    if vc and vc.is_paused():
+        vc.resume()
+        await interaction.response.send_message(embed=success_embed("Resumed", "Back to it."), ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=error_embed("Not paused", "Nothing is paused."), ephemeral=True)
+
+
+@bot.tree.command(name="volume", description="Set the volume 1–100 (DJ)")
+@app_commands.describe(percent="Volume from 1 to 100")
+async def volume_cmd(interaction: discord.Interaction, percent: app_commands.Range[int, 1, 100]):
+    ok, err = _music_gate(interaction, need_dj=True)
+    if not ok:
+        await interaction.response.send_message(embed=err, ephemeral=True)
+        return
+    st = _music_state(interaction.guild_id)
+    st["volume"] = percent / 100.0
+    vc = interaction.guild.voice_client
+    if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
+        vc.source.volume = st["volume"]
+    await interaction.response.send_message(embed=success_embed("Volume", f"Set to **{percent}%**."), ephemeral=True)
+
+
+@bot.tree.command(name="loop", description="Toggle looping the current song")
+async def loop_cmd(interaction: discord.Interaction):
+    ok, err = _music_gate(interaction, need_dj=True)
+    if not ok:
+        await interaction.response.send_message(embed=err, ephemeral=True)
+        return
+    st = _music_state(interaction.guild_id)
+    st["loop"] = not st.get("loop")
+    await interaction.response.send_message(embed=success_embed("Loop", "Looping **on**." if st["loop"] else "Looping **off**."), ephemeral=True)
+
+
+@bot.tree.command(name="queue", description="Show the music queue")
+async def queue_cmd(interaction: discord.Interaction):
+    ok, err = _music_gate(interaction)
+    if not ok:
+        await interaction.response.send_message(embed=err, ephemeral=True)
+        return
+    st = _music_state(interaction.guild_id)
+    cur = st.get("current")
+    lines = []
+    if cur:
+        lines.append(f"**Now:** [{cur.get('title')}]({cur.get('webpage_url') or ''}) — {cur.get('requester_name', '')}")
+    if st["queue"]:
+        for i, t in enumerate(st["queue"][:15], 1):
+            lines.append(f"`{i}.` {t.get('title')} — {t.get('requester_name', '')}")
+        extra = len(st["queue"]) - 15
+        if extra > 0:
+            lines.append(f"…and **{extra}** more")
+    if not lines:
+        lines = ["The queue is empty. Add a song with `/play`."]
+    await interaction.response.send_message(embed=info_embed("Music Queue", "\n".join(lines)[:4000]), ephemeral=True)
+
+
+@bot.tree.command(name="nowplaying", description="Show the current song")
+async def nowplaying_cmd(interaction: discord.Interaction):
+    ok, err = _music_gate(interaction)
+    if not ok:
+        await interaction.response.send_message(embed=err, ephemeral=True)
+        return
+    st = _music_state(interaction.guild_id)
+    if not st.get("current"):
+        await interaction.response.send_message(embed=error_embed("Nothing playing", "Queue a song with `/play`."), ephemeral=True)
+        return
+    await interaction.response.send_message(embed=_music_np_embed(st["current"], st), ephemeral=True)
+
+
+@bot.tree.command(name="radio", description="Start a 24/7 genre radio in your voice channel (DJ)")
+@app_commands.describe(genre="Genre to stream (defaults to the dashboard setting)")
+async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
+    ok, err = _music_gate(interaction, need_dj=True)
+    if not ok:
+        await interaction.response.send_message(embed=err, ephemeral=True)
+        return
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    vc, err = await _music_connect(interaction)
+    if not vc:
+        await interaction.followup.send(embed=err, ephemeral=True)
+        return
+    g = (genre or music_config.get("radio_genre") or "pop").strip()
+    track, terr = await _yt_resolve(f"ytsearch1:{g} music 24/7 radio live")
+    if not track:
+        await interaction.followup.send(embed=error_embed("Couldn't start radio", terr or "No stream found."), ephemeral=True)
+        return
+    st = _music_state(interaction.guild_id)
+    st["text_id"] = interaction.channel_id
+    st["radio"] = True
+    st["loop"] = False
+    st["queue"].clear()
+    st["current"] = track
+    if vc.is_playing() or vc.is_paused():
+        vc.stop()
+    await _music_play_next(interaction.guild)
+    await interaction.followup.send(embed=success_embed("Radio on", f"Now streaming **{g}** radio. Use `/stop` to end it."), ephemeral=True)
+
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Auto-leave: when the bot is left alone in a voice channel, disconnect (if
+    the dashboard's Auto-leave toggle is on)."""
+    try:
+        if member.bot or not music_config.get("auto_leave", True):
+            return
+        guild = member.guild
+        vc = guild.voice_client if guild else None
+        if not (vc and vc.channel):
+            return
+        humans = [m for m in vc.channel.members if not m.bot]
+        if not humans:
+            st = _music_state(guild.id)
+            st["queue"].clear(); st["current"] = None; st["radio"] = False; st["loop"] = False
+            try:
+                await vc.disconnect()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[Music] voice-state hook error: {e}")
 
 
 async def apply_bot_identity():
