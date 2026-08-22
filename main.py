@@ -3724,6 +3724,10 @@ async def on_interaction(interaction: discord.Interaction):
         await _pkg_handle_buy(interaction, cid.split(":", 1)[1])
     elif cid.startswith("pkg_claim:gp:"):
         await _pkg_claim_gamepass(interaction, cid.split(":", 2)[2])
+    elif cid.startswith("pkg_claim:shirt:"):
+        await _pkg_claim_shirt(interaction, cid.split(":", 2)[2])
+    elif cid == "pkg_claim:stripe":
+        await _pkg_claim_stripe(interaction)
     elif cid == "pkg_claim":
         # Package card "Claim" button. Behavior is a simple acknowledgement for
         # now — the real claim flow can be wired later.
@@ -5701,6 +5705,33 @@ def _pkg_parse_robux(text):
     return 0
 
 
+def _pkg_parse_usd(text):
+    """Pull the USD amount ($ …, not R$) out of a price like '$500 R$500'."""
+    m = re.search(r"(?<!R)\$\s*([\d,]+(?:\.\d+)?)", str(text or ""))
+    if m:
+        try:
+            return float(m.group(1).replace(",", ""))
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def _pkg_title(interaction):
+    """The package's title (from the card heading) — used to match a gamepass."""
+    try:
+        for emb in (interaction.message.embeds or []):
+            if emb.title:
+                return str(emb.title).strip()
+    except Exception:
+        pass
+    return ""
+
+
+# Rotates through the six shirt slots (1–6) so each Roblox Select buyer gets the
+# next shirt in the list. In-memory: resets to the first slot on bot restart.
+_pkg_shirt_cursor = {"n": 0}
+
+
 def _pkg_help_mention(guild):
     """A '#dashboard'-style mention for 'open a ticket', resolved by name."""
     if guild:
@@ -5735,26 +5766,29 @@ async def _pkg_handle_buy(interaction, kind):
         return
     if kind == "gamepass":
         await _pkg_flow_gamepass(interaction, acct)
-        return
-    label = {"select": "Roblox Select", "stripe": "Stripe"}.get(kind, kind)
-    await interaction.followup.send(
-        embed=info_embed("Almost there", f"Linked as **{acct['roblox_username']}**. The **{label}** purchase flow is being finished — hang tight."),
-        ephemeral=True)
+    elif kind == "select":
+        await _pkg_flow_select(interaction, acct)
+    elif kind == "stripe":
+        await _pkg_flow_stripe(interaction, acct)
+    else:
+        await interaction.followup.send(embed=error_embed("Unknown option", "That button isn't wired up."), ephemeral=True)
 
 
 async def _pkg_flow_gamepass(interaction, acct):
-    """Find the game pass priced at the package's R$ amount and hand the buyer
+    """Match the package title to a game pass in our stores and hand the buyer
     the purchase link plus a Claim button that verifies ownership."""
-    robux = _pkg_parse_robux(_pkg_price_field(interaction))
+    title = _pkg_title(interaction)
     help_to = _pkg_help_mention(interaction.guild)
-    if not robux:
+    if not title:
         await interaction.followup.send(embed=error_embed(
-            "Couldn't read the price", f"I couldn't find an R$ amount on this package. Open a ticket in {help_to}."), ephemeral=True)
+            "No package title", f"This package has no title to match a gamepass. Open a ticket in {help_to}."), ephemeral=True)
         return
-    res = await _robux_locker_call("gamepass_find", place_ids=PKG_GAMEPASS_PLACE_IDS, robux=robux)
+    res = await _robux_locker_call("gamepass_find", place_ids=PKG_GAMEPASS_PLACE_IDS, title=title)
     if not (isinstance(res, dict) and res.get("ok") and res.get("found")):
+        # No gamepass named after this package yet — auto-creation is the next
+        # step; for now route them to staff.
         await interaction.followup.send(embed=error_embed(
-            "No matching gamepass", f"No game pass is priced at **R$ {robux}** in our stores. Open a ticket in {help_to} and we'll sort it."), ephemeral=True)
+            "No matching gamepass", f"No gamepass named **{title}** exists yet. Open a ticket in {help_to} and we'll create it."), ephemeral=True)
         return
     gp = res["gamepass"]
     link = f"https://www.roblox.com/game-pass/{gp['id']}"
@@ -5765,6 +5799,105 @@ async def _pkg_flow_gamepass(interaction, acct):
         "Your Gamepass",
         f"Buy **{gp['name']}** (R$ {gp['price']}) with the button below.\nAfter you've bought it, click **Claim Package** and I'll deliver it."),
         view=view, ephemeral=True)
+
+
+async def _pkg_flow_stripe(interaction, acct):
+    """Create a Stripe payment link for the package's $ amount and hand it over."""
+    dollars = _pkg_parse_usd(_pkg_price_field(interaction))
+    help_to = _pkg_help_mention(interaction.guild)
+    if not dollars:
+        await interaction.followup.send(embed=error_embed(
+            "Couldn't read the price", f"I couldn't find a $ amount on this package. Open a ticket in {help_to}."), ephemeral=True)
+        return
+    res = await _payments_call("", method="stripe", price=dollars)
+    if not (isinstance(res, dict) and res.get("ok") and res.get("url")):
+        err = (res or {}).get("error") if isinstance(res, dict) else None
+        await interaction.followup.send(embed=error_embed(
+            "Stripe unavailable", f"Couldn't create a checkout link{f' — {err}' if err else ''}. Open a ticket in {help_to}."), ephemeral=True)
+        return
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="Pay with Stripe", style=discord.ButtonStyle.link, url=res["url"]))
+    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id="pkg_claim:stripe"))
+    await interaction.followup.send(embed=info_embed(
+        "Your Stripe checkout",
+        f"Pay **${dollars:.2f}** with the button below. After paying, click **Claim Package**."),
+        view=view, ephemeral=True)
+
+
+async def _pkg_flow_select(interaction, acct):
+    """Roblox Select: re-price the next shirt slot (1–6) to this package's R$
+    amount and hand the buyer its catalog link + a Claim button."""
+    robux = _pkg_parse_robux(_pkg_price_field(interaction))
+    help_to = _pkg_help_mention(interaction.guild)
+    if not robux:
+        await interaction.followup.send(embed=error_embed(
+            "Couldn't read the price", f"I couldn't find an R$ amount on this package. Open a ticket in {help_to}."), ephemeral=True)
+        return
+    _pkg_shirt_cursor["n"] += 1
+    slot = ((_pkg_shirt_cursor["n"] - 1) % 6) + 1
+    res = await _payments_call("", method="shirt", item=slot, price=robux)
+    if not (isinstance(res, dict) and res.get("ok") and res.get("url")):
+        err = (res or {}).get("error") if isinstance(res, dict) else None
+        await interaction.followup.send(embed=error_embed(
+            "Shirt unavailable", f"Couldn't set up a shirt{f' — {err}' if err else ''}. Open a ticket in {help_to}."), ephemeral=True)
+        return
+    url = res["url"]
+    m = re.search(r"catalog/(\d+)", url)
+    asset_id = m.group(1) if m else ""
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="Buy Shirt", style=discord.ButtonStyle.link, url=url))
+    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:shirt:{asset_id}"))
+    await interaction.followup.send(embed=info_embed(
+        "Your Roblox Select shirt",
+        f"Buy the shirt (R$ {robux}) with the button below.\nAfter you've bought it, click **Claim Package** and I'll deliver it."),
+        view=view, ephemeral=True)
+
+
+async def _pkg_claim_stripe(interaction):
+    """Claim for a Stripe purchase — Stripe can't be tied to a Roblox account, so
+    we simply DM the thank-you (the purchase-log poller records the sale)."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    acct = await _pkg_lookup_roblox(interaction.user.id)
+    name = acct["roblox_username"] if acct else interaction.user.display_name
+    dm_ok = True
+    try:
+        await interaction.user.send(embed=_pkg_thankyou_embed(name, "Stripe package"))
+    except Exception:
+        dm_ok = False
+    msg = "Thanks! Check your DMs for the details." if dm_ok else "Thanks! (I couldn't DM you — enable DMs to get the receipt.)"
+    await interaction.followup.send(embed=success_embed("Claimed", msg), ephemeral=True)
+
+
+async def _pkg_claim_shirt(interaction, asset_id):
+    """Claim for a Roblox Select shirt: confirm the buyer owns the asset, DM them."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    acct = await _pkg_lookup_roblox(interaction.user.id)
+    help_to = _pkg_help_mention(interaction.guild)
+    if not acct:
+        await interaction.followup.send(embed=error_embed("Verify first", f"Link your Roblox account first, then claim. {help_to}"), ephemeral=True)
+        return
+    if not asset_id:
+        await interaction.followup.send(embed=error_embed("Couldn't verify", f"I lost track of which shirt this was — open a ticket in {help_to}."), ephemeral=True)
+        return
+    res = await _robux_locker_call("owns_asset", user_id=acct["roblox_id"], asset_id=str(asset_id))
+    if not (isinstance(res, dict) and res.get("ok")):
+        await interaction.followup.send(embed=error_embed("Couldn't verify", f"Roblox didn't answer — try again shortly or open a ticket in {help_to}."), ephemeral=True)
+        return
+    if res.get("hidden"):
+        await interaction.followup.send(embed=error_embed(
+            "Inventory is private", f"Make your Roblox inventory **public** so I can confirm the purchase, then click **Claim Package** again — or open a ticket in {help_to}."), ephemeral=True)
+        return
+    if not res.get("owned"):
+        await interaction.followup.send(embed=error_embed(
+            "Not owned yet", "I don't see that shirt on your account yet. Buy it with the link, then click **Claim Package** again."), ephemeral=True)
+        return
+    dm_ok = True
+    try:
+        await interaction.user.send(embed=_pkg_thankyou_embed(acct["roblox_username"], "Roblox Select package"))
+    except Exception:
+        dm_ok = False
+    msg = "Purchase confirmed — check your DMs for the details!" if dm_ok else "Purchase confirmed! (I couldn't DM you — enable DMs to get the receipt.)"
+    await interaction.followup.send(embed=success_embed("Claimed", msg), ephemeral=True)
 
 
 async def _pkg_claim_gamepass(interaction, gamepass_id):
