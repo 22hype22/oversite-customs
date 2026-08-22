@@ -547,8 +547,9 @@ async def on_ready():
             _strat = "tv-anon→tv-cookies→web→app"
         _po = "on" if _BGUTIL_URL else "off"
         _px = "on" if _YT_PROXY else "off"
-        print(f"[Boot] yt-dlp {_ytver} — /play: {_strat} | po_token={_po} proxy={_px} "
-              f"cookies={'yes' if _YT_COOKIEFILE else 'no'} | radio=direct-stream")
+        _v6 = f"on ({_IPV6_SUBNET})" if _ipv6_net else "off"
+        print(f"[Boot] yt-dlp {_ytver} — /play: {_strat} | ipv6_rotate={_v6} | po_token={_po} "
+              f"proxy={_px} cookies={'yes' if _YT_COOKIEFILE else 'no'} | radio=direct-stream")
         # Prove what IP YouTube actually sees, direct vs through the proxy.
         try:
             import httpx as _hx
@@ -565,6 +566,16 @@ async def on_ready():
                 except Exception as _e2:
                     print(f"[Boot] PROXY TEST FAILED: {type(_e2).__name__}: {str(_e2)[:160]} "
                           f"— proxy unreachable/misconfigured; yt-dlp requests are NOT going through it")
+            if _ipv6_net:
+                try:
+                    _s6 = _random_ipv6()
+                    _t6 = _hx.HTTPTransport(local_address=_s6)
+                    with _hx.Client(transport=_t6, timeout=12) as _c6:
+                        _e6 = _c6.get("https://api64.ipify.org").text.strip()
+                    print(f"[Boot] egress IP (ipv6)    = {_e6}  <-- rotates per request (bound {_s6})")
+                except Exception as _e3:
+                    print(f"[Boot] IPV6 ROTATION TEST FAILED: {type(_e3).__name__}: {str(_e3)[:160]} "
+                          f"— OS not set up for non-local bind; run the setup script")
         except Exception:
             pass
     except Exception:
@@ -6941,6 +6952,33 @@ else:
 _BGUTIL_URL = (os.environ.get("BGUTIL_POT_BASE_URL") or "").strip()
 _YT_PROXY = (os.environ.get("YTDLP_PROXY") or "").strip()
 
+# --- IPv6 /64 rotation (the way real music bots avoid the block) ---
+# On a host with a routed IPv6 /64 (e.g. a Hetzner Cloud server), set IPV6_SUBNET
+# to that block, e.g. "2a01:4f8:1c1e:abcd::/64". We then bind each YouTube request
+# to a RANDOM address inside it, so no single IP ever accumulates enough requests
+# to trip the bot-check — YouTube can't block the whole /64 (it'd hit real users).
+# Requires the OS to allow non-local bind + a local route for the block (setup.sh).
+import ipaddress as _ipaddr
+import random as _rand
+_IPV6_SUBNET = (os.environ.get("IPV6_SUBNET") or "").strip()
+_ipv6_net = None
+if _IPV6_SUBNET:
+    try:
+        _ipv6_net = _ipaddr.IPv6Network(_IPV6_SUBNET, strict=False)
+        if _ipv6_net.prefixlen > 120:  # too small to rotate meaningfully
+            print(f"[Boot] IPV6_SUBNET {_IPV6_SUBNET} is tiny (/{_ipv6_net.prefixlen}); rotation weak")
+    except Exception as _e:
+        print(f"[Boot] bad IPV6_SUBNET '{_IPV6_SUBNET}': {_e}")
+        _ipv6_net = None
+
+
+def _random_ipv6():
+    if not _ipv6_net:
+        return None
+    bits = 128 - _ipv6_net.prefixlen
+    host = _rand.getrandbits(bits)
+    return str(_ipaddr.IPv6Address(int(_ipv6_net.network_address) + host))
+
 
 def _yt_extractor_args(clients):
     # formats=missing_pot lets yt-dlp select formats that lack a PO token instead
@@ -7035,6 +7073,11 @@ def _ytdl_opts(clients, use_cookies):
         opts.pop("cookiefile", None)
     if _YT_PROXY:
         opts["proxy"] = _YT_PROXY
+    # Rotate to a fresh IPv6 from the /64 for this request (overrides the IPv4
+    # default). A brand-new IP per request never accumulates a bot-check.
+    ip6 = _random_ipv6()
+    if ip6:
+        opts["source_address"] = ip6
     return opts
 
 
