@@ -539,9 +539,9 @@ async def on_ready():
     try:
         _ytver = getattr(yt_dlp, "version", None)
         _ytver = getattr(_ytver, "__version__", None) or getattr(yt_dlp, "__version__", "?")
-        _pc = _YT_PLAYER_CLIENTS or "yt-dlp default"
-        print(f"[Boot] yt-dlp {_ytver} — player_client={_pc} "
-              f"cookies={'yes' if _YT_COOKIEFILE else 'no'} formats=missing_pot")
+        _strat = "env:" + ",".join(_YT_PLAYER_CLIENTS) if _env_clients else "tv-anon→tv-cookies→web→app"
+        print(f"[Boot] yt-dlp {_ytver} — /play strategy: {_strat} | "
+              f"cookies={'available' if _YT_COOKIEFILE else 'none'} | radio=direct-stream")
     except Exception:
         pass
 
@@ -6979,24 +6979,44 @@ def _fmt_duration(sec):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-# Clients to fall back to when the primary set hits a transient YouTube error
-# ("page needs to be reloaded", player errors). With cookies we MUST stay on web
-# clients — the app clients (tv/ios/android) ignore cookies and get bot-flagged
-# from datacenter IPs. Without cookies, the app clients are the best anonymous bet.
-_YT_FALLBACK_CLIENTS = ["ios", "tv", "android", "mweb"]
+def _ytdl_opts(clients, use_cookies):
+    """Build a yt-dlp opts dict for a specific client set, toggling cookies.
 
-
-def _ytdl_opts_with_clients(clients):
+    KEY (yt-dlp 2026.8 internals): sending cookies puts YouTube in authenticated
+    mode, which forces a PO-token requirement on web/app clients — without a token
+    provider it returns 'The page needs to be reloaded' and zero formats. The `tv`
+    (TVHTML5) client is the only one that needs NO PO token, and it works best
+    UNAUTHENTICATED. So we lead with tv-anonymous."""
     opts = dict(_YTDL_OPTS)
     opts["extractor_args"] = _yt_extractor_args(clients)
+    if use_cookies and _YT_COOKIEFILE:
+        opts["cookiefile"] = _YT_COOKIEFILE
+    else:
+        opts.pop("cookiefile", None)
     return opts
+
+
+# Ordered resolution strategy. Each entry: (clients, use_cookies, label).
+# tv-anonymous first (no PO token, no auth demand), then progressively fall back.
+def _yt_attempt_plan():
+    if _env_clients:  # user override wins as the first attempt
+        return [(_YT_PLAYER_CLIENTS, bool(_YT_COOKIEFILE), "env")]
+    plan = [
+        (["tv"], False, "tv/anon"),
+        (["tv"], True, "tv/cookies"),
+    ]
+    if _YT_COOKIEFILE:
+        plan.append((["web_safari", "web"], True, "web/cookies"))
+    plan.append((["ios", "android"], False, "app/anon"))
+    return plan
 
 
 async def _yt_resolve(query):
     """Resolve a search term / URL into a track dict via yt-dlp (off-thread).
 
-    Retries once with fallback player clients on transient YouTube errors like
-    'The page needs to be reloaded' (common on live streams / stale sessions)."""
+    Tries several client/cookie strategies in order and returns the first that
+    yields playable formats. tv-anonymous is first because, per yt-dlp's current
+    client table, it's the only path that needs no PO token."""
     if yt_dlp is None:
         return None, "yt-dlp isn't installed."
 
@@ -7010,37 +7030,30 @@ async def _yt_resolve(query):
 
     info = None
     last_msg = ""
-    attempts = [(_YTDL_OPTS, _YT_PLAYER_CLIENTS),
-                (_ytdl_opts_with_clients(_YT_FALLBACK_CLIENTS), _YT_FALLBACK_CLIENTS)]
-    for opts, clients in attempts:
+    saw_botcheck = False
+    for clients, use_cookies, label in _yt_attempt_plan():
         try:
-            info = await asyncio.to_thread(_extract, opts)
+            info = await asyncio.to_thread(_extract, _ytdl_opts(clients, use_cookies))
             if info:
+                if label != "tv/anon":
+                    print(f"[Music] resolved via {label} (clients={clients})")
                 break
         except Exception as e:
             last_msg = str(e)
             low = last_msg.lower()
-            print(f"[Music] yt-dlp extract failed (clients={clients}): {last_msg[:280]}")
             if "sign in to confirm" in low or "not a bot" in low:
-                hint = ("YouTube is blocking this server's IP. Add a `YOUTUBE_COOKIES` "
-                        "env var (exported cookies.txt from a logged-in browser) on the "
-                        "host and redeploy." if not _YT_COOKIEFILE else
-                        "YouTube rejected the request even with cookies — the cookies "
-                        "may be expired. Re-export a fresh cookies.txt and update "
-                        "`YOUTUBE_COOKIES`.")
-                return None, f"YouTube requires verification. {hint}"
-            retryable = ("reload" in low or "player" in low or "unavailable" in low
-                         or "temporarily" in low or "failed to extract" in low
-                         or "requested format" in low or "not available" in low
-                         or "no video formats" in low)
-            if not retryable:
-                return None, last_msg[:200]
-            # else fall through to the next client set
+                saw_botcheck = True
+            print(f"[Music] yt-dlp attempt '{label}' failed (clients={clients}): {last_msg[:220]}")
+            # keep trying the remaining strategies regardless of error type
     if not info:
         low = last_msg.lower()
+        if saw_botcheck or "sign in to confirm" in low or "not a bot" in low:
+            return None, ("YouTube blocked every method from this server's IP. This "
+                          "usually needs a PO-token provider or a proxy — tell me and "
+                          "I'll set one up. `/radio` still works in the meantime.")
         if "reload" in low:
-            return None, ("YouTube returned a reload error for that video (common with "
-                          "live streams). Try a normal song, or a different search.")
+            return None, ("YouTube wouldn't return a stream for that video. Try a "
+                          "different song, or use `/radio`.")
         return None, (last_msg[:200] or "No results.")
     return {
         "title": info.get("title") or "Unknown",
