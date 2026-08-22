@@ -537,7 +537,9 @@ async def on_ready():
     print(f"[Boot] voice deps — PyNaCl:{_nacl_ok} davey:{_dave_ok} yt_dlp:{yt_dlp is not None} "
           f"ffmpeg:{_ff_ok} ({_ff}) — Opus handled by ffmpeg")
     try:
-        print(f"[Boot] yt-dlp — player_client={_YT_PLAYER_CLIENTS} "
+        _ytver = getattr(yt_dlp, "version", None)
+        _ytver = getattr(_ytver, "__version__", None) or getattr(yt_dlp, "__version__", "?")
+        print(f"[Boot] yt-dlp {_ytver} — player_client={_YT_PLAYER_CLIENTS} "
               f"cookies={'yes' if _YT_COOKIEFILE else 'no'}")
     except Exception:
         pass
@@ -6892,7 +6894,7 @@ _YT_COOKIEFILE = _resolve_cookiefile()
 _YT_PLAYER_CLIENTS = [
     c.strip() for c in (
         os.environ.get("YTDLP_PLAYER_CLIENT")
-        or ("web_safari,web,mweb,default" if _YT_COOKIEFILE
+        or ("default,web,mweb,tv" if _YT_COOKIEFILE
             else "default,tv,ios,mweb,android")
     ).split(",") if c.strip()
 ]
