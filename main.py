@@ -5721,6 +5721,77 @@ async def _pkg_lookup_roblox(discord_id):
 # The two Roblox game stores whose game passes back the "Gamepass" option.
 PKG_GAMEPASS_PLACE_IDS = ["99629898994812", "128739314806275"]
 
+_ROBLOX_UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json",
+}
+
+
+def _pkg_extract_passes(obj):
+    """Normalize a Roblox game-pass listing response into [{id,name,price}]."""
+    if not isinstance(obj, dict):
+        return []
+    arr = obj.get("data") or obj.get("gamePasses") or obj.get("gamepasses") or []
+    out = []
+    for p in (arr if isinstance(arr, list) else []):
+        if not isinstance(p, dict):
+            continue
+        pid = str(p.get("id") or p.get("gamePassId") or p.get("targetId") or "")
+        name = str(p.get("name") or p.get("displayName") or "")
+        try:
+            price = int(p.get("price") or p.get("priceInRobux") or 0)
+        except Exception:
+            price = 0
+        if pid and name:
+            out.append({"id": pid, "name": name, "price": price})
+    return out
+
+
+async def _pkg_find_gamepass_direct(title):
+    """Find a game pass by title across the configured stores, calling Roblox
+    directly from the bot (Railway has open internet). Returns (gamepass|None,
+    debug list)."""
+    want = (title or "").strip().lower()
+    partial = None
+    debug = []
+    if not want:
+        return None, debug
+    async with httpx.AsyncClient(headers=_ROBLOX_UA, timeout=20, follow_redirects=True) as client:
+        for pid in PKG_GAMEPASS_PLACE_IDS:
+            uni = ""
+            ustat = 0
+            try:
+                r = await client.get(f"https://apis.roblox.com/universes/v1/places/{pid}/universe")
+                ustat = r.status_code
+                if r.status_code == 200:
+                    uni = str((r.json() or {}).get("universeId") or "")
+            except Exception as e:
+                ustat = -1
+            dbg = {"place": pid, "universe": uni, "universeStatus": ustat, "attempts": []}
+            debug.append(dbg)
+            if not uni:
+                continue
+            for url in (
+                f"https://games.roblox.com/v1/games/{uni}/game-passes?limit=100&sortOrder=Asc",
+                f"https://apis.roblox.com/game-passes/v1/universes/{uni}/creator-game-passes?count=100",
+            ):
+                try:
+                    r = await client.get(url)
+                    body = r.json() if r.status_code == 200 else {}
+                    rows = _pkg_extract_passes(body)
+                    dbg["attempts"].append({"url": url.split("?")[0], "status": r.status_code,
+                                            "count": len(rows), "sample": [p["name"] for p in rows[:8]]})
+                    for p in rows:
+                        n = p["name"].strip().lower()
+                        if n == want:
+                            return p, debug
+                        if not partial and want in n:
+                            partial = p
+                except Exception as e:
+                    dbg["attempts"].append({"url": url.split("?")[0], "error": str(e)[:100]})
+    return partial, debug
+
 
 def _pkg_price_field(interaction):
     """Read the Price field text off the package embed the button sits on."""
@@ -5984,13 +6055,12 @@ async def _pkg_flow_gamepass(interaction, acct):
         await interaction.followup.send(embed=error_embed(
             "No package title", f"This package has no title to match a gamepass. Open a ticket in {help_to}."), ephemeral=True)
         return
-    res = await _robux_locker_call("gamepass_find", place_ids=PKG_GAMEPASS_PLACE_IDS, title=title)
-    if not (isinstance(res, dict) and res.get("ok") and res.get("found")):
-        print(f"[Package] gamepass_find title={title!r} -> {res if not isinstance(res, dict) else res.get('debug', res)}")
+    gp, dbg = await _pkg_find_gamepass_direct(title)
+    if not gp:
+        print(f"[Package] gamepass direct title={title!r} -> {dbg}")
         await interaction.followup.send(embed=error_embed(
             "No matching gamepass", f"No gamepass named **{title}** exists yet. Open a ticket in {help_to} and we'll create it."), ephemeral=True)
         return
-    gp = res["gamepass"]
     pkg_id = interaction.message.id if interaction.message else 0
     link = f"https://www.roblox.com/game-pass/{gp['id']}"
     view = discord.ui.View(timeout=None)
