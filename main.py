@@ -511,6 +511,19 @@ async def on_ready():
     print(f"[Boot] bot {BOT_ORDER_ID} using worker token prefix {WORKER_TOKEN[:12] if WORKER_TOKEN else 'MISSING'} (len {len(WORKER_TOKEN) if WORKER_TOKEN else 0})")
     # Dropdown-in-modal (Close Order form) needs discord.py 2.6+ (discord.ui.Label).
     print(f"[Boot] discord.py {discord.__version__} | dropdown-in-modal supported: {hasattr(discord.ui, 'Label')}")
+    # Voice/music dependency check — this is what /play needs at runtime.
+    try:
+        import nacl  # noqa: F401
+        _nacl_ok = True
+    except Exception:
+        _nacl_ok = False
+    import shutil as _sh
+    try:
+        _opus_ok = discord.opus.is_loaded()
+    except Exception:
+        _opus_ok = False
+    print(f"[Boot] voice deps — PyNaCl:{_nacl_ok} yt_dlp:{yt_dlp is not None} "
+          f"ffmpeg:{bool(_sh.which('ffmpeg'))} opus:{_opus_ok}")
 
     if BOT_ORDER_ID and WORKER_TOKEN:
         for loop in (send_heartbeat, poll_configs, poll_shutdown, record_metrics_loop, poll_roblox_apply, poll_about_me):
