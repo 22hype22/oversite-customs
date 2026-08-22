@@ -2636,6 +2636,15 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
         ("{payment_link}", ctx.get("link") or ""),
     ):
         raw = raw.replace(tok, _js(val))
+    # Turn "#channel-name" into a real clickable channel mention (<#id>) by name,
+    # so staff can just type #dashboard instead of hunting for the channel ID.
+    guild = getattr(ch, "guild", None) or interaction.guild
+    if guild:
+        by_name = {c.name.lower(): c.id for c in guild.channels}
+        def _chan_repl(m):
+            cid = by_name.get(m.group(1).lower())
+            return f"<#{cid}>" if cid else m.group(0)
+        raw = re.sub(r"#([A-Za-z0-9_\-]{2,})", _chan_repl, raw)
     try:
         final = json.loads(raw)
     except Exception:
@@ -2650,9 +2659,9 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
     # Every package card gets the three purchase buttons. Each one gates the
     # buyer behind Roblox verification, then runs its flow (built in phases).
     view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(label="Gamepass", style=discord.ButtonStyle.primary, custom_id="pkg_buy:gamepass", emoji="🎮"))
-    view.add_item(discord.ui.Button(label="Roblox Select", style=discord.ButtonStyle.primary, custom_id="pkg_buy:select", emoji="👕"))
-    view.add_item(discord.ui.Button(label="Stripe", style=discord.ButtonStyle.primary, custom_id="pkg_buy:stripe", emoji="💳"))
+    view.add_item(discord.ui.Button(label="Gamepass", style=discord.ButtonStyle.secondary, custom_id="pkg_buy:gamepass"))
+    view.add_item(discord.ui.Button(label="Roblox Select", style=discord.ButtonStyle.secondary, custom_id="pkg_buy:select"))
+    view.add_item(discord.ui.Button(label="Stripe", style=discord.ButtonStyle.secondary, custom_id="pkg_buy:stripe"))
 
     async def _banner_file(f):
         """Download an {SFile} Preview so it can post as a real native image."""
