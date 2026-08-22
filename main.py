@@ -5772,16 +5772,28 @@ async def _pkg_find_gamepass_direct(title):
             debug.append(dbg)
             if not uni:
                 continue
+            # Probe: confirm the universe is valid + games.roblox.com is reachable.
+            try:
+                gr = await client.get(f"https://games.roblox.com/v1/games?universeIds={uni}")
+                gname = ""
+                if gr.status_code == 200:
+                    d = (gr.json() or {}).get("data") or []
+                    gname = str(d[0].get("name")) if d else ""
+                dbg["game"] = {"status": gr.status_code, "name": gname, "body": None if gr.status_code == 200 else gr.text[:160]}
+            except Exception as e:
+                dbg["game"] = {"error": str(e)[:100]}
             for url in (
                 f"https://games.roblox.com/v1/games/{uni}/game-passes?limit=100&sortOrder=Asc",
                 f"https://apis.roblox.com/game-passes/v1/universes/{uni}/creator-game-passes?count=100",
+                f"https://apis.roblox.com/game-passes/v1/universes/{uni}/game-passes?count=100",
             ):
                 try:
                     r = await client.get(url)
                     body = r.json() if r.status_code == 200 else {}
                     rows = _pkg_extract_passes(body)
                     dbg["attempts"].append({"url": url.split("?")[0], "status": r.status_code,
-                                            "count": len(rows), "sample": [p["name"] for p in rows[:8]]})
+                                            "count": len(rows), "sample": [p["name"] for p in rows[:8]],
+                                            "body": None if r.status_code == 200 else r.text[:160]})
                     for p in rows:
                         n = p["name"].strip().lower()
                         if n == want:
