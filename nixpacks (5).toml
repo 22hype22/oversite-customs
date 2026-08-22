@@ -1,0 +1,3 @@
+# Music add-on needs FFmpeg (yt-dlp audio) and libopus (Discord voice encoding).
+[phases.setup]
+nixPkgs = ["...", "ffmpeg", "libopus"]
