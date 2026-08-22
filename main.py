@@ -158,7 +158,8 @@ FORM_LOG_DEFS = {
     "customs-promotion":  {"key": "promotion",  "title": "Promotion Log"},
 }
 form_log_configs = {
-    d["key"]: {"components": [], "channel_id": "", "allowed_role_ids": [], "watched_role_ids": []}
+    d["key"]: {"components": [], "channel_id": "", "allowed_role_ids": [],
+               "watched_role_ids": [], "groups": []}
     for d in FORM_LOG_DEFS.values()
 }
 form_log_titles = {d["key"]: d["title"] for d in FORM_LOG_DEFS.values()}
@@ -3183,23 +3184,88 @@ async def _rolelog_open_reason(interaction, cid):
         await interaction.response.send_message(embed=error_embed("Couldn't open form", str(e)[:150]), ephemeral=True)
 
 
+def _rolelog_groups(kind):
+    return form_log_configs.get(kind, {}).get("groups", []) or []
+
+
+def _rolelog_watched_ids(kind):
+    ids = set()
+    for g in _rolelog_groups(kind):
+        ids |= g["roles"]
+    return ids
+
+
+def _rolelog_hits(changed_roles, groups):
+    """Return the changed role objects that belong to a group whose threshold is met.
+    A group fires when >= `min` of its roles changed (min<=0/>len ⇒ all of them)."""
+    by_id = {str(r.id): r for r in changed_roles}
+    hit = {}
+    for g in groups:
+        present = [rid for rid in g["roles"] if rid in by_id]
+        if not present:
+            continue
+        need = g["min"] if 0 < g["min"] <= len(g["roles"]) else len(g["roles"])
+        if len(present) >= need:
+            for rid in present:
+                hit[rid] = by_id[rid]
+    return list(hit.values())
+
+
+# member_id -> {"removed": {id: role}, "added": {id: role}, "task": Task}
+# Role changes are accumulated over a short window so a "set" still fires whether
+# the roles are pulled all at once or one-by-one.
+_rolelog_accum = {}
+_ROLELOG_WINDOW = 4.0
+
+
+async def _rolelog_eval_later(guild_id, member_id):
+    try:
+        await asyncio.sleep(_ROLELOG_WINDOW)
+    except asyncio.CancelledError:
+        return
+    acc = _rolelog_accum.pop(member_id, None)
+    if not acc:
+        return
+    guild = bot.get_guild(guild_id)
+    member = guild.get_member(member_id) if guild else None
+    if not member:
+        return
+    removed = list(acc["removed"].values())
+    added = list(acc["added"].values())
+    rh = _rolelog_hits(removed, _rolelog_groups("infraction"))
+    ah = _rolelog_hits(added, _rolelog_groups("promotion"))
+    if rh:
+        await _rolelog_trigger(guild, member, "infraction", rh)
+    if ah:
+        await _rolelog_trigger(guild, member, "promotion", ah)
+
+
 @bot.event
 async def on_member_update(before, after):
-    """Auto infraction/promotion: watched role removed -> infraction, added -> promotion."""
+    """Auto infraction/promotion: a watched role-SET removed -> infraction, added -> promotion."""
     try:
         if before.roles == after.roles:
             return
         bset, aset = set(before.roles), set(after.roles)
-        removed = list(bset - aset)
-        added = list(aset - bset)
-        inf_watch = set(form_log_configs.get("infraction", {}).get("watched_role_ids", []))
-        pro_watch = set(form_log_configs.get("promotion", {}).get("watched_role_ids", []))
-        hit_removed = [r for r in removed if str(r.id) in inf_watch]
-        hit_added = [r for r in added if str(r.id) in pro_watch]
-        if hit_removed:
-            await _rolelog_trigger(after.guild, after, "infraction", hit_removed)
-        if hit_added:
-            await _rolelog_trigger(after.guild, after, "promotion", hit_added)
+        inf_ids = _rolelog_watched_ids("infraction")
+        pro_ids = _rolelog_watched_ids("promotion")
+        w_removed = [r for r in (bset - aset) if str(r.id) in inf_ids]
+        w_added = [r for r in (aset - bset) if str(r.id) in pro_ids]
+        if not w_removed and not w_added:
+            return
+        acc = _rolelog_accum.get(after.id)
+        if acc is None:
+            acc = _rolelog_accum[after.id] = {"removed": {}, "added": {}, "task": None}
+        for r in w_removed:
+            acc["removed"][str(r.id)] = r
+            acc["added"].pop(str(r.id), None)   # a re-add within the window cancels the remove
+        for r in w_added:
+            acc["added"][str(r.id)] = r
+            acc["removed"].pop(str(r.id), None)
+        old = acc.get("task")
+        if old and not old.done():
+            old.cancel()
+        acc["task"] = asyncio.create_task(_rolelog_eval_later(after.guild.id, after.id))
     except Exception as e:
         print(f"[RoleLog] on_member_update error: {e}")
 
@@ -5598,11 +5664,27 @@ async def apply_config(feature, cfg, post_panel=False):
         fc["components"] = comps if isinstance(comps, list) else []
         fc["channel_id"] = str(cfg.get("channel_id") or "")
         fc["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
-        # Roles that, when added/removed, auto-trigger a promotion/infraction log.
-        fc["watched_role_ids"] = [str(x) for x in (cfg.get("watched_role_ids") or []) if x]
+        # Watched role SETS: each set auto-triggers a log when at least `min` of its
+        # roles are added (promotion) / removed (infraction) from a member. min<=0 or
+        # min>len means "all of them". Configured as group{i}_roles / group{i}_min.
+        groups = []
+        for i in range(1, 7):
+            rids = [str(x) for x in (cfg.get(f"group{i}_roles") or []) if x]
+            if not rids:
+                continue
+            try:
+                mn = int(cfg.get(f"group{i}_min") or 0)
+            except Exception:
+                mn = 0
+            groups.append({"roles": set(rids), "min": mn})
+        # Back-compat: a flat watched_role_ids list = a set where any one triggers.
+        legacy = [str(x) for x in (cfg.get("watched_role_ids") or []) if x]
+        if legacy:
+            groups.append({"roles": set(legacy), "min": 1})
+        fc["groups"] = groups
         _ticket_sources.pop(feature, None)  # not a panel source
         print(f"[Config] {key}(form) — design {len(fc['components'])} channel {fc['channel_id']} "
-              f"allowed {fc['allowed_role_ids']} watched {fc['watched_role_ids']}")
+              f"allowed {fc['allowed_role_ids']} groups {[(len(g['roles']), g['min']) for g in groups]}")
     elif feature in ("payment", "customs-payment"):
         payment_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
         print(f"[Config] payment — roles {payment_config['allowed_role_ids']}")
