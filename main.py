@@ -517,13 +517,11 @@ async def on_ready():
         _nacl_ok = True
     except Exception:
         _nacl_ok = False
-    import shutil as _sh
-    try:
-        _opus_ok = discord.opus.is_loaded()
-    except Exception:
-        _opus_ok = False
+    import os as _os
+    _ff = globals().get("_FFMPEG_EXE") or ""
+    _ff_ok = bool(_ff) and (_ff == "ffmpeg" or _os.path.exists(_ff))
     print(f"[Boot] voice deps — PyNaCl:{_nacl_ok} yt_dlp:{yt_dlp is not None} "
-          f"ffmpeg:{bool(_sh.which('ffmpeg'))} opus:{_opus_ok}")
+          f"ffmpeg:{_ff_ok} ({_ff}) — Opus handled by ffmpeg")
 
     if BOT_ORDER_ID and WORKER_TOKEN:
         for loop in (send_heartbeat, poll_configs, poll_shutdown, record_metrics_loop, poll_roblox_apply, poll_about_me):
@@ -6831,6 +6829,16 @@ try:
 except Exception:
     yt_dlp = None
 
+# FFmpeg from a pip-bundled static binary (imageio-ffmpeg) so we don't depend on
+# the host having ffmpeg. We use FFmpegOpusAudio (ffmpeg encodes to Opus), which
+# also means libopus isn't required on the host.
+try:
+    import imageio_ffmpeg
+    _FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    import shutil as _shutil_ff
+    _FFMPEG_EXE = _shutil_ff.which("ffmpeg") or "ffmpeg"
+
 _YTDL_OPTS = {
     "format": "bestaudio/best",
     "noplaylist": True,
@@ -6970,8 +6978,12 @@ async def _music_play_next(guild):
         await _music_announce(guild, error=f"Skipped **{track.get('title')}** — {err or 'no stream'}")
         return await _music_play_next(guild)
     try:
-        source = discord.FFmpegPCMAudio(resolved["url"], before_options=_FFMPEG_BEFORE, options=_FFMPEG_OPTS)
-        source = discord.PCMVolumeTransformer(source, volume=st["volume"])
+        vol = max(0.0, min(2.0, float(st.get("volume", 0.5))))
+        # ffmpeg applies the volume filter and encodes straight to Opus, so no
+        # libopus is needed on the host.
+        source = discord.FFmpegOpusAudio(
+            resolved["url"], executable=_FFMPEG_EXE,
+            before_options=_FFMPEG_BEFORE, options=f"-vn -af volume={vol:.2f}")
     except Exception as e:
         await _music_announce(guild, error=f"Couldn't play **{track.get('title')}**: {str(e)[:150]}")
         return await _music_play_next(guild)
@@ -7127,10 +7139,7 @@ async def volume_cmd(interaction: discord.Interaction, percent: app_commands.Ran
         return
     st = _music_state(interaction.guild_id)
     st["volume"] = percent / 100.0
-    vc = interaction.guild.voice_client
-    if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
-        vc.source.volume = st["volume"]
-    await interaction.response.send_message(embed=success_embed("Volume", f"Set to **{percent}%**."), ephemeral=True)
+    await interaction.response.send_message(embed=success_embed("Volume", f"Set to **{percent}%** — applies to the next song."), ephemeral=True)
 
 
 @bot.tree.command(name="loop", description="Toggle looping the current song")
