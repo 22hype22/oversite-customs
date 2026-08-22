@@ -3629,9 +3629,6 @@ async def on_interaction(interaction: discord.Interaction):
             await handle_robux_buy_submit(interaction)
         elif cid.startswith("pkgreview:"):
             await _pkg_review_submit(interaction, cid.split(":", 1)[1])
-        elif cid.startswith("pkgbuyform:"):
-            parts = cid.split(":")  # pkgbuyform:{kind}:{pkgmsg}
-            await _pkg_buy_submit(interaction, parts[1], parts[2] if len(parts) > 2 else "")
         elif cid.startswith("setprice_one:"):
             parts = cid.split(":")
             try:
@@ -6045,68 +6042,55 @@ async def _pkg_review_submit(interaction, pkg_msg_id):
         pass
 
 
-_pkg_agree_text = "I agree to the Master Service Agreement and package purchase terms"
+class _PkgBuyModal(discord.ui.Modal):
+    """The purchase form: Personal/Gift, a member picker for gifts, and a required
+    checkbox agreeing to the Oversite Customs Sales & Refund Policy."""
+    def __init__(self, kind, pkg_id, title):
+        super().__init__(title=f"Purchase {title}"[:45], timeout=600)
+        self._kind = kind
+        self._pkg_id = str(pkg_id)
+        self.recipient = discord.ui.Select(custom_id="recipient", min_values=1, max_values=1, options=[
+            discord.SelectOption(label="Personal", value="personal", default=True),
+            discord.SelectOption(label="Gift", value="gift"),
+        ])
+        self.ruser = discord.ui.UserSelect(custom_id="ruser", min_values=0, max_values=1, required=False)
+        self.agree = discord.ui.Checkbox(custom_id="agree")
+        self.add_item(discord.ui.Label(text="Recipient", description="Buy for yourself, or gift it to someone.", component=self.recipient))
+        self.add_item(discord.ui.Label(text="Gift Recipient (required if gifting)", component=self.ruser))
+        self.add_item(discord.ui.Label(text="I agree to the Oversite Customs Sales & Refund Policy", description="Required before checkout.", component=self.agree))
+
+    async def on_submit(self, interaction):
+        if not self.agree.value:
+            await interaction.response.send_message(
+                embed=error_embed("Agreement required", "You must agree to the **Oversite Customs Sales & Refund Policy** to continue."), ephemeral=True)
+            return
+        mode = self.recipient.values[0] if self.recipient.values else "personal"
+        if mode == "gift":
+            picks = self.ruser.values
+            if not picks:
+                await interaction.response.send_message(
+                    embed=error_embed("Pick a recipient", "Choose who receives this gift, then submit again."), ephemeral=True)
+                return
+            deliver_to = str(picks[0].id)
+        else:
+            deliver_to = str(interaction.user.id)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await _pkg_run_flow(interaction, self._kind, self._pkg_id, deliver_to)
 
 
 async def _pkg_handle_buy(interaction, kind):
-    """A buyer clicked Gamepass / Roblox Select / Stripe — pop the purchase form
-    (personal/gift + agreement). Verification and the actual checkout happen on
-    submit."""
+    """A buyer clicked Gamepass / Roblox Select / Stripe — pop the purchase form.
+    Verification and checkout happen on submit."""
     pkg_id = interaction.message.id if interaction.message else 0
     title = _pkg_title(interaction) or "Package"
-    components = [
-        {"type": 18, "label": "Recipient", "description": "Buy for yourself, or gift it to someone.",
-         "component": {"type": 3, "custom_id": "recipient", "min_values": 1, "max_values": 1, "options": [
-             {"label": "Personal", "value": "personal", "default": True},
-             {"label": "Gift", "value": "gift"},
-         ]}},
-        {"type": 18, "label": "Agreement — required before checkout",
-         "component": {"type": 3, "custom_id": "agree", "min_values": 1, "max_values": 1, "options": [
-             {"label": "I do NOT agree", "value": "no", "default": True},
-             {"label": _pkg_agree_text[:100], "value": "yes"},
-         ]}},
-    ]
-    data = {"title": f"Purchase {title}"[:45], "custom_id": f"pkgbuyform:{kind}:{pkg_id}", "components": components}
-    route = discord.http.Route("POST", "/interactions/{interaction_id}/{interaction_token}/callback",
-                               interaction_id=interaction.id, interaction_token=interaction.token)
     try:
-        await bot.http.request(route, json={"type": 9, "data": data})
+        await interaction.response.send_modal(_PkgBuyModal(kind, pkg_id, title))
     except Exception as e:
         print(f"[Package] buy modal failed: {e}")
         try:
             await interaction.response.send_message(embed=error_embed("Couldn't open the form", "Please try again."), ephemeral=True)
         except Exception:
             pass
-
-
-async def _pkg_buy_submit(interaction, kind, pkg_id):
-    """Purchase form submitted. Enforce agreement, then run the flow (personal)
-    or ask who to gift it to (gift)."""
-    vals = _modal_values((interaction.data or {}).get("components"))
-    if (vals.get("agree") or "no") != "yes":
-        await interaction.response.send_message(
-            embed=error_embed("Agreement required", "You must agree to the purchase terms to continue."), ephemeral=True)
-        return
-    if (vals.get("recipient") or "personal") == "gift":
-        view = discord.ui.View(timeout=300)
-        view.add_item(_PkgGiftSelect(kind, str(pkg_id)))
-        await interaction.response.send_message(embed=info_embed("Gift", "Who should receive this package?"), view=view, ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    await _pkg_run_flow(interaction, kind, str(pkg_id), str(interaction.user.id))
-
-
-class _PkgGiftSelect(discord.ui.UserSelect):
-    """Member picker shown after choosing 'Gift' — runs the flow for the pick."""
-    def __init__(self, kind, pkg_id):
-        super().__init__(placeholder="Select who receives this", min_values=1, max_values=1)
-        self._kind = kind
-        self._pkg_id = pkg_id
-
-    async def callback(self, interaction):
-        recipient = str(self.values[0].id) if self.values else str(interaction.user.id)
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        await _pkg_run_flow(interaction, self._kind, self._pkg_id, recipient)
 
 
 async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to):
