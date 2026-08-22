@@ -539,9 +539,16 @@ async def on_ready():
     try:
         _ytver = getattr(yt_dlp, "version", None)
         _ytver = getattr(_ytver, "__version__", None) or getattr(yt_dlp, "__version__", "?")
-        _strat = "env:" + ",".join(_YT_PLAYER_CLIENTS) if _env_clients else "tv-anon→tv-cookies→web→app"
-        print(f"[Boot] yt-dlp {_ytver} — /play strategy: {_strat} | "
-              f"cookies={'available' if _YT_COOKIEFILE else 'none'} | radio=direct-stream")
+        if _env_clients:
+            _strat = "env:" + ",".join(_YT_PLAYER_CLIENTS)
+        elif _BGUTIL_URL:
+            _strat = "web+PO-token"
+        else:
+            _strat = "tv-anon→tv-cookies→web→app"
+        _po = "on" if _BGUTIL_URL else "off"
+        _px = "on" if _YT_PROXY else "off"
+        print(f"[Boot] yt-dlp {_ytver} — /play: {_strat} | po_token={_po} proxy={_px} "
+              f"cookies={'yes' if _YT_COOKIEFILE else 'no'} | radio=direct-stream")
     except Exception:
         pass
 
@@ -6905,6 +6912,17 @@ elif _YT_COOKIEFILE:
 else:
     _YT_PLAYER_CLIENTS = ["default", "tv", "ios", "mweb", "android"]
 
+# --- Datacenter-IP bypass infrastructure (set via env on the host) ---
+# YouTube blocks datacenter IPs with "Sign in to confirm you're not a bot" on
+# EVERY client. The only real fixes:
+#   1) A PO-token provider (bgutil) that mints WebPO tokens proving legitimacy.
+#      Deploy the `brainicism/bgutil-ytdlp-pot-provider` server and set
+#      BGUTIL_POT_BASE_URL to its URL (e.g. http://bgutil.railway.internal:4416).
+#      The `bgutil-ytdlp-pot-provider` pip plugin (in requirements) auto-loads.
+#   2) A proxy on a non-flagged (residential) IP — set YTDLP_PROXY.
+_BGUTIL_URL = (os.environ.get("BGUTIL_POT_BASE_URL") or "").strip()
+_YT_PROXY = (os.environ.get("YTDLP_PROXY") or "").strip()
+
 
 def _yt_extractor_args(clients):
     # formats=missing_pot lets yt-dlp select formats that lack a PO token instead
@@ -6912,7 +6930,11 @@ def _yt_extractor_args(clients):
     args = {"formats": ["missing_pot"]}
     if clients:
         args["player_client"] = list(clients)
-    return {"youtube": args}
+    ea = {"youtube": args}
+    if _BGUTIL_URL:
+        # Point the bgutil HTTP PO-token plugin at the provider server.
+        ea["youtubepot-bgutilhttp"] = {"base_url": [_BGUTIL_URL]}
+    return ea
 
 
 _YTDL_OPTS = {
@@ -6993,6 +7015,8 @@ def _ytdl_opts(clients, use_cookies):
         opts["cookiefile"] = _YT_COOKIEFILE
     else:
         opts.pop("cookiefile", None)
+    if _YT_PROXY:
+        opts["proxy"] = _YT_PROXY
     return opts
 
 
@@ -7001,6 +7025,17 @@ def _ytdl_opts(clients, use_cookies):
 def _yt_attempt_plan():
     if _env_clients:  # user override wins as the first attempt
         return [(_YT_PLAYER_CLIENTS, bool(_YT_COOKIEFILE), "env")]
+    # With a PO-token provider, the web clients get valid tokens and clear the
+    # bot-check — lead with them (+cookies if available).
+    if _BGUTIL_URL:
+        plan = [
+            (["web_safari", "web"], bool(_YT_COOKIEFILE), "web+pot"),
+            (["tv"], bool(_YT_COOKIEFILE), "tv+pot"),
+            (["mweb"], bool(_YT_COOKIEFILE), "mweb+pot"),
+        ]
+        return plan
+    # No provider: best-effort client rotation (works only if the IP isn't flagged
+    # or a proxy is in play).
     plan = [
         (["tv"], False, "tv/anon"),
         (["tv"], True, "tv/cookies"),
