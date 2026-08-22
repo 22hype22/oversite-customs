@@ -7096,7 +7096,12 @@ async def _music_play_next(guild):
         st["current"] = None
         return
     st["current"] = track
-    resolved, err = await _yt_resolve(track.get("webpage_url") or track.get("title"))
+    # Direct stream (internet radio): play the URL straight through ffmpeg — no
+    # yt-dlp resolution, no YouTube, no cookies. Otherwise resolve via yt-dlp.
+    if track.get("direct_url"):
+        resolved, err = {"url": track["direct_url"]}, None
+    else:
+        resolved, err = await _yt_resolve(track.get("webpage_url") or track.get("title"))
     if not (resolved and resolved.get("url")):
         await _music_announce(guild, error=f"Skipped **{track.get('title')}** — {err or 'no stream'}")
         return await _music_play_next(guild)
@@ -7336,6 +7341,41 @@ async def nowplaying_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=_music_np_embed(st["current"], st), ephemeral=True)
 
 
+# Direct internet-radio streams (SomaFM — commercial-free, bot-friendly, no auth).
+# Each is a plain MP3 stream ffmpeg plays straight through, so radio never touches
+# YouTube/yt-dlp/cookies and just works. Genre is matched by keyword.
+_RADIO_STREAMS = [
+    (("lofi", "lo-fi", "chill", "study", "ambient", "sleep", "relax"),
+     "SomaFM Groove Salad", "https://ice1.somafm.com/groovesalad-128-mp3"),
+    (("indie",), "SomaFM Indie Pop Rocks", "https://ice1.somafm.com/indiepop-128-mp3"),
+    (("synth", "electropop", "electro pop"),
+     "SomaFM PopTron", "https://ice1.somafm.com/poptron-128-mp3"),
+    (("metal", "heavy"), "SomaFM Metal Detector", "https://ice1.somafm.com/metal-128-mp3"),
+    (("rock", "alt", "alternative", "punk"),
+     "SomaFM BAGeL Radio", "https://ice1.somafm.com/bagel-128-mp3"),
+    (("hip", "rap", "trap", "soul"), "SomaFM Fluid", "https://ice1.somafm.com/fluid-128-mp3"),
+    (("trance", "progressive", "psy"),
+     "SomaFM The Trip", "https://ice1.somafm.com/thetrip-128-mp3"),
+    (("edm", "electronic", "electronica", "house", "techno", "dance", "dubstep", "bass"),
+     "SomaFM Beat Blender", "https://ice1.somafm.com/beatblender-128-mp3"),
+    (("jazz", "lounge"), "SomaFM Sonic Universe", "https://ice1.somafm.com/sonicuniverse-128-mp3"),
+    (("country", "americana", "folk", "blues"),
+     "SomaFM Boot Liquor", "https://ice1.somafm.com/bootliquor-128-mp3"),
+    (("80s", "eighties", "retro"), "SomaFM Underground 80s", "https://ice1.somafm.com/u80s-128-mp3"),
+    (("70s", "seventies"), "SomaFM Left Coast 70s", "https://ice1.somafm.com/seventies-128-mp3"),
+    (("pop", "top", "hits"), "SomaFM PopTron", "https://ice1.somafm.com/poptron-128-mp3"),
+]
+_RADIO_DEFAULT = ("SomaFM Groove Salad", "https://ice1.somafm.com/groovesalad-128-mp3")
+
+
+def _radio_stream_for(genre):
+    g = (genre or "").lower().strip()
+    for keys, name, url in _RADIO_STREAMS:
+        if any(k in g for k in keys):
+            return name, url
+    return _RADIO_DEFAULT
+
+
 @bot.tree.command(name="radio", description="Start a 24/7 genre radio in your voice channel (DJ)")
 @app_commands.describe(genre="Genre to stream (defaults to the dashboard setting)")
 async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
@@ -7348,20 +7388,13 @@ async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
     if not vc:
         await interaction.followup.send(embed=err, ephemeral=True)
         return
-    g = (genre or music_config.get("radio_genre") or "pop").strip()
-    # Use a long uploaded mix rather than a live 24/7 broadcast — live streams
-    # frequently fail with "The page needs to be reloaded". The radio flag loops
-    # the current track, so a long mix keeps playing continuously.
-    track = None
-    for q in (f"ytsearch1:{g} music mix 1 hour",
-              f"ytsearch1:{g} songs playlist mix",
-              f"ytsearch1:{g} music"):
-        track, terr = await _yt_resolve(q)
-        if track:
-            break
-    if not track:
-        await interaction.followup.send(embed=error_embed("Couldn't start radio", terr or "No stream found."), ephemeral=True)
-        return
+    g = (genre or music_config.get("radio_genre") or "lofi").strip()
+    # Play a direct internet-radio stream — reliable, continuous, and completely
+    # independent of YouTube (no cookies / bot-checks / PO tokens).
+    station, stream_url = _radio_stream_for(g)
+    track = {"title": f"{station} · {g} radio", "url": stream_url,
+             "direct_url": stream_url, "webpage_url": "https://somafm.com",
+             "duration": 0, "thumbnail": ""}
     st = _music_state(interaction.guild_id)
     st["text_id"] = interaction.channel_id
     st["radio"] = True
@@ -7371,7 +7404,7 @@ async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
     if vc.is_playing() or vc.is_paused():
         vc.stop()
     await _music_play_next(interaction.guild)
-    await interaction.followup.send(embed=success_embed("Radio on", f"Now streaming **{g}** radio. Use `/stop` to end it."), ephemeral=True)
+    await interaction.followup.send(embed=success_embed("Radio on", f"Now streaming **{station}** ({g}). Use `/stop` to end it."), ephemeral=True)
 
 
 @bot.event
