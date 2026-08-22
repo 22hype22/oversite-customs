@@ -158,7 +158,7 @@ FORM_LOG_DEFS = {
     "customs-promotion":  {"key": "promotion",  "title": "Promotion Log"},
 }
 form_log_configs = {
-    d["key"]: {"components": [], "channel_id": "", "allowed_role_ids": []}
+    d["key"]: {"components": [], "channel_id": "", "allowed_role_ids": [], "watched_role_ids": []}
     for d in FORM_LOG_DEFS.values()
 }
 form_log_titles = {d["key"]: d["title"] for d in FORM_LOG_DEFS.values()}
@@ -3044,6 +3044,163 @@ async def promote_cmd(interaction: discord.Interaction):
     await _run_form_log(interaction, "promotion")
 
 
+# ===================== Auto infraction / promotion logging =====================
+# When a dashboard-configured "watched" team role is REMOVED from a member we open
+# an Infraction log; when one is ADDED we open a Promotion log. The staff member
+# who made the change is found via the audit log and prompted (a Reason field + a
+# responsibility checkbox) before it's posted to the configured channel.
+_ROLELOG = {
+    "infraction": {"key": "infraction", "verb": "removed", "prep": "from", "noun": "Infraction",
+                   "emoji": "⚠️", "color": 0xED4245,
+                   "reason_label": "Reason For Infraction",
+                   "ack": "I take full responsibility for this infraction of the user."},
+    "promotion":  {"key": "promotion", "verb": "added", "prep": "to", "noun": "Promotion",
+                   "emoji": "⭐", "color": 0x57F287,
+                   "reason_label": "Reason For Promotion",
+                   "ack": "I confirm this promotion is authorized."},
+}
+_ROLELOG_CODE = {"i": "infraction", "p": "promotion"}
+_ROLELOG_SHORT = {"infraction": "i", "promotion": "p"}
+# (kind, target_id) -> {"roles": "<mentions>", "issuer_id": int}
+_pending_rolelog = {}
+
+
+async def _find_role_changer(guild, target_id):
+    """Best-effort: who added/removed roles on target_id, from the audit log."""
+    try:
+        await asyncio.sleep(1.2)  # give the audit-log entry a moment to land
+        async for entry in guild.audit_logs(limit=8, action=discord.AuditLogAction.member_role_update):
+            tgt = getattr(entry, "target", None)
+            if tgt and tgt.id == target_id:
+                return entry.user
+    except Exception as e:
+        print(f"[RoleLog] audit lookup failed (needs View Audit Log perm?): {e}")
+    return None
+
+
+async def _rolelog_trigger(guild, member, kind, roles):
+    meta = _ROLELOG[kind]
+    cfg = form_log_configs.get(meta["key"], {})
+    ch = await resolve_channel(cfg.get("channel_id"))
+    if not ch:
+        return
+    issuer = await _find_role_changer(guild, member.id)
+    if issuer and issuer.bot:
+        issuer = None  # change made by an integration/bot — don't ping a bot
+    roles_text = ", ".join(r.mention for r in roles) if roles else "—"
+    _pending_rolelog[(kind, member.id)] = {"roles": roles_text, "issuer_id": issuer.id if issuer else 0}
+    who = issuer.mention if issuer else "A staff member"
+    cid = f"infr:{_ROLELOG_SHORT[kind]}:{member.id}:{issuer.id if issuer else 0}"
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label=f"Add {meta['noun']} Reason",
+                                    style=discord.ButtonStyle.primary, custom_id=cid, emoji="📝"))
+    txt = (f"{meta['emoji']} **{meta['noun']} pending** — {who}, add the reason for "
+           f"{meta['verb']} {roles_text} {meta['prep']} {member.mention}.")
+    try:
+        await ch.send(txt, view=view,
+                      allowed_mentions=discord.AllowedMentions(users=[issuer] if issuer else False, roles=False))
+    except Exception as e:
+        print(f"[RoleLog] prompt post failed: {e}")
+
+
+class _RoleLogReasonModal(discord.ui.Modal):
+    def __init__(self, kind, target_id, roles_text, channel_id, prompt_msg_id):
+        meta = _ROLELOG[kind]
+        super().__init__(title=meta["noun"], timeout=600)
+        self._kind = kind
+        self._target_id = int(target_id)
+        self._roles_text = roles_text
+        self._channel_id = str(channel_id)
+        self._prompt_msg_id = int(prompt_msg_id) if prompt_msg_id else 0
+        self.reason = discord.ui.TextInput(style=discord.TextStyle.paragraph, required=True,
+                                           max_length=800, placeholder="Type the reason…")
+        self.ack = discord.ui.Checkbox(custom_id="ack")
+        self.add_item(discord.ui.Label(text=meta["reason_label"][:45], component=self.reason))
+        self.add_item(discord.ui.Label(text="Responsibility", description=meta["ack"][:100], component=self.ack))
+
+    async def on_submit(self, interaction):
+        if not self.ack.value:
+            await interaction.response.send_message(
+                embed=error_embed("Acknowledgement required", _ROLELOG[self._kind]["ack"]), ephemeral=True)
+            return
+        reason = (self.reason.value or "").strip() or "No reason provided."
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await _rolelog_post(interaction, self._kind, self._target_id, self._roles_text, reason,
+                            self._channel_id, self._prompt_msg_id)
+
+
+async def _rolelog_post(interaction, kind, target_id, roles_text, reason, channel_id, prompt_msg_id):
+    meta = _ROLELOG[kind]
+    guild = interaction.guild
+    ch = await resolve_channel(channel_id)
+    if not ch:
+        await interaction.followup.send(embed=error_embed("No channel", "No log channel is configured."), ephemeral=True)
+        return
+    target = guild.get_member(target_id) if guild else None
+    target_txt = target.mention if target else f"<@{target_id}>"
+    e = discord.Embed(title=meta["noun"], color=meta["color"], timestamp=discord.utils.utcnow())
+    e.add_field(name="User", value=target_txt, inline=True)
+    e.add_field(name="Issued by", value=interaction.user.mention, inline=True)
+    e.add_field(name=f"Role(s) {meta['verb']}", value=roles_text or "—", inline=False)
+    e.add_field(name=meta["reason_label"], value=reason[:1024], inline=False)
+    e.set_footer(text="Responsibility acknowledged ✓")
+    try:
+        await ch.send(embed=e, allowed_mentions=discord.AllowedMentions(users=False, roles=False))
+    except Exception as ex:
+        await interaction.followup.send(embed=error_embed("Couldn't post", str(ex)[:150]), ephemeral=True)
+        return
+    if prompt_msg_id:
+        try:
+            pm = await ch.fetch_message(prompt_msg_id)
+            await pm.delete()
+        except Exception:
+            pass
+    _pending_rolelog.pop((kind, target_id), None)
+    await interaction.followup.send(embed=success_embed("Logged", f"Posted in {ch.mention}."), ephemeral=True)
+
+
+async def _rolelog_open_reason(interaction, cid):
+    # cid = infr:{i|p}:{target_id}:{issuer_id}
+    parts = cid.split(":")
+    kind = _ROLELOG_CODE.get(parts[1] if len(parts) > 1 else "i", "infraction")
+    target_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    issuer_id = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+    if issuer_id and interaction.user.id != issuer_id and not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            embed=error_embed("Not yours", "Only the staff member who made this change (or an admin) can add the reason."),
+            ephemeral=True)
+        return
+    pend = _pending_rolelog.get((kind, target_id), {})
+    roles_text = pend.get("roles", "the role(s)")
+    prompt_msg_id = interaction.message.id if interaction.message else 0
+    try:
+        await interaction.response.send_modal(
+            _RoleLogReasonModal(kind, target_id, roles_text, str(interaction.channel_id), prompt_msg_id))
+    except Exception as e:
+        await interaction.response.send_message(embed=error_embed("Couldn't open form", str(e)[:150]), ephemeral=True)
+
+
+@bot.event
+async def on_member_update(before, after):
+    """Auto infraction/promotion: watched role removed -> infraction, added -> promotion."""
+    try:
+        if before.roles == after.roles:
+            return
+        bset, aset = set(before.roles), set(after.roles)
+        removed = list(bset - aset)
+        added = list(aset - bset)
+        inf_watch = set(form_log_configs.get("infraction", {}).get("watched_role_ids", []))
+        pro_watch = set(form_log_configs.get("promotion", {}).get("watched_role_ids", []))
+        hit_removed = [r for r in removed if str(r.id) in inf_watch]
+        hit_added = [r for r in added if str(r.id) in pro_watch]
+        if hit_removed:
+            await _rolelog_trigger(after.guild, after, "infraction", hit_removed)
+        if hit_added:
+            await _rolelog_trigger(after.guild, after, "promotion", hit_added)
+    except Exception as e:
+        print(f"[RoleLog] on_member_update error: {e}")
+
+
 # ===================== Pricing =====================
 
 async def _pricing_call(action, entries=None, user=None):
@@ -3838,6 +3995,8 @@ async def on_interaction(interaction: discord.Interaction):
         await _joinsetup_open_one(interaction, si, ii)
     elif cid == "joinsetup_done":
         await _joinsetup_done(interaction)
+    elif cid.startswith("infr:"):
+        await _rolelog_open_reason(interaction, cid)
     elif cid.startswith("pkg_buy:"):
         await _pkg_handle_buy(interaction, cid.split(":", 1)[1])
     elif cid.startswith("pkg_claim:gp:"):
@@ -5436,8 +5595,11 @@ async def apply_config(feature, cfg, post_panel=False):
         fc["components"] = comps if isinstance(comps, list) else []
         fc["channel_id"] = str(cfg.get("channel_id") or "")
         fc["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
+        # Roles that, when added/removed, auto-trigger a promotion/infraction log.
+        fc["watched_role_ids"] = [str(x) for x in (cfg.get("watched_role_ids") or []) if x]
         _ticket_sources.pop(feature, None)  # not a panel source
-        print(f"[Config] {key}(form) — design {len(fc['components'])} channel {fc['channel_id']} allowed {fc['allowed_role_ids']}")
+        print(f"[Config] {key}(form) — design {len(fc['components'])} channel {fc['channel_id']} "
+              f"allowed {fc['allowed_role_ids']} watched {fc['watched_role_ids']}")
     elif feature in ("payment", "customs-payment"):
         payment_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
         print(f"[Config] payment — roles {payment_config['allowed_role_ids']}")
