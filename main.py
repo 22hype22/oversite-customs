@@ -4459,7 +4459,7 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
             raw = json.dumps(open_comps)
             raw = raw.replace("{user}", _js(interaction.user.mention)).replace("{username}", _js(interaction.user.display_name))
             comps = json.loads(raw)
-            close_row = {"type": "buttonRow", "buttons": [{"label": "Claim", "style": "success", "__ticket_claim": True}, {"label": "Close Order", "style": "danger", "__ticket_close": True}]}
+            close_row = {"type": "buttonRow", "buttons": [{"label": "Claim", "style": "success", "__ticket_claim": True}, {"label": "Close", "style": "danger", "__ticket_close": True}]}
             panel = [dict(c) for c in comps]
             container_idxs = [i for i, c in enumerate(panel) if c.get("type") == "container"]
             if container_idxs:
@@ -4497,7 +4497,7 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
 
         close_view = discord.ui.View(timeout=None)
         close_view.add_item(discord.ui.Button(label="Claim", style=discord.ButtonStyle.success, custom_id="ticket_claim"))
-        close_view.add_item(discord.ui.Button(label="Close Order", style=discord.ButtonStyle.danger, custom_id="ticket_close", emoji="🔒"))
+        close_view.add_item(discord.ui.Button(label="Close", style=discord.ButtonStyle.danger, custom_id="ticket_close", emoji="🔒"))
 
         await channel.send(content=content, embed=embed, view=close_view)
     # Post any uploaded form files into the ticket (each labelled by its field).
@@ -4812,7 +4812,7 @@ async def on_message(message):
 # falls back to the plain-dropdown flow below so it can never time out.
 class CloseOrderModal(discord.ui.Modal):
     def __init__(self):
-        super().__init__(title="Close Order", timeout=600)
+        super().__init__(title="Close", timeout=600)
         self.close_type = discord.ui.Select(min_values=1, max_values=1, options=[
             discord.SelectOption(label="Instant Close", value="instant", default=True, description="Close this order right now"),
             discord.SelectOption(label="Manual Close", value="request", description="Ask the opener to confirm first"),
@@ -4840,7 +4840,7 @@ class CloseOrderModal(discord.ui.Modal):
 # when the single form above isn't supported by the running discord.py build.
 class CloseReasonModal(discord.ui.Modal):
     def __init__(self, mode):
-        super().__init__(title="Close Order", timeout=600)
+        super().__init__(title="Close", timeout=600)
         self.mode = mode
         self.reason = discord.ui.TextInput(
             label="Reason", style=discord.TextStyle.paragraph, required=False,
@@ -4883,7 +4883,7 @@ async def ticket_close_prompt(interaction):
         except Exception as e:
             print(f"[Ticket] single-form close modal unavailable ({e}); using dropdown fallback")
     await interaction.response.send_message(
-        embed=info_embed("Close Order", "Choose how you'd like to close this order."),
+        embed=info_embed("Close", "Choose how you'd like to close this order."),
         view=_close_type_view(), ephemeral=True,
     )
 
@@ -5205,7 +5205,7 @@ def build_button(btn, guild):
     if btn.get("__ticket_unclaim"):
         return _btn({"type": 2, "label": (label[:80] or "Unclaim"), "style": 2, "custom_id": "ticket_unclaim"})
     if btn.get("__ticket_close"):
-        return _btn({"type": 2, "label": (label[:80] or "Close Order"), "style": BUTTON_STYLE_MAP.get(style_name, 4), "custom_id": "ticket_close"})
+        return _btn({"type": 2, "label": (label[:80] or "Close"), "style": BUTTON_STYLE_MAP.get(style_name, 4), "custom_id": "ticket_close"})
     if btn.get("disabled"):
         cid = f"display_{btn.get('id') or label[:20] or 'x'}"
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": cid[:100], "disabled": True})
