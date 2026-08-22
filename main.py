@@ -5879,12 +5879,7 @@ async def _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, product
     files = (rec.get("files") if rec else []) or []
     embed = _pkg_receipt_embed(acct["roblox_username"], acct.get("roblox_id"), price_str, product, product_url or thread_url, image)
     view = discord.ui.View(timeout=None)
-    # Download is a link button straight to the file so a click just downloads it
-    # (nothing gets posted). Fall back to the re-send button if we can't get a URL.
-    dl_url = await _pkg_ref_url(files[0]) if files else None
-    if dl_url and str(dl_url).startswith("http"):
-        view.add_item(discord.ui.Button(label="Download", style=discord.ButtonStyle.link, url=dl_url))
-    elif files:
+    if files:
         view.add_item(discord.ui.Button(label="Download", style=discord.ButtonStyle.success, custom_id=f"pkg_dl:{pkg_msg_id}"))
     view.add_item(discord.ui.Button(label="Leave a Review", style=discord.ButtonStyle.secondary, custom_id=f"pkg_review:{pkg_msg_id}"))
     if thread_url:
@@ -6040,8 +6035,14 @@ async def _pkg_flow_select(interaction, acct):
         await interaction.followup.send(embed=error_embed(
             "Couldn't read the price", f"I couldn't find an R$ amount on this package. Open a ticket in {help_to}."), ephemeral=True)
         return
-    _pkg_shirt_cursor["n"] += 1
-    slot = ((_pkg_shirt_cursor["n"] - 1) % 6) + 1
+    # Durable next-slot (survives redeploys); fall back to the in-memory counter
+    # only if the store is unreachable.
+    nxt = await _robux_locker_call("pkg_shirt_next")
+    if isinstance(nxt, dict) and nxt.get("ok") and nxt.get("slot"):
+        slot = int(nxt["slot"])
+    else:
+        _pkg_shirt_cursor["n"] += 1
+        slot = ((_pkg_shirt_cursor["n"] - 1) % 6) + 1
     res = await _payments_call("", method="shirt", item=slot, price=robux)
     if not (isinstance(res, dict) and res.get("ok") and res.get("url")):
         err = (res or {}).get("error") if isinstance(res, dict) else None
