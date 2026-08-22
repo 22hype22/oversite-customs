@@ -520,15 +520,21 @@ async def on_ready():
     except Exception as _ne:
         _nacl_ok = False
         print(f"[Boot] nacl bindings failed to import: {_ne}")
+    # discord.py 2.7 requires BOTH PyNaCl AND `davey` (Discord's DAVE E2EE lib)
+    # for ALL voice — VoiceClient.__init__ raises if either is missing.
+    _dave_ok = "?"
     try:
         from discord import voice_client as _vcmod
-        print(f"[Boot] discord has_nacl = {getattr(_vcmod, 'has_nacl', '?')} (python {__import__('sys').version.split()[0]})")
-    except Exception:
-        pass
+        from discord import voice_state as _vsmod
+        _dave_ok = getattr(_vsmod, "has_dave", "?")
+        print(f"[Boot] discord has_nacl = {getattr(_vcmod, 'has_nacl', '?')} | "
+              f"has_dave = {_dave_ok} (python {__import__('sys').version.split()[0]})")
+    except Exception as _de:
+        print(f"[Boot] voice gate check failed: {_de!r}")
     import os as _os
     _ff = globals().get("_FFMPEG_EXE") or ""
     _ff_ok = bool(_ff) and (_ff == "ffmpeg" or _os.path.exists(_ff))
-    print(f"[Boot] voice deps — PyNaCl:{_nacl_ok} yt_dlp:{yt_dlp is not None} "
+    print(f"[Boot] voice deps — PyNaCl:{_nacl_ok} davey:{_dave_ok} yt_dlp:{yt_dlp is not None} "
           f"ffmpeg:{_ff_ok} ({_ff}) — Opus handled by ffmpeg")
 
     if BOT_ORDER_ID and WORKER_TOKEN:
@@ -7028,7 +7034,32 @@ async def _music_connect(interaction):
         else:
             vc = await voice.channel.connect()
     except Exception as e:
-        return None, error_embed("Couldn't join", f"I couldn't connect to voice: {str(e)[:150]}")
+        # Full diagnostic to the Railway log so we can see the REAL exception,
+        # not just the friendly text (has_nacl can be True at import yet the
+        # 2.7 voice handshake can still fail on encryption backend selection).
+        import traceback as _tb
+        print(f"[Music] voice connect FAILED: {type(e).__module__}.{type(e).__name__}: {e!r}")
+        try:
+            import discord.voice_client as _vc
+            print(f"[Music] voice_client.has_nacl = {getattr(_vc, 'has_nacl', '?')}")
+        except Exception as _e:
+            print(f"[Music] voice_client import check failed: {_e!r}")
+        try:
+            import discord.voice_state as _vs
+            print(f"[Music] voice_state.has_nacl = {getattr(_vs, 'has_nacl', '?')}")
+        except Exception as _e:
+            print(f"[Music] voice_state import check failed: {_e!r}")
+        try:
+            import importlib
+            _cg = importlib.import_module("cryptography")
+            print(f"[Music] cryptography present: {getattr(_cg, '__version__', '?')}")
+        except Exception as _e:
+            print(f"[Music] cryptography MISSING: {_e!r}")
+        print("[Music] traceback:\n" + _tb.format_exc())
+        return None, error_embed(
+            "Couldn't join",
+            f"Voice connect failed: `{type(e).__name__}: {str(e)[:120]}`",
+        )
     return vc, None
 
 
