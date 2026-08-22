@@ -549,6 +549,24 @@ async def on_ready():
         _px = "on" if _YT_PROXY else "off"
         print(f"[Boot] yt-dlp {_ytver} — /play: {_strat} | po_token={_po} proxy={_px} "
               f"cookies={'yes' if _YT_COOKIEFILE else 'no'} | radio=direct-stream")
+        # Prove what IP YouTube actually sees, direct vs through the proxy.
+        try:
+            import httpx as _hx
+            try:
+                _dip = _hx.get("https://api.ipify.org", timeout=8).text.strip()
+                print(f"[Boot] egress IP (direct)  = {_dip}")
+            except Exception as _e1:
+                print(f"[Boot] direct IP check failed: {str(_e1)[:100]}")
+            if _YT_PROXY:
+                try:
+                    with _hx.Client(proxy=_YT_PROXY, timeout=12) as _pc:
+                        _pip = _pc.get("https://api.ipify.org").text.strip()
+                    print(f"[Boot] egress IP (proxy)   = {_pip}  <-- YouTube sees this for /play")
+                except Exception as _e2:
+                    print(f"[Boot] PROXY TEST FAILED: {type(_e2).__name__}: {str(_e2)[:160]} "
+                          f"— proxy unreachable/misconfigured; yt-dlp requests are NOT going through it")
+        except Exception:
+            pass
     except Exception:
         pass
 
