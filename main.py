@@ -512,11 +512,19 @@ async def on_ready():
     # Dropdown-in-modal (Close Order form) needs discord.py 2.6+ (discord.ui.Label).
     print(f"[Boot] discord.py {discord.__version__} | dropdown-in-modal supported: {hasattr(discord.ui, 'Label')}")
     # Voice/music dependency check — this is what /play needs at runtime.
+    # discord.py's own `has_nacl` is the real gate (it imports nacl.secret +
+    # nacl.utils; those C bindings can fail even when `import nacl` succeeds).
     try:
-        import nacl  # noqa: F401
+        import nacl.secret, nacl.utils  # noqa: F401
         _nacl_ok = True
-    except Exception:
+    except Exception as _ne:
         _nacl_ok = False
+        print(f"[Boot] nacl bindings failed to import: {_ne}")
+    try:
+        from discord import voice_client as _vcmod
+        print(f"[Boot] discord has_nacl = {getattr(_vcmod, 'has_nacl', '?')} (python {__import__('sys').version.split()[0]})")
+    except Exception:
+        pass
     import os as _os
     _ff = globals().get("_FFMPEG_EXE") or ""
     _ff_ok = bool(_ff) and (_ff == "ffmpeg" or _os.path.exists(_ff))
