@@ -37,7 +37,23 @@ source "$ENV_FILE"; set +a
 echo "==> Installing packages (python, ffmpeg, git)…"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y python3 python3-venv python3-pip git ffmpeg curl iproute2
+apt-get install -y python3 python3-venv python3-pip git ffmpeg curl iproute2 software-properties-common
+
+# The voice stack (PyNaCl 1.5 + davey wheels) is known-good on Python 3.11 and
+# breaks on 3.13+. Force 3.11 via deadsnakes so we never re-hit the voice issue.
+PYBIN="python3"
+if ! command -v python3.11 >/dev/null 2>&1; then
+  echo "==> Installing Python 3.11 (deadsnakes) for the voice stack…"
+  add-apt-repository -y ppa:deadsnakes/ppa || true
+  apt-get update -y || true
+  apt-get install -y python3.11 python3.11-venv python3.11-dev || true
+fi
+if command -v python3.11 >/dev/null 2>&1; then
+  PYBIN="python3.11"
+  echo "==> Using $($PYBIN --version)"
+else
+  echo "!! python3.11 unavailable; falling back to $(python3 --version). Voice may need attention."
+fi
 
 # ── Detect the server's IPv6 /64 (unless you set IPV6_SUBNET yourself) ──
 if [[ -z "${IPV6_SUBNET:-}" ]]; then
@@ -80,7 +96,7 @@ systemctl enable --now anyip.service
 
 # ── Python venv + dependencies ──
 echo "==> Installing Python dependencies…"
-python3 -m venv "${REPO_DIR}/.venv"
+"$PYBIN" -m venv "${REPO_DIR}/.venv"
 "${REPO_DIR}/.venv/bin/pip" install --upgrade pip >/dev/null
 "${REPO_DIR}/.venv/bin/pip" install -r "${REPO_DIR}/requirements.txt"
 
