@@ -539,8 +539,9 @@ async def on_ready():
     try:
         _ytver = getattr(yt_dlp, "version", None)
         _ytver = getattr(_ytver, "__version__", None) or getattr(yt_dlp, "__version__", "?")
-        print(f"[Boot] yt-dlp {_ytver} — player_client={_YT_PLAYER_CLIENTS} "
-              f"cookies={'yes' if _YT_COOKIEFILE else 'no'}")
+        _pc = _YT_PLAYER_CLIENTS or "yt-dlp default"
+        print(f"[Boot] yt-dlp {_ytver} — player_client={_pc} "
+              f"cookies={'yes' if _YT_COOKIEFILE else 'no'} formats=missing_pot")
     except Exception:
         pass
 
@@ -6889,24 +6890,29 @@ def _resolve_cookiefile():
 
 _YT_COOKIEFILE = _resolve_cookiefile()
 
-# With cookies present, lead with web clients (they authenticate via the cookies
-# and clear the bot-check) but ALSO include the app clients (ios/tv) because the
-# web clients now gate their audio behind a PO token (SABR) and yt-dlp filters
-# those out — the app clients still return plain downloadable audio formats.
-# Without cookies, use the clients most likely to skip the bot-check anonymously.
-_YT_PLAYER_CLIENTS = [
-    c.strip() for c in (
-        os.environ.get("YTDLP_PLAYER_CLIENT")
-        or ("web_safari,web,ios,tv,mweb" if _YT_COOKIEFILE
-            else "default,tv,ios,mweb,android")
-    ).split(",") if c.strip()
-]
+# Client selection is a moving target — YouTube changes what works weekly, and
+# yt-dlp's maintainers tune the DEFAULT client set for the current state every
+# release. So when we have cookies (which clear the bot-check), we let yt-dlp
+# pick the clients itself (empty list = no override) and only keep the two proven
+# levers: the cookies + allowing PO-token-gated formats. Without cookies we have
+# to steer toward the clients that skip the bot-check anonymously.
+# Override anytime with the YTDLP_PLAYER_CLIENT env var (comma-separated).
+_env_clients = (os.environ.get("YTDLP_PLAYER_CLIENT") or "").strip()
+if _env_clients:
+    _YT_PLAYER_CLIENTS = [c.strip() for c in _env_clients.split(",") if c.strip()]
+elif _YT_COOKIEFILE:
+    _YT_PLAYER_CLIENTS = []  # let yt-dlp choose
+else:
+    _YT_PLAYER_CLIENTS = ["default", "tv", "ios", "mweb", "android"]
 
 
 def _yt_extractor_args(clients):
     # formats=missing_pot lets yt-dlp select formats that lack a PO token instead
     # of discarding them (fixes "Requested format is not available" on web clients).
-    return {"youtube": {"player_client": list(clients), "formats": ["missing_pot"]}}
+    args = {"formats": ["missing_pot"]}
+    if clients:
+        args["player_client"] = list(clients)
+    return {"youtube": args}
 
 
 _YTDL_OPTS = {
