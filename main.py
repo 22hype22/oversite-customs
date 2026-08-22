@@ -3140,12 +3140,11 @@ async def _rolelog_post(interaction, kind, target_id, roles_text, reason, channe
     target_txt = target.mention if target else f"<@{target_id}>"
     ts = int(discord.utils.utcnow().timestamp())
     header = "Infraction Logs" if kind == "infraction" else "Promotion Logs"
-    subject = "Infractor" if kind == "infraction" else "Promoted"
     content = (
         f"## **{header}**\n\n"
-        f"Logger: {interaction.user.mention}\n"
-        f"{subject}: {target_txt}\n"
-        f"Reason: {reason}\n\n"
+        f"User: {target_txt}\n"
+        f"Reason: {reason}\n"
+        f"Logger: {interaction.user.mention}\n\n"
         f"Date: <t:{ts}:F>"
     )
     try:
