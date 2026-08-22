@@ -2636,15 +2636,26 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
         ("{payment_link}", ctx.get("link") or ""),
     ):
         raw = raw.replace(tok, _js(val))
-    # Turn "#channel-name" into a real clickable channel mention (<#id>) by name,
-    # so staff can just type #dashboard instead of hunting for the channel ID.
+    # Turn "#channel-name" (or "<#channel-name>") into a real clickable channel
+    # mention (<#id>) by name, so staff can just type #dashboard instead of
+    # hunting for the channel ID. Falls back to a unique partial-name match, so
+    # "#dashboard" still finds a channel actually named "package-dashboard".
     guild = getattr(ch, "guild", None) or interaction.guild
     if guild:
-        by_name = {c.name.lower(): c.id for c in guild.channels}
+        chans = list(guild.channels)
+        by_name = {c.name.lower(): c.id for c in chans}
+        def _resolve(name):
+            name = name.lower()
+            if name in by_name:
+                return by_name[name]
+            hits = [c for c in chans if name in c.name.lower()]
+            return hits[0].id if len(hits) == 1 else None
         def _chan_repl(m):
-            cid = by_name.get(m.group(1).lower())
+            if m.group(1):  # already a real <#123> mention — leave it
+                return m.group(0)
+            cid = _resolve(m.group(2) or m.group(3) or "")
             return f"<#{cid}>" if cid else m.group(0)
-        raw = re.sub(r"#([A-Za-z0-9_\-]{2,})", _chan_repl, raw)
+        raw = re.sub(r"<#(\d+)>|<#([A-Za-z0-9_\-]{2,})>|(?<!<)#([A-Za-z0-9_\-]{2,})", _chan_repl, raw)
     try:
         final = json.loads(raw)
     except Exception:
@@ -3711,6 +3722,8 @@ async def on_interaction(interaction: discord.Interaction):
         await _joinsetup_done(interaction)
     elif cid.startswith("pkg_buy:"):
         await _pkg_handle_buy(interaction, cid.split(":", 1)[1])
+    elif cid.startswith("pkg_claim:gp:"):
+        await _pkg_claim_gamepass(interaction, cid.split(":", 2)[2])
     elif cid == "pkg_claim":
         # Package card "Claim" button. Behavior is a simple acknowledgement for
         # now — the real claim flow can be wired later.
@@ -5661,6 +5674,52 @@ async def _pkg_lookup_roblox(discord_id):
     return None
 
 
+# The two Roblox game stores whose game passes back the "Gamepass" option.
+PKG_GAMEPASS_PLACE_IDS = ["99629898994812", "128739314806275"]
+
+
+def _pkg_price_field(interaction):
+    """Read the Price field text off the package embed the button sits on."""
+    try:
+        for emb in (interaction.message.embeds or []):
+            for f in emb.fields:
+                if str(f.name or "").strip().lower() == "price":
+                    return str(f.value or "")
+    except Exception:
+        pass
+    return ""
+
+
+def _pkg_parse_robux(text):
+    """Pull the Robux amount (R$ …) out of a price string like '$500 R$500'."""
+    m = re.search(r"R\$\s*([\d,]+)", str(text or ""), re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1).replace(",", ""))
+        except Exception:
+            return 0
+    return 0
+
+
+def _pkg_help_mention(guild):
+    """A '#dashboard'-style mention for 'open a ticket', resolved by name."""
+    if guild:
+        for c in guild.channels:
+            if "dashboard" in c.name.lower():
+                return f"<#{c.id}>"
+    return "the dashboard channel"
+
+
+def _pkg_thankyou_embed(roblox_username, item_name):
+    e = discord.Embed(
+        title="Thank you for your purchase!",
+        description=(f"Thanks for purchasing from **Oversite**, **{roblox_username}**!\n\n"
+                     f"Your **{item_name}** is on the way. If you need anything, open a ticket and our team will help."),
+        color=discord.Color(0x2b2d31), timestamp=discord.utils.utcnow(),
+    )
+    return e
+
+
 async def _pkg_handle_buy(interaction, kind):
     """A buyer clicked Gamepass / Roblox Select / Stripe on a package card.
     Everyone is gated behind Roblox verification first; if they're not linked
@@ -5674,12 +5733,67 @@ async def _pkg_handle_buy(interaction, kind):
             embed=error_embed("Verify first", f"Link your Roblox account before buying — head to {where}, verify, then try again."),
             ephemeral=True)
         return
-    # Per-flow purchase logic (gamepass match / shirt assign / stripe checkout)
-    # is built in the next phases; for now confirm the linked account.
-    label = {"gamepass": "Gamepass", "select": "Roblox Select", "stripe": "Stripe"}.get(kind, kind)
+    if kind == "gamepass":
+        await _pkg_flow_gamepass(interaction, acct)
+        return
+    label = {"select": "Roblox Select", "stripe": "Stripe"}.get(kind, kind)
     await interaction.followup.send(
         embed=info_embed("Almost there", f"Linked as **{acct['roblox_username']}**. The **{label}** purchase flow is being finished — hang tight."),
         ephemeral=True)
+
+
+async def _pkg_flow_gamepass(interaction, acct):
+    """Find the game pass priced at the package's R$ amount and hand the buyer
+    the purchase link plus a Claim button that verifies ownership."""
+    robux = _pkg_parse_robux(_pkg_price_field(interaction))
+    help_to = _pkg_help_mention(interaction.guild)
+    if not robux:
+        await interaction.followup.send(embed=error_embed(
+            "Couldn't read the price", f"I couldn't find an R$ amount on this package. Open a ticket in {help_to}."), ephemeral=True)
+        return
+    res = await _robux_locker_call("gamepass_find", place_ids=PKG_GAMEPASS_PLACE_IDS, robux=robux)
+    if not (isinstance(res, dict) and res.get("ok") and res.get("found")):
+        await interaction.followup.send(embed=error_embed(
+            "No matching gamepass", f"No game pass is priced at **R$ {robux}** in our stores. Open a ticket in {help_to} and we'll sort it."), ephemeral=True)
+        return
+    gp = res["gamepass"]
+    link = f"https://www.roblox.com/game-pass/{gp['id']}"
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="Buy Gamepass", style=discord.ButtonStyle.link, url=link))
+    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:gp:{gp['id']}"))
+    await interaction.followup.send(embed=info_embed(
+        "Your Gamepass",
+        f"Buy **{gp['name']}** (R$ {gp['price']}) with the button below.\nAfter you've bought it, click **Claim Package** and I'll deliver it."),
+        view=view, ephemeral=True)
+
+
+async def _pkg_claim_gamepass(interaction, gamepass_id):
+    """Claim button for a gamepass: confirm the buyer now owns it, then DM them."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    acct = await _pkg_lookup_roblox(interaction.user.id)
+    help_to = _pkg_help_mention(interaction.guild)
+    if not acct:
+        await interaction.followup.send(embed=error_embed("Verify first", f"Link your Roblox account first, then claim. {help_to}"), ephemeral=True)
+        return
+    res = await _robux_locker_call("owns_gamepass", user_id=acct["roblox_id"], gamepass_id=str(gamepass_id))
+    if not (isinstance(res, dict) and res.get("ok")):
+        await interaction.followup.send(embed=error_embed("Couldn't verify", f"Roblox didn't answer — try again in a moment or open a ticket in {help_to}."), ephemeral=True)
+        return
+    if res.get("hidden"):
+        await interaction.followup.send(embed=error_embed(
+            "Inventory is private", f"Make your Roblox inventory **public** so I can confirm the purchase, then click **Claim Package** again — or open a ticket in {help_to}."), ephemeral=True)
+        return
+    if not res.get("owned"):
+        await interaction.followup.send(embed=error_embed(
+            "Not owned yet", "I don't see that gamepass on your account yet. Buy it with the link, then click **Claim Package** again."), ephemeral=True)
+        return
+    dm_ok = True
+    try:
+        await interaction.user.send(embed=_pkg_thankyou_embed(acct["roblox_username"], "Gamepass package"))
+    except Exception:
+        dm_ok = False
+    msg = "Purchase confirmed — check your DMs for the details!" if dm_ok else "Purchase confirmed! (I couldn't DM you — enable DMs to get the receipt.)"
+    await interaction.followup.send(embed=success_embed("Claimed", msg), ephemeral=True)
 
 
 async def apply_roblox_verification(payload):
