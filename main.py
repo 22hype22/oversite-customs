@@ -6894,7 +6894,7 @@ _YT_COOKIEFILE = _resolve_cookiefile()
 _YT_PLAYER_CLIENTS = [
     c.strip() for c in (
         os.environ.get("YTDLP_PLAYER_CLIENT")
-        or ("default,web,mweb,tv" if _YT_COOKIEFILE
+        or ("web_safari,web,mweb" if _YT_COOKIEFILE
             else "default,tv,ios,mweb,android")
     ).split(",") if c.strip()
 ]
@@ -6964,9 +6964,11 @@ def _fmt_duration(sec):
 
 
 # Clients to fall back to when the primary set hits a transient YouTube error
-# ("page needs to be reloaded", live-stream reload, player errors). These are
-# resilient for actual playback and don't need a PO token.
-_YT_FALLBACK_CLIENTS = ["tv", "ios", "android", "mweb"]
+# ("page needs to be reloaded", player errors). With cookies we MUST stay on web
+# clients — the app clients (tv/ios/android) ignore cookies and get bot-flagged
+# from datacenter IPs. Without cookies, the app clients are the best anonymous bet.
+_YT_FALLBACK_CLIENTS = (["mweb", "web", "web_safari"] if _YT_COOKIEFILE
+                        else ["tv", "ios", "android", "mweb"])
 
 
 def _ytdl_opts_with_clients(clients):
