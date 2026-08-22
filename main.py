@@ -536,6 +536,11 @@ async def on_ready():
     _ff_ok = bool(_ff) and (_ff == "ffmpeg" or _os.path.exists(_ff))
     print(f"[Boot] voice deps — PyNaCl:{_nacl_ok} davey:{_dave_ok} yt_dlp:{yt_dlp is not None} "
           f"ffmpeg:{_ff_ok} ({_ff}) — Opus handled by ffmpeg")
+    try:
+        print(f"[Boot] yt-dlp — player_client={_YT_PLAYER_CLIENTS} "
+              f"cookies={'yes' if _YT_COOKIEFILE else 'no'}")
+    except Exception:
+        pass
 
     if BOT_ORDER_ID and WORKER_TOKEN:
         for loop in (send_heartbeat, poll_configs, poll_shutdown, record_metrics_loop, poll_roblox_apply, poll_about_me):
@@ -6853,6 +6858,41 @@ except Exception:
     import shutil as _shutil_ff
     _FFMPEG_EXE = _shutil_ff.which("ffmpeg") or "ffmpeg"
 
+# YouTube blocks yt-dlp from datacenter IPs (Railway) with "Sign in to confirm
+# you're not a bot" unless the request looks like a real client. Two mitigations:
+#   1) Rotate player clients that don't require a PO token (env YTDLP_PLAYER_CLIENT,
+#      comma-separated, overrides the default list).
+#   2) Cookies — the reliable fix. Provide a Netscape cookies.txt either as a path
+#      (env YOUTUBE_COOKIEFILE) or inline content (env YOUTUBE_COOKIES); we write
+#      the inline form to a temp file at boot.
+_YT_PLAYER_CLIENTS = [
+    c.strip() for c in (os.environ.get("YTDLP_PLAYER_CLIENT")
+                        or "default,tv,ios,mweb,android").split(",") if c.strip()
+]
+
+
+def _resolve_cookiefile():
+    path = (os.environ.get("YOUTUBE_COOKIEFILE") or "").strip()
+    if path and os.path.exists(path):
+        return path
+    raw = os.environ.get("YOUTUBE_COOKIES")
+    if raw and raw.strip():
+        try:
+            import tempfile
+            fd, tmp = tempfile.mkstemp(prefix="ytcookies_", suffix=".txt")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                body = raw.replace("\\n", "\n")
+                if not body.startswith("# Netscape"):
+                    body = "# Netscape HTTP Cookie File\n" + body
+                f.write(body if body.endswith("\n") else body + "\n")
+            return tmp
+        except Exception as _e:
+            print(f"[Music] failed to write YOUTUBE_COOKIES: {_e!r}")
+    return None
+
+
+_YT_COOKIEFILE = _resolve_cookiefile()
+
 _YTDL_OPTS = {
     "format": "bestaudio/best",
     "noplaylist": True,
@@ -6862,7 +6902,10 @@ _YTDL_OPTS = {
     "source_address": "0.0.0.0",
     "cachedir": False,
     "skip_download": True,
+    "extractor_args": {"youtube": {"player_client": _YT_PLAYER_CLIENTS}},
 }
+if _YT_COOKIEFILE:
+    _YTDL_OPTS["cookiefile"] = _YT_COOKIEFILE
 _FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 _FFMPEG_OPTS = "-vn"
 
@@ -6930,7 +6973,17 @@ async def _yt_resolve(query):
     try:
         info = await asyncio.to_thread(_extract)
     except Exception as e:
-        return None, str(e)[:200]
+        msg = str(e)
+        print(f"[Music] yt-dlp extract failed: {msg[:300]}")
+        low = msg.lower()
+        if "sign in to confirm" in low or "not a bot" in low or "cookies" in low:
+            hint = ("YouTube is blocking this server's IP. Add a `YOUTUBE_COOKIES` "
+                    "env var (exported cookies.txt from a logged-in browser) on the "
+                    "host and redeploy." if not _YT_COOKIEFILE else
+                    "YouTube rejected the request even with cookies — the cookies may "
+                    "be expired. Re-export a fresh cookies.txt and update `YOUTUBE_COOKIES`.")
+            return None, f"YouTube requires verification. {hint}"
+        return None, msg[:200]
     if not info:
         return None, "No results."
     return {
