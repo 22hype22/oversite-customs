@@ -3138,14 +3138,18 @@ async def _rolelog_post(interaction, kind, target_id, roles_text, reason, channe
         return
     target = guild.get_member(target_id) if guild else None
     target_txt = target.mention if target else f"<@{target_id}>"
-    e = discord.Embed(title=meta["noun"], color=meta["color"], timestamp=discord.utils.utcnow())
-    e.add_field(name="User", value=target_txt, inline=True)
-    e.add_field(name="Issued by", value=interaction.user.mention, inline=True)
-    e.add_field(name=f"Role(s) {meta['verb']}", value=roles_text or "—", inline=False)
-    e.add_field(name=meta["reason_label"], value=reason[:1024], inline=False)
-    e.set_footer(text="Responsibility acknowledged ✓")
+    ts = int(discord.utils.utcnow().timestamp())
+    header = "Infraction Logs" if kind == "infraction" else "Promotion Logs"
+    subject = "Infractor" if kind == "infraction" else "Promoted"
+    content = (
+        f"## **{header}**\n\n"
+        f"Logger: {interaction.user.mention}\n"
+        f"{subject}: {target_txt}\n"
+        f"Reason: {reason}\n\n"
+        f"Date: <t:{ts}:F>"
+    )
     try:
-        await ch.send(embed=e, allowed_mentions=discord.AllowedMentions(users=False, roles=False))
+        await ch.send(content, allowed_mentions=discord.AllowedMentions(users=False, roles=False))
     except Exception as ex:
         await interaction.followup.send(embed=error_embed("Couldn't post", str(ex)[:150]), ephemeral=True)
         return
