@@ -5819,6 +5819,20 @@ async def _pkg_vault_files(delivery_ch, after_files):
     return refs
 
 
+async def _pkg_ref_url(ref):
+    """A direct, currently-valid URL for a stored file ref (refetches the vault
+    message so the link is fresh), for a Download link button."""
+    try:
+        if ref.get("message_id") and ref.get("channel_id"):
+            ch = bot.get_channel(int(ref["channel_id"])) or await bot.fetch_channel(int(ref["channel_id"]))
+            msg = await ch.fetch_message(int(ref["message_id"]))
+            if msg.attachments:
+                return msg.attachments[0].url
+    except Exception as e:
+        print(f"[Package] ref url failed: {e}")
+    return ref.get("url")
+
+
 async def _pkg_ref_to_file(ref):
     """Turn a stored file ref back into a fresh discord.File for delivery."""
     try:
@@ -5865,7 +5879,12 @@ async def _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, product
     files = (rec.get("files") if rec else []) or []
     embed = _pkg_receipt_embed(acct["roblox_username"], acct.get("roblox_id"), price_str, product, product_url or thread_url, image)
     view = discord.ui.View(timeout=None)
-    if files:
+    # Download is a link button straight to the file so a click just downloads it
+    # (nothing gets posted). Fall back to the re-send button if we can't get a URL.
+    dl_url = await _pkg_ref_url(files[0]) if files else None
+    if dl_url and str(dl_url).startswith("http"):
+        view.add_item(discord.ui.Button(label="Download", style=discord.ButtonStyle.link, url=dl_url))
+    elif files:
         view.add_item(discord.ui.Button(label="Download", style=discord.ButtonStyle.success, custom_id=f"pkg_dl:{pkg_msg_id}"))
     view.add_item(discord.ui.Button(label="Leave a Review", style=discord.ButtonStyle.secondary, custom_id=f"pkg_review:{pkg_msg_id}"))
     if thread_url:
@@ -5973,8 +5992,6 @@ async def _pkg_flow_gamepass(interaction, acct):
     res = await _robux_locker_call("gamepass_find", place_ids=PKG_GAMEPASS_PLACE_IDS, title=title)
     if not (isinstance(res, dict) and res.get("ok") and res.get("found")):
         print(f"[Package] gamepass_find title={title!r} -> {res if not isinstance(res, dict) else res.get('debug', res)}")
-        # No gamepass named after this package yet — auto-creation is the next
-        # step; for now route them to staff.
         await interaction.followup.send(embed=error_embed(
             "No matching gamepass", f"No gamepass named **{title}** exists yet. Open a ticket in {help_to} and we'll create it."), ephemeral=True)
         return
