@@ -4516,6 +4516,58 @@ def _is_ticket_staff(member, channel=None):
     return False
 
 
+def _ticket_guard(interaction):
+    """Return (channel, ok, err_embed) — channel must be a ticket and the caller
+    must be staff or the opener."""
+    channel = interaction.channel
+    topic = getattr(channel, "topic", "") or ""
+    if not topic.startswith("ticket|"):
+        return channel, False, error_embed("Not a ticket", "Run this inside a ticket channel.")
+    parts = topic.split("|")
+    opener_id = parts[1] if len(parts) > 1 else ""
+    if not (_is_ticket_staff(interaction.user, channel) or str(interaction.user.id) == opener_id):
+        return channel, False, error_embed("No permission", "Only staff or the ticket opener can do that.")
+    return channel, True, None
+
+
+@bot.tree.command(name="ticketadd", description="Add a user to this ticket")
+@app_commands.describe(user="The member to add to this ticket")
+async def ticketadd_cmd(interaction: discord.Interaction, user: discord.Member):
+    channel, ok, err = _ticket_guard(interaction)
+    if not ok:
+        await interaction.response.send_message(embed=err, ephemeral=True)
+        return
+    try:
+        await channel.set_permissions(
+            user, view_channel=True, send_messages=True, attach_files=True,
+            embed_links=True, read_message_history=True, reason=f"Ticket add by {interaction.user}")
+    except discord.Forbidden:
+        await interaction.response.send_message(embed=error_embed("Missing permission", "I need **Manage Channels** in this ticket."), ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.response.send_message(embed=error_embed("Couldn't add", str(e)[:200]), ephemeral=True)
+        return
+    await interaction.response.send_message(embed=success_embed("Added", f"{user.mention} was added to this ticket."))
+
+
+@bot.tree.command(name="ticketremove", description="Remove a user from this ticket")
+@app_commands.describe(user="The member to remove from this ticket")
+async def ticketremove_cmd(interaction: discord.Interaction, user: discord.Member):
+    channel, ok, err = _ticket_guard(interaction)
+    if not ok:
+        await interaction.response.send_message(embed=err, ephemeral=True)
+        return
+    try:
+        await channel.set_permissions(user, overwrite=None, reason=f"Ticket remove by {interaction.user}")
+    except discord.Forbidden:
+        await interaction.response.send_message(embed=error_embed("Missing permission", "I need **Manage Channels** in this ticket."), ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.response.send_message(embed=error_embed("Couldn't remove", str(e)[:200]), ephemeral=True)
+        return
+    await interaction.response.send_message(embed=success_embed("Removed", f"{user.mention} was removed from this ticket."))
+
+
 def _toggle_claim_in_components(comps, claimed):
     for c in (comps or []):
         if not isinstance(c, dict):
