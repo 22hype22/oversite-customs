@@ -5780,6 +5780,11 @@ async def apply_config(feature, cfg, post_panel=False):
         # Watched role SETS: each set auto-triggers a log when at least `min` of its
         # roles are added (promotion) / removed (infraction) from a member.
         fc["groups"] = _parse_role_groups(cfg)
+        # Fallback so dashboard-picked roles work even if the separate "Set" fields
+        # aren't in play: with no explicit sets, watch the config's roles directly —
+        # removing (infraction) / adding (promotion) ANY one of them fires a log.
+        if not fc["groups"] and key in ("infraction", "promotion") and fc["allowed_role_ids"]:
+            fc["groups"] = [{"roles": set(fc["allowed_role_ids"]), "min": 1}]
         _ticket_sources.pop(feature, None)  # not a panel source
         print(f"[Config] {key}(form) — design {len(fc['components'])} channel {fc['channel_id']} "
               f"allowed {fc['allowed_role_ids']} groups {[(len(g['roles']), g['min']) for g in fc['groups']]}")
