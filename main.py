@@ -5782,7 +5782,7 @@ async def apply_config(feature, cfg, post_panel=False):
         fc["groups"] = _parse_role_groups(cfg)
         _ticket_sources.pop(feature, None)  # not a panel source
         print(f"[Config] {key}(form) — design {len(fc['components'])} channel {fc['channel_id']} "
-              f"allowed {fc['allowed_role_ids']} groups {[(len(g['roles']), g['min']) for g in groups]}")
+              f"allowed {fc['allowed_role_ids']} groups {[(len(g['roles']), g['min']) for g in fc['groups']]}")
     elif feature in ("payment", "customs-payment"):
         payment_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
         print(f"[Config] payment — roles {payment_config['allowed_role_ids']}")
