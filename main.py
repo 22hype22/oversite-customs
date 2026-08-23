@@ -164,6 +164,26 @@ form_log_configs = {
 }
 form_log_titles = {d["key"]: d["title"] for d in FORM_LOG_DEFS.values()}
 
+
+def _parse_role_groups(cfg):
+    """Watched role SETS from a saved config: group{i}_roles + group{i}_min.
+    A set triggers when >= min of its roles change (min<=0/>len ⇒ all of them)."""
+    groups = []
+    for i in range(1, 7):
+        rids = [str(x) for x in (cfg.get(f"group{i}_roles") or []) if x]
+        if not rids:
+            continue
+        try:
+            mn = int(cfg.get(f"group{i}_min") or 0)
+        except Exception:
+            mn = 0
+        groups.append({"roles": set(rids), "min": mn})
+    # Back-compat: a flat watched_role_ids list = a set where any one triggers.
+    legacy = [str(x) for x in (cfg.get("watched_role_ids") or []) if x]
+    if legacy:
+        groups.append({"roles": set(legacy), "min": 1})
+    return groups
+
 # ---- Order Status ----
 # Configured in the dashboard "Order Status" block. An "Order Status" button
 # shows a live embed: each service is Open / Oversite+ only / Closed based on how
@@ -3270,6 +3290,99 @@ async def on_member_update(before, after):
         print(f"[RoleLog] on_member_update error: {e}")
 
 
+# --- Set watched role sets straight from Discord (bypasses the dashboard) ---
+async def _bot_config_get(feature):
+    if not (SUPABASE_URL and SUPABASE_KEY and BOT_ORDER_ID):
+        return {}
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/bot_config?bot_id=eq.{BOT_ORDER_ID}&feature=eq.{feature}&select=config"
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=15)
+        if r.status_code == 200 and r.json():
+            return r.json()[0].get("config") or {}
+    except Exception as e:
+        print(f"[RoleLog] config get failed: {e}")
+    return {}
+
+
+async def _bot_config_upsert(feature, config):
+    if not (SUPABASE_URL and SUPABASE_KEY and BOT_ORDER_ID):
+        return False, "no supabase creds"
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/bot_config?on_conflict=bot_id,feature"
+        payload = {"bot_id": BOT_ORDER_ID, "feature": feature, "config": config,
+                   "updated_at": discord.utils.utcnow().isoformat()}
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                url,
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                         "Content-Type": "application/json",
+                         "Prefer": "resolution=merge-duplicates,return=minimal"},
+                json=payload, timeout=15)
+        if r.status_code in (200, 201, 204):
+            return True, ""
+        return False, f"HTTP {r.status_code}: {r.text[:100]}"
+    except Exception as e:
+        return False, str(e)[:120]
+
+
+class _RoleWatchSelect(discord.ui.RoleSelect):
+    def __init__(self, kind, minv):
+        super().__init__(placeholder="Pick the roles to watch…", min_values=1, max_values=25)
+        self._kind = kind
+        self._minv = int(minv or 0)
+
+    async def callback(self, interaction):
+        role_ids = [str(r.id) for r in self.values]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        key = self._kind
+        feature = "customs-infraction" if key == "infraction" else "customs-promotion"
+        cfg = await _bot_config_get(feature)
+        cfg["group1_roles"] = role_ids
+        cfg["group1_min"] = self._minv
+        form_log_configs[key]["groups"] = _parse_role_groups(cfg)  # apply live, now
+        ok, err = await _bot_config_upsert(feature, cfg)
+        names = ", ".join(f"<@&{rid}>" for rid in role_ids)
+        verb = "removed" if key == "infraction" else "added"
+        trig = "all of them" if self._minv <= 0 or self._minv > len(role_ids) else f"{self._minv} of them"
+        note = "Saved permanently." if ok else f"Applied now, but couldn't write to the dashboard DB ({err}) — resets on a full restart."
+        ch = await resolve_channel(form_log_configs[key].get("channel_id"))
+        chnote = f"\nLogging to {ch.mention}." if ch else "\n⚠️ No log channel set for this yet — set one in the dashboard."
+        await interaction.followup.send(
+            embed=success_embed(f"{key.title()} roles set",
+                                f"Watching: {names}\nFires when **{trig}** are **{verb}**.{chnote}\n{note}"),
+            ephemeral=True)
+        print(f"[RoleLog] {key} watch set via command -> {role_ids} min={self._minv} persist_ok={ok} {err}")
+
+
+class _RoleWatchView(discord.ui.View):
+    def __init__(self, kind, minv):
+        super().__init__(timeout=300)
+        self.add_item(_RoleWatchSelect(kind, minv))
+
+
+@bot.tree.command(name="infractionroles", description="Set the roles that auto-log an infraction when removed (admin)")
+@app_commands.describe(min="How many must be removed to trigger (0 = all of them)")
+async def infractionroles_cmd(interaction: discord.Interaction, min: int = 0):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(embed=error_embed("Admins only", "You need Manage Server."), ephemeral=True)
+        return
+    await interaction.response.send_message(
+        embed=info_embed("Infraction roles", "Pick the roles to watch — removing them (that many, within a few seconds) auto-logs an infraction."),
+        view=_RoleWatchView("infraction", min), ephemeral=True)
+
+
+@bot.tree.command(name="promotionroles", description="Set the roles that auto-log a promotion when added (admin)")
+@app_commands.describe(min="How many must be added to trigger (0 = all of them)")
+async def promotionroles_cmd(interaction: discord.Interaction, min: int = 0):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(embed=error_embed("Admins only", "You need Manage Server."), ephemeral=True)
+        return
+    await interaction.response.send_message(
+        embed=info_embed("Promotion roles", "Pick the roles to watch — adding them (that many, within a few seconds) auto-logs a promotion."),
+        view=_RoleWatchView("promotion", min), ephemeral=True)
+
+
 # ===================== Pricing =====================
 
 async def _pricing_call(action, entries=None, user=None):
@@ -5665,23 +5778,8 @@ async def apply_config(feature, cfg, post_panel=False):
         fc["channel_id"] = str(cfg.get("channel_id") or "")
         fc["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
         # Watched role SETS: each set auto-triggers a log when at least `min` of its
-        # roles are added (promotion) / removed (infraction) from a member. min<=0 or
-        # min>len means "all of them". Configured as group{i}_roles / group{i}_min.
-        groups = []
-        for i in range(1, 7):
-            rids = [str(x) for x in (cfg.get(f"group{i}_roles") or []) if x]
-            if not rids:
-                continue
-            try:
-                mn = int(cfg.get(f"group{i}_min") or 0)
-            except Exception:
-                mn = 0
-            groups.append({"roles": set(rids), "min": mn})
-        # Back-compat: a flat watched_role_ids list = a set where any one triggers.
-        legacy = [str(x) for x in (cfg.get("watched_role_ids") or []) if x]
-        if legacy:
-            groups.append({"roles": set(legacy), "min": 1})
-        fc["groups"] = groups
+        # roles are added (promotion) / removed (infraction) from a member.
+        fc["groups"] = _parse_role_groups(cfg)
         _ticket_sources.pop(feature, None)  # not a panel source
         print(f"[Config] {key}(form) — design {len(fc['components'])} channel {fc['channel_id']} "
               f"allowed {fc['allowed_role_ids']} groups {[(len(g['roles']), g['min']) for g in groups]}")
