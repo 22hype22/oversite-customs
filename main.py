@@ -304,7 +304,7 @@ def _render_order_tokens(text, guild):
         # Default token = 'Name — <emoji>' (no Open/Closed word). Falls back to
         # the word only if no emoji is configured.
         name = svc.get("name") or ""
-        return f"{name} — {emoji}" if emoji else f"{name} — {lbl}"
+        return f"{name}, {emoji}" if emoji else f"{name}, {lbl}"
 
     return _ORDER_TOKEN_RE.sub(_sub, text)
 
@@ -964,7 +964,7 @@ def _render_invite_components(components, member):
 
 async def send_welcome(channel, member):
     emoji = f"<:e:{WELCOME_EMOJI_ID}>"
-    body = welcome_config.get("message") or f"{emoji} Welcome {member.mention} to **{SERVER_NAME}** — glad to have you."
+    body = welcome_config.get("message") or f"{emoji} Welcome {member.mention} to **{SERVER_NAME}**, glad to have you."
     body = body.replace("{user}", member.mention).replace("{server}", SERVER_NAME).replace("{emoji}", emoji)
     view = discord.ui.View()
     count_btn = discord.ui.Button(
@@ -1039,7 +1039,7 @@ async def credits_add(interaction: discord.Interaction, member: discord.Member, 
         return
     await interaction.response.defer(ephemeral=True)
     total = await credits_change(interaction.guild_id, member.id, amount, reason, interaction.user.id)
-    await log_credit_action(interaction.guild, f"{interaction.user.mention} gave **{amount}** credits to {member.mention} — {reason}")
+    await log_credit_action(interaction.guild, f"{interaction.user.mention} gave **{amount}** credits to {member.mention}, {reason}")
     await interaction.followup.send(embed=success_embed("Credits added", f"{member.mention} now has **{total}** credits."), ephemeral=True)
 
 
@@ -1051,7 +1051,7 @@ async def credits_remove(interaction: discord.Interaction, member: discord.Membe
         return
     await interaction.response.defer(ephemeral=True)
     total = await credits_change(interaction.guild_id, member.id, -amount, reason, interaction.user.id)
-    await log_credit_action(interaction.guild, f"{interaction.user.mention} removed **{amount}** credits from {member.mention} — {reason}")
+    await log_credit_action(interaction.guild, f"{interaction.user.mention} removed **{amount}** credits from {member.mention}, {reason}")
     await interaction.followup.send(embed=success_embed("Credits removed", f"{member.mention} now has **{total}** credits."), ephemeral=True)
 
 
@@ -1071,7 +1071,7 @@ async def credits_view(interaction: discord.Interaction, member: discord.Member 
             by = e.get("granted_by")
             by_txt = f"<@{by}>" if by else "system"
             reason = e.get("reason", "")
-            lines.append(f"`{sign}{amt}` by {by_txt} — {reason}")
+            lines.append(f"`{sign}{amt}` by {by_txt}, {reason}")
         embed.add_field(name="History", value="\n".join(lines), inline=False)
     else:
         embed.add_field(name="History", value="No credit history yet.", inline=False)
@@ -1194,7 +1194,7 @@ async def log_purchase(guild, *, discord_id=None, roblox_username=None, roblox_i
         print(f"[Purchase] log failed: {e}")
 
 
-@bot.tree.command(name="logtest", description="Post a sample purchase log (staff — to test the channel + design)")
+@bot.tree.command(name="logtest", description="Post a sample purchase log (staff, to test the channel and design)")
 async def logtest_cmd(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(embed=error_embed("No permission", "Only staff can run this."), ephemeral=True)
@@ -1245,13 +1245,13 @@ async def logdebug_cmd(interaction: discord.Interaction, roblox_id: str, roblox_
     hint = ""
     if not resolved:
         if dbg.get("any_bot") and not dbg.get("by_id"):
-            hint = "\n\n➡️ A row exists under a **different bot_id** — the buyer verified with another bot."
+            hint = "\n\n➡️ A row exists under a **different bot_id**, the buyer verified with another bot."
         elif dbg.get("by_name") and not dbg.get("by_id"):
-            hint = "\n\n➡️ Found by username — the row's `roblox_id` is empty. The username fallback now handles this; re-run a purchase."
+            hint = "\n\n➡️ Found by username, the row's `roblox_id` is empty. The username fallback now handles this; re-run a purchase."
         elif not dbg.get("by_id") and not dbg.get("by_name") and not dbg.get("any_bot"):
             hint = "\n\n➡️ No verification row at all for this Roblox account. The buyer isn't verified in this bot's `/verify` system."
     await interaction.followup.send(
-        embed=success_embed(f"Verify debug — {roblox_id}", "\n".join(lines) + hint), ephemeral=True)
+        embed=success_embed(f"Verify debug, {roblox_id}", "\n".join(lines) + hint), ephemeral=True)
 
 
 async def _log_group_sale(sale):
@@ -1499,7 +1499,7 @@ def _payment_can_use(member):
     return has_any_role(member, ticket_config.get("support_role_ids", []))
 
 
-@bot.tree.command(name="payment", description="Create a payment — Stripe, gamepass, or shirt")
+@bot.tree.command(name="payment", description="Create a payment: Stripe, gamepass, or shirt")
 async def payment_cmd(interaction: discord.Interaction):
     if not _payment_can_use(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to create payments."), ephemeral=True)
@@ -1594,7 +1594,7 @@ def build_giveaway_embed(g, ended=False, winner_ids=None):
             mentions = ", ".join(f"<@{w}>" for w in winner_ids)
             lines.append(f"**Winner{'s' if len(winner_ids) != 1 else ''}:** {mentions}")
         else:
-            lines.append("**No valid entries — no winner drawn.**")
+            lines.append("**No valid entries, no winner drawn.**")
         lines.append(f"Ended: <t:{end_ts}:f>")
 
     lines.append(f"Winners: **{winners}**  •  Entries: **{entries}**")
@@ -1729,7 +1729,7 @@ def _giveaway_render_guard(built, g, gid, ended, winner_ids):
     if ended:
         wl = ", ".join(f"<@{w}>" for w in (winner_ids or [])) or "No winners"
         return [{"type": 10, "content": f"**Giveaway ended.** Winner: {wl}"}]
-    return [{"type": 10, "content": "**Giveaway** — click below to enter!"},
+    return [{"type": 10, "content": "**Giveaway**, click below to enter!"},
             _giveaway_action_row(g, gid, False)]
 
 
@@ -1889,7 +1889,7 @@ async def handle_giveaway_form_submit(interaction):
             length=length_str,
         )
         if gid:
-            await interaction.followup.send(embed=success_embed("Giveaway started", f"Ends <t:{int(time.time()) + seconds}:R> — {winners} winner(s)."), ephemeral=True)
+            await interaction.followup.send(embed=success_embed("Giveaway started", f"Ends <t:{int(time.time()) + seconds}:R>, {winners} winner(s)."), ephemeral=True)
         else:
             await interaction.followup.send(embed=error_embed("Couldn't post", "I couldn't post the giveaway here. Check my permissions in this channel."), ephemeral=True)
     except Exception as e:
@@ -1962,12 +1962,12 @@ class GiveawayModal(discord.ui.Modal):
             length=str(self.length.value or "").strip(),
         )
         if gid:
-            await interaction.followup.send(embed=success_embed("Giveaway started", f"**{prize}** — {winners} winner(s), ends <t:{int(time.time()) + seconds}:R>."), ephemeral=True)
+            await interaction.followup.send(embed=success_embed("Giveaway started", f"**{prize}**, {winners} winner(s), ends <t:{int(time.time()) + seconds}:R>."), ephemeral=True)
         else:
             await interaction.followup.send(embed=error_embed("Couldn't post", "I couldn't post the giveaway here. Check my permissions in this channel."), ephemeral=True)
 
 
-@bot.tree.command(name="giveaway", description="Start a giveaway — prize, winners, and length")
+@bot.tree.command(name="giveaway", description="Start a giveaway with a prize, winners, and length")
 async def giveaway_cmd(interaction: discord.Interaction):
     if not _giveaway_can_manage(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "Only staff can start giveaways."), ephemeral=True)
@@ -2101,7 +2101,7 @@ async def robuxlockerrate_cmd(interaction: discord.Interaction):
         print(f"[RobuxLocker] rate modal open failed: {e!r}")
 
 
-@bot.tree.command(name="funds", description="Group funds — available and pending")
+@bot.tree.command(name="funds", description="Group funds, available and pending")
 @app_commands.describe(period="Revenue window for the breakdown (default: this month)")
 @app_commands.choices(period=[
     app_commands.Choice(name="Today", value="Day"),
@@ -2141,8 +2141,8 @@ async def _open_robux_stock_modal(interaction, funds):
          "component": {"type": 4, "custom_id": "amount", "style": 1, "required": True, "max_length": 12, "placeholder": "e.g. 1000"}},
         {"type": 18, "label": "Confirm",
          "component": {"type": 3, "custom_id": "confirm", "min_values": 1, "max_values": 1, "options": [
-             {"label": "No — cancel", "value": "no", "default": True},
-             {"label": "Yes — add to Available Stock", "value": "yes"},
+             {"label": "No, cancel", "value": "no", "default": True},
+             {"label": "Yes, add to Available Stock", "value": "yes"},
          ]}},
     ]
     data = {"title": "Stock the Robux Locker", "custom_id": f"robuxstockform:{funds}", "components": components}
@@ -2245,7 +2245,7 @@ async def handle_robux_buy_submit(interaction):
             return
         price = round(amount / 1000.0 * rate, 2)
         if price <= 0:
-            await interaction.followup.send(embed=error_embed("Amount too small", "That works out to $0.00 — buy a larger amount."), ephemeral=True)
+            await interaction.followup.send(embed=error_embed("Amount too small", "That works out to $0.00, buy a larger amount."), ephemeral=True)
             return
         # Reserve the stock FIRST — first come, first served. If someone already
         # took it, take_stock returns ok:false and nothing is reserved.
@@ -2253,7 +2253,7 @@ async def handle_robux_buy_submit(interaction):
         if not (isinstance(res, dict) and res.get("ok")):
             have = int((res or {}).get("stock") or 0)
             await interaction.followup.send(
-                embed=error_embed("Not enough left", f"Only **{have:,}** Robux is available right now — someone may have just bought some."),
+                embed=error_embed("Not enough left", f"Only **{have:,}** Robux is available right now, someone may have just bought some."),
                 ephemeral=True)
             return
         reserved = amount
@@ -2264,7 +2264,7 @@ async def handle_robux_buy_submit(interaction):
         if isinstance(pay, dict) and pay.get("ok") and pay.get("url"):
             reserved = 0  # committed — don't refund
             await interaction.followup.send(
-                embed=success_embed("You're first in line", f"**{amount:,} Robux** reserved for you — **${price:,.2f}**.\n{pay['url']}\n\nComplete payment to claim it — it's first come, first served."),
+                embed=success_embed("You're first in line", f"**{amount:,} Robux** reserved for you, **${price:,.2f}**.\n{pay['url']}\n\nComplete payment to claim it, it's first come, first served."),
                 ephemeral=True)
         else:
             # Payment link failed — release the reservation back to stock.
@@ -2322,7 +2322,7 @@ async def handle_notify_click(interaction, ids_csv):
                 added.append(r.mention)
     except discord.Forbidden:
         try:
-            await interaction.response.send_message(embed=error_embed("Missing permission", "I can't manage that role — make sure my role is above it."), ephemeral=True)
+            await interaction.response.send_message(embed=error_embed("Missing permission", "I can't manage that role, make sure my role is above it."), ephemeral=True)
         except Exception:
             pass
         return
@@ -2358,7 +2358,7 @@ async def show_order_status(interaction):
         emoji, lbl = _order_status_for(guild, svc)
         emoji = (emoji or "").strip()
         # 'Name — <emoji>' (no status word). Falls back to the word if no emoji.
-        lines.append(f"**{name}** — {emoji}" if emoji else f"**{name}** — {lbl}")
+        lines.append(f"**{name}**, {emoji}" if emoji else f"**{name}**, {lbl}")
 
     title = order_status_config.get("title") or "Order Status"
     desc = "\n".join(lines) if lines else "No services are configured yet."
@@ -2720,7 +2720,7 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
     ctx = _pending_pkg_ctx.pop(interaction.user.id, {})
     ch = await resolve_channel(ctx.get("channel_id"))
     if not ch:
-        await interaction.followup.send(embed=error_embed("No channel", "That channel is gone — run /package again."), ephemeral=True)
+        await interaction.followup.send(embed=error_embed("No channel", "That channel is gone, run /package again."), ephemeral=True)
         return
 
     def _js(s):
@@ -2904,10 +2904,10 @@ async def _package_tag_autocomplete(interaction: discord.Interaction, current: s
 @bot.tree.command(name="package", description="Post the package card to a channel")
 @app_commands.describe(
     channel="Which channel to post the package card in",
-    tag="Forum tag to apply (pick the channel first — this lists that forum's tags).",
+    tag="Forum tag to apply (pick the channel first, this lists that forum's tags).",
     delivery="Private channel to stash the Finished Product file (so Download never expires).",
-    payment="What the payment is — e.g. Gamepass, Roblox Select, Stripe. Fills {payment}.",
-    link="The payment link. Fills {payment_link} — e.g. [{payment}]({payment_link}).",
+    payment="What the payment is, e.g. Gamepass, Roblox Select, Stripe. Fills {payment}.",
+    link="The payment link. Fills {payment_link}, e.g. [{payment}]({payment_link}).",
 )
 @app_commands.autocomplete(tag=_package_tag_autocomplete)
 async def package_cmd(interaction: discord.Interaction, channel: typing.Union[discord.TextChannel, discord.ForumChannel], tag: str = "", delivery: typing.Optional[discord.TextChannel] = None, payment: str = "", link: str = ""):
@@ -2923,7 +2923,7 @@ async def package_cmd(interaction: discord.Interaction, channel: typing.Union[di
     if isinstance(channel, discord.ForumChannel):
         avail = getattr(channel, "available_tags", None) or []
         if not tag:
-            await interaction.response.send_message(embed=error_embed("Pick a tag", f"{channel.mention} is a forum — pick a tag in the `tag` option before running /package."), ephemeral=True)
+            await interaction.response.send_message(embed=error_embed("Pick a tag", f"{channel.mention} is a forum, pick a tag in the `tag` option before running /package."), ephemeral=True)
             return
         if not any(str(t.id) == str(tag) for t in avail):
             await interaction.response.send_message(embed=error_embed("Unknown tag", "That tag isn't on this forum. Open the `tag` option and pick one from the list."), ephemeral=True)
@@ -3172,10 +3172,10 @@ async def _qc_decide(interaction, submitter_id, accepted, reason=None, message_i
     # Acknowledge the reviewer privately, then delete the QC post to keep the
     # channel clean — the outcome lives in the submitter's DM (and the
     # Reference / Final Product threads stay for the record).
-    warn = "" if dm_ok or not submitter else f" (couldn't DM {submitter.display_name} — DMs closed)"
+    warn = "" if dm_ok or not submitter else f" (couldn't DM {submitter.display_name}, DMs closed)"
     try:
         await interaction.response.send_message(
-            embed=success_embed("Done", f"{'Accepted' if accepted else 'Denied'} — "
+            embed=success_embed("Done", f"{'Accepted' if accepted else 'Denied'}, "
                                         f"{'DM sent' if dm_ok else 'could not DM the submitter'}{warn}."), ephemeral=True)
     except Exception:
         pass
@@ -3224,22 +3224,22 @@ async def _run_form_log(interaction, key):
     await _open_form_page(interaction, key, 0)
 
 
-@bot.tree.command(name="orderlog", description="Log an order — fills in a quick form")
+@bot.tree.command(name="orderlog", description="Log an order with a quick form")
 async def orderlog_cmd(interaction: discord.Interaction):
     await _run_form_log(interaction, "orderlog")
 
 
-@bot.tree.command(name="infraction", description="Log an infraction — fills in a quick form")
+@bot.tree.command(name="infraction", description="Log an infraction with a quick form")
 async def infraction_cmd(interaction: discord.Interaction):
     await _run_form_log(interaction, "infraction")
 
 
-@bot.tree.command(name="promote", description="Log a promotion — fills in a quick form")
+@bot.tree.command(name="promote", description="Log a promotion with a quick form")
 async def promote_cmd(interaction: discord.Interaction):
     await _run_form_log(interaction, "promotion")
 
 
-@bot.tree.command(name="qualitycheck", description="Submit work for a quality check — upload files + fill the form")
+@bot.tree.command(name="qualitycheck", description="Submit work for a quality check: upload files and fill the form")
 async def qualitycheck_cmd(interaction: discord.Interaction):
     await _run_form_log(interaction, "qualitycheck")
 
@@ -3248,7 +3248,7 @@ async def qualitycheck_cmd(interaction: discord.Interaction):
 ROBLOX_KEEP = 0.70
 
 
-@bot.tree.command(name="tax", description="Roblox 30% tax — see your take-home and what to charge to hit a target")
+@bot.tree.command(name="tax", description="Roblox 30% tax: your take-home and what to charge to hit a target")
 @app_commands.describe(amount="An amount in Robux")
 async def tax_cmd(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 1000000000]):
     # Roblox skims 30% off every sale. Two things people want to know:
@@ -3258,7 +3258,7 @@ async def tax_cmd(interaction: discord.Interaction, amount: app_commands.Range[i
     need_to_charge = (amount * 10 + 6) // 7  # ceil(amount / 0.70)
     embed = info_embed(
         "Roblox Tax Calculator",
-        f"Roblox keeps **30%** of every sale — you keep **70%**.",
+        f"Roblox keeps **30%** of every sale, you keep **70%**.",
     )
     embed.add_field(
         name=f"If you charge R$ {amount:,}",
@@ -3401,7 +3401,7 @@ async def _rolelog_trigger(guild, member, kind, roles):
         # in the channel so someone can still add the reason.
         try:
             who = issuer.mention if issuer else "A staff member"
-            await ch.send(f"{who} — add the reason (10 min):", view=view,
+            await ch.send(f"{who}, add the reason (10 min):", view=view,
                           allowed_mentions=discord.AllowedMentions(users=[issuer] if issuer else False, roles=False))
         except Exception as e:
             print(f"[RoleLog] channel prompt failed: {e}")
@@ -3632,9 +3632,9 @@ class _RoleWatchSelect(discord.ui.RoleSelect):
         names = ", ".join(f"<@&{rid}>" for rid in role_ids)
         verb = "removed" if key == "infraction" else "added"
         trig = "all of them" if self._minv <= 0 or self._minv > len(role_ids) else f"{self._minv} of them"
-        note = "Saved permanently." if ok else f"Applied now, but couldn't write to the dashboard DB ({err}) — resets on a full restart."
+        note = "Saved permanently." if ok else f"Applied now, but couldn't write to the dashboard DB ({err}), resets on a full restart."
         ch = await resolve_channel(form_log_configs[key].get("channel_id"))
-        chnote = f"\nLogging to {ch.mention}." if ch else "\n⚠️ No log channel set for this yet — set one in the dashboard."
+        chnote = f"\nLogging to {ch.mention}." if ch else "\n⚠️ No log channel set for this yet, set one in the dashboard."
         await interaction.followup.send(
             embed=success_embed(f"{key.title()} roles set",
                                 f"Watching: {names}\nFires when **{trig}** are **{verb}**.{chnote}\n{note}"),
@@ -3655,7 +3655,7 @@ async def infractionroles_cmd(interaction: discord.Interaction, min: int = 0):
         await interaction.response.send_message(embed=error_embed("Admins only", "You need Manage Server."), ephemeral=True)
         return
     await interaction.response.send_message(
-        embed=info_embed("Infraction roles", "Pick the roles to watch — removing them (that many, within a few seconds) auto-logs an infraction."),
+        embed=info_embed("Infraction roles", "Pick the roles to watch, removing them (that many, within a few seconds) auto-logs an infraction."),
         view=_RoleWatchView("infraction", min), ephemeral=True)
 
 
@@ -3666,7 +3666,7 @@ async def promotionroles_cmd(interaction: discord.Interaction, min: int = 0):
         await interaction.response.send_message(embed=error_embed("Admins only", "You need Manage Server."), ephemeral=True)
         return
     await interaction.response.send_message(
-        embed=info_embed("Promotion roles", "Pick the roles to watch — adding them (that many, within a few seconds) auto-logs a promotion."),
+        embed=info_embed("Promotion roles", "Pick the roles to watch, adding them (that many, within a few seconds) auto-logs a promotion."),
         view=_RoleWatchView("promotion", min), ephemeral=True)
 
 
@@ -3777,7 +3777,7 @@ def _pricing_lines_text(si, guild=None):
             if usd:
                 parts.append(f"{cur}{usd}")
             if parts:  # only items this designer actually priced
-                lines.append(f"{item} — {' · '.join(parts)}")
+                lines.append(f"{item}, {' · '.join(parts)}")
         if lines:
             blocks.append(f"<@{uid}>\n" + "\n".join(lines))
     return "\n\n".join(blocks) if blocks else "No pricing set yet."
@@ -3837,7 +3837,7 @@ async def handle_pricing_pick(interaction, si):
     except Exception as ex:
         print(f"[Pricing] post failed: {ex}")
     content = (f"Posted **{name}** pricing below. Pick another to post it too."
-               if posted else "Couldn't post the pricing — please try again.")
+               if posted else "Couldn't post the pricing, please try again.")
     await _raw_interaction_reply(interaction, 7, content=content,
                                  components=[_pricing_service_select("pricing_svc")])
 
@@ -3923,7 +3923,7 @@ async def _open_setprice(interaction, si):
     options = [{"label": it[:100], "value": str(i)} for i, it in enumerate(items[:25])]
     row = {"type": 1, "components": [{"type": 3, "custom_id": f"setprice_item:{si}",
                                       "placeholder": "Pick an item to price", "options": options}]}
-    await _raw_interaction_reply(interaction, 7, content=f"**{name}** — pick an item:", components=[row])
+    await _raw_interaction_reply(interaction, 7, content=f"**{name}**, pick an item:", components=[row])
 
 
 async def _open_setprice_one(interaction, si, ii):
@@ -3940,10 +3940,10 @@ async def _open_setprice_one(interaction, si, ii):
     mine = ((pricing_config.get("values") or {}).get(name, {}) or {}).get(uid, {})
     robux, usd = _price_parts(mine.get(item))
     components = [
-        {"type": 18, "label": f"{item[:30]} — Robux",
+        {"type": 18, "label": f"{item[:30]}, Robux",
          "component": {"type": 4, "custom_id": "robux", "style": 1, "required": False,
                        "max_length": 20, "value": robux, "placeholder": "e.g. 1500 (blank = none)"}},
-        {"type": 18, "label": f"{item[:30]} — USD",
+        {"type": 18, "label": f"{item[:30]}, USD",
          "component": {"type": 4, "custom_id": "usd", "style": 1, "required": False,
                        "max_length": 20, "value": usd, "placeholder": "e.g. 15 (blank = none)"}},
     ]
@@ -4002,7 +4002,7 @@ def _joinsetup_service_rows():
         {"type": 1, "components": [{"type": 3, "custom_id": "joinsetup_svc",
                                     "placeholder": "Pick a service to set your prices", "options": options}]},
         {"type": 1, "components": [{"type": 2, "style": 3, "custom_id": "joinsetup_done",
-                                    "label": "Done — Create my portfolio"}]},
+                                    "label": "Done, Create my portfolio"}]},
     ]
 
 
@@ -4024,8 +4024,8 @@ async def joinsetup_cmd(interaction: discord.Interaction):
         application_id=bot.application_id, interaction_token=interaction.token,
     )
     await bot.http.request(route, json={
-        "content": "**Step 1 — Set your prices.** Pick each service and fill in your Robux/USD. "
-                   "When you're finished, click **Done — Create my portfolio**.",
+        "content": "**Step 1, Set your prices.** Pick each service and fill in your Robux/USD. "
+                   "When you're finished, click **Done, Create my portfolio**.",
         "components": _joinsetup_service_rows(),
     })
 
@@ -4045,9 +4045,9 @@ async def _joinsetup_open_item(interaction, si):
         {"type": 1, "components": [{"type": 3, "custom_id": f"joinsetup_item:{si}",
                                     "placeholder": "Pick an item to price", "options": options}]},
         {"type": 1, "components": [{"type": 2, "style": 3, "custom_id": "joinsetup_done",
-                                    "label": "Done — Create my portfolio"}]},
+                                    "label": "Done, Create my portfolio"}]},
     ]
-    await _raw_interaction_reply(interaction, 7, content=f"**{name}** — pick an item to price (or click Done when finished):", components=rows)
+    await _raw_interaction_reply(interaction, 7, content=f"**{name}**, pick an item to price (or click Done when finished):", components=rows)
 
 
 async def _joinsetup_open_one(interaction, si, ii):
@@ -4064,10 +4064,10 @@ async def _joinsetup_open_one(interaction, si, ii):
     mine = ((pricing_config.get("values") or {}).get(name, {}) or {}).get(uid, {})
     robux, usd = _price_parts(mine.get(item))
     components = [
-        {"type": 18, "label": f"{item[:30]} — Robux",
+        {"type": 18, "label": f"{item[:30]}, Robux",
          "component": {"type": 4, "custom_id": "robux", "style": 1, "required": False,
                        "max_length": 20, "value": robux, "placeholder": "e.g. 1500 (blank = none)"}},
-        {"type": 18, "label": f"{item[:30]} — USD",
+        {"type": 18, "label": f"{item[:30]}, USD",
          "component": {"type": 4, "custom_id": "usd", "style": 1, "required": False,
                        "max_length": 20, "value": usd, "placeholder": "e.g. 15 (blank = none)"}},
     ]
@@ -4094,7 +4094,7 @@ async def _joinsetup_one_submit(interaction, si, ii):
         "service": name, "user": str(interaction.user.id), "item": item, "robux": robux, "usd": usd,
     }])
     if ok:
-        note = f"Saved **{item}** ✓ — set more prices, or click **Done — Create my portfolio**."
+        note = f"Saved **{item}** ✓, set more prices, or click **Done, Create my portfolio**."
     else:
         note = f"Couldn't save **{item}**: {str(err)[:200]}"
     # Update the message (the modal was launched from a component) back to the picker.
@@ -4490,7 +4490,7 @@ async def on_interaction(interaction: discord.Interaction):
         # now — the real claim flow can be wired later.
         try:
             await interaction.response.send_message(
-                embed=success_embed("Claim received", "Thanks — a staff member will follow up on your claim."),
+                embed=success_embed("Claim received", "Thanks, a staff member will follow up on your claim."),
                 ephemeral=True)
         except Exception:
             pass
@@ -4921,7 +4921,7 @@ async def handle_ticket_form_submit(interaction, key, page=0):
             "type": 2, "style": 1, "custom_id": f"formcont:{key}|{page + 1}", "label": "Continue",
         }]}
         data = {"flags": 1 << 6,
-                "content": f"Saved — **{remaining}** more field{'s' if remaining != 1 else ''} to go. Tap **Continue**.",
+                "content": f"Saved, **{remaining}** more field{'s' if remaining != 1 else ''} to go. Tap **Continue**.",
                 "components": [row]}
         try:
             route = discord.http.Route(
@@ -6722,7 +6722,7 @@ async def _pkg_vault_files(delivery_ch, after_files):
                 if r.status_code != 200:
                     continue
                 msg = await delivery_ch.send(
-                    content=f"Finished product — {_clean_label(f.get('label') or 'File')}",
+                    content=f"Finished product, {_clean_label(f.get('label') or 'File')}",
                     file=discord.File(io.BytesIO(r.content), filename=fname))
                 refs.append({"channel_id": str(delivery_ch.id), "message_id": str(msg.id), "filename": fname})
             except Exception as e:
@@ -6818,7 +6818,7 @@ async def _pkg_download(interaction, pkg_msg_id):
     refs = (rec or {}).get("files") or []
     files = [f for f in [await _pkg_ref_to_file(r) for r in refs] if f]
     if not files:
-        await interaction.followup.send(embed=error_embed("Nothing to download", "That file isn't available anymore — please open a ticket for help."))
+        await interaction.followup.send(embed=error_embed("Nothing to download", "That file isn't available anymore, please open a ticket for help."))
         return
     await interaction.followup.send(files=files)
 
@@ -6887,7 +6887,7 @@ class _PkgBuyModal(discord.ui.Modal):
         self.agree = discord.ui.Checkbox(custom_id="agree")
         self.add_item(discord.ui.Label(text="Recipient", description="Buy for yourself, or gift it to someone.", component=self.recipient))
         self.add_item(discord.ui.Label(text="Gift Recipient (required if gifting)", component=self.ruser))
-        self.add_item(discord.ui.Label(text="Oversite Customs Sales & Refund Policy", description="Check to agree — required before checkout.", component=self.agree))
+        self.add_item(discord.ui.Label(text="Oversite Customs Sales & Refund Policy", description="Check to agree, required before checkout.", component=self.agree))
 
     async def on_submit(self, interaction):
         if not self.agree.value:
@@ -6932,7 +6932,7 @@ async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to):
         vch = str(roblox_config.get("channel_id") or "").strip()
         where = f"<#{vch}>" if vch else "the verification channel"
         await interaction.followup.send(
-            embed=error_embed("Verify first", f"Link your Roblox account before buying — head to {where}, verify, then try again."),
+            embed=error_embed("Verify first", f"Link your Roblox account before buying, head to {where}, verify, then try again."),
             ephemeral=True)
         return
     rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
@@ -6949,7 +6949,7 @@ async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to):
 
 
 def _pkg_gift_note(deliver_to, buyer_id):
-    return "" if str(deliver_to) == str(buyer_id) else f"\n\n🎁 This is a gift — the receipt goes to <@{deliver_to}>."
+    return "" if str(deliver_to) == str(buyer_id) else f"\n\n🎁 This is a gift, the receipt goes to <@{deliver_to}>."
 
 
 async def _pkg_flow_gamepass(interaction, title, pkg_msg_id, deliver_to):
@@ -6988,7 +6988,7 @@ async def _pkg_flow_stripe(interaction, price_field, pkg_msg_id, deliver_to):
     if not (isinstance(res, dict) and res.get("ok") and res.get("url")):
         err = (res or {}).get("error") if isinstance(res, dict) else None
         await interaction.followup.send(embed=error_embed(
-            "Stripe unavailable", f"Couldn't create a checkout link{f' — {err}' if err else ''}. Open a ticket in {help_to}."), ephemeral=True)
+            "Stripe unavailable", f"Couldn't create a checkout link{f', {err}' if err else ''}. Open a ticket in {help_to}."), ephemeral=True)
         return
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(label="Pay with Stripe", style=discord.ButtonStyle.link, url=res["url"]))
@@ -7019,7 +7019,7 @@ async def _pkg_flow_select(interaction, price_field, pkg_msg_id, deliver_to):
     if not (isinstance(res, dict) and res.get("ok") and res.get("url")):
         err = (res or {}).get("error") if isinstance(res, dict) else None
         await interaction.followup.send(embed=error_embed(
-            "Shirt unavailable", f"Couldn't set up a shirt{f' — {err}' if err else ''}. Open a ticket in {help_to}."), ephemeral=True)
+            "Shirt unavailable", f"Couldn't set up a shirt{f', {err}' if err else ''}. Open a ticket in {help_to}."), ephemeral=True)
         return
     url = res["url"]
     m = re.search(r"catalog/(\d+)", url)
@@ -7036,10 +7036,10 @@ async def _pkg_flow_select(interaction, price_field, pkg_msg_id, deliver_to):
 
 def _pkg_claimed_msg(dm_ok, target, buyer):
     if str(getattr(target, "id", buyer.id)) != str(buyer.id):
-        return (f"Delivered — the receipt was DM'd to {target.mention}." if dm_ok
-                else f"Couldn't DM {getattr(target, 'mention', 'the recipient')} — they may have DMs off.")
-    return ("Purchase confirmed — check your DMs for the receipt!" if dm_ok
-            else "Purchase confirmed! (I couldn't DM you — enable DMs to get the receipt.)")
+        return (f"Delivered, the receipt was DM'd to {target.mention}." if dm_ok
+                else f"Couldn't DM {getattr(target, 'mention', 'the recipient')}, they may have DMs off.")
+    return ("Purchase confirmed, check your DMs for the receipt!" if dm_ok
+            else "Purchase confirmed! (I couldn't DM you, enable DMs to get the receipt.)")
 
 
 async def _pkg_claim_stripe(interaction, pkg_msg_id="", deliver_to=""):
@@ -7063,15 +7063,15 @@ async def _pkg_claim_shirt(interaction, asset_id, pkg_msg_id="", deliver_to=""):
         await interaction.followup.send(embed=error_embed("Verify first", f"Link your Roblox account first, then claim. {help_to}"), ephemeral=True)
         return
     if not asset_id:
-        await interaction.followup.send(embed=error_embed("Couldn't verify", f"I lost track of which shirt this was — open a ticket in {help_to}."), ephemeral=True)
+        await interaction.followup.send(embed=error_embed("Couldn't verify", f"I lost track of which shirt this was, open a ticket in {help_to}."), ephemeral=True)
         return
     res = await _robux_locker_call("owns_asset", user_id=acct["roblox_id"], asset_id=str(asset_id))
     if not (isinstance(res, dict) and res.get("ok")):
-        await interaction.followup.send(embed=error_embed("Couldn't verify", f"Roblox didn't answer — try again shortly or open a ticket in {help_to}."), ephemeral=True)
+        await interaction.followup.send(embed=error_embed("Couldn't verify", f"Roblox didn't answer, try again shortly or open a ticket in {help_to}."), ephemeral=True)
         return
     if res.get("hidden"):
         await interaction.followup.send(embed=error_embed(
-            "Inventory is private", f"Make your Roblox inventory **public** so I can confirm the purchase, then click **Claim Package** again — or open a ticket in {help_to}."), ephemeral=True)
+            "Inventory is private", f"Make your Roblox inventory **public** so I can confirm the purchase, then click **Claim Package** again, or open a ticket in {help_to}."), ephemeral=True)
         return
     if not res.get("owned"):
         await interaction.followup.send(embed=error_embed(
@@ -7094,11 +7094,11 @@ async def _pkg_claim_gamepass(interaction, gamepass_id, pkg_msg_id="", deliver_t
         return
     res = await _robux_locker_call("owns_gamepass", user_id=acct["roblox_id"], gamepass_id=str(gamepass_id))
     if not (isinstance(res, dict) and res.get("ok")):
-        await interaction.followup.send(embed=error_embed("Couldn't verify", f"Roblox didn't answer — try again in a moment or open a ticket in {help_to}."), ephemeral=True)
+        await interaction.followup.send(embed=error_embed("Couldn't verify", f"Roblox didn't answer, try again in a moment or open a ticket in {help_to}."), ephemeral=True)
         return
     if res.get("hidden"):
         await interaction.followup.send(embed=error_embed(
-            "Inventory is private", f"Make your Roblox inventory **public** so I can confirm the purchase, then click **Claim Package** again — or open a ticket in {help_to}."), ephemeral=True)
+            "Inventory is private", f"Make your Roblox inventory **public** so I can confirm the purchase, then click **Claim Package** again, or open a ticket in {help_to}."), ephemeral=True)
         return
     if not res.get("owned"):
         await interaction.followup.send(embed=error_embed(
@@ -7133,17 +7133,17 @@ async def apply_roblox_verification(payload):
         try:
             await member.edit(nick=roblox_username[:32], reason="Roblox verified")
         except discord.Forbidden:
-            notes.append("• Couldn't set nickname — I need **Manage Nicknames**, and I can't rename the server owner or anyone with a role above mine.")
+            notes.append("• Couldn't set nickname, I need **Manage Nicknames**, and I can't rename the server owner or anyone with a role above mine.")
             print("[Verify] nickname change forbidden")
         except Exception as e:
-            notes.append(f"• Couldn't set nickname — {e}")
+            notes.append(f"• Couldn't set nickname, {e}")
             print(f"[Verify] nickname change failed: {e}")
 
     # Roles: add the configured verify roles, remove the configured ones.
     add_ids = roblox_config.get("verified_role_ids") or []
     remove_ids = roblox_config.get("remove_role_ids") or []
     if not add_ids:
-        notes.append("• No 'Roles to add on verify' is set in the dashboard — open the Verification block, pick one or more roles, and Save.")
+        notes.append("• No 'Roles to add on verify' is set in the dashboard, open the Verification block, pick one or more roles, and Save.")
         print("[Verify] no verified_role_ids configured")
 
     add_roles = [r for r in (guild.get_role(int(x)) for x in add_ids if str(x).isdigit()) if r]
@@ -7152,10 +7152,10 @@ async def apply_roblox_verification(payload):
             await member.add_roles(*add_roles, reason="Roblox verified")
             print(f"[Verify] added {[r.name for r in add_roles]} to {member}")
         except discord.Forbidden:
-            notes.append("• Couldn't add one or more verify roles — my role must sit **above** them in Server Settings → Roles, and I need **Manage Roles**.")
+            notes.append("• Couldn't add one or more verify roles, my role must sit **above** them in Server Settings → Roles, and I need **Manage Roles**.")
             print("[Verify] add roles forbidden (hierarchy/perms)")
         except Exception as e:
-            notes.append(f"• Couldn't add verify roles — {e}")
+            notes.append(f"• Couldn't add verify roles, {e}")
             print(f"[Verify] add roles failed: {e}")
 
     remove_roles = [r for r in (guild.get_role(int(x)) for x in remove_ids if str(x).isdigit()) if r and r in member.roles]
@@ -7164,10 +7164,10 @@ async def apply_roblox_verification(payload):
             await member.remove_roles(*remove_roles, reason="Roblox verified")
             print(f"[Verify] removed {[r.name for r in remove_roles]} from {member}")
         except discord.Forbidden:
-            notes.append("• Couldn't remove one or more roles — my role must sit **above** them in Server Settings → Roles, and I need **Manage Roles**.")
+            notes.append("• Couldn't remove one or more roles, my role must sit **above** them in Server Settings → Roles, and I need **Manage Roles**.")
             print("[Verify] remove roles forbidden (hierarchy/perms)")
         except Exception as e:
-            notes.append(f"• Couldn't remove roles — {e}")
+            notes.append(f"• Couldn't remove roles, {e}")
             print(f"[Verify] remove roles failed: {e}")
 
     # Report the outcome to the log channel so the owner can see it in Discord.
@@ -7178,13 +7178,13 @@ async def apply_roblox_verification(payload):
             try:
                 if notes:
                     await log_ch.send(embed=error_embed(
-                        "Verified — but something needs fixing",
+                        "Verified, but something needs fixing",
                         f"{member.mention} linked **{roblox_username}**, however:\n" + "\n".join(notes),
                     ))
                 else:
                     await log_ch.send(embed=success_embed(
                         "Roblox verified",
-                        f"{member.mention} linked **{roblox_username}** — nickname and role applied.",
+                        f"{member.mention} linked **{roblox_username}**, nickname and role applied.",
                     ))
             except Exception:
                 pass
@@ -7222,7 +7222,7 @@ async def start_roblox_verify(interaction):
         view = discord.ui.View()
         view.add_item(discord.ui.Button(label="Link Roblox", url=url, style=discord.ButtonStyle.link, emoji="🔗"))
         await interaction.followup.send(
-            "Click **Link Roblox** to log in. When Roblox says you're verified, come back here — your nickname and role update automatically.",
+            "Click **Link Roblox** to log in. When Roblox says you're verified, come back here, your nickname and role update automatically.",
             view=view,
             ephemeral=True,
         )
@@ -7712,7 +7712,7 @@ def _music_gate(interaction, need_dj=False):
     if not music_config.get("enabled"):
         return False, error_embed("Music is off", "The Music Add-On isn't enabled in the dashboard.")
     if yt_dlp is None:
-        return False, error_embed("Music unavailable", "The host is missing `yt-dlp` — add it to requirements and redeploy.")
+        return False, error_embed("Music unavailable", "The host is missing `yt-dlp`, add it to requirements and redeploy.")
     if need_dj and not _music_is_dj(interaction.user):
         return False, error_embed("DJ only", "Only a DJ (or Manage Server) can control playback.")
     return True, None
@@ -7818,7 +7818,7 @@ async def _yt_resolve(query):
         low = last_msg.lower()
         if saw_botcheck or "sign in to confirm" in low or "not a bot" in low:
             return None, ("YouTube blocked every method from this server's IP. This "
-                          "usually needs a PO-token provider or a proxy — tell me and "
+                          "usually needs a PO-token provider or a proxy, tell me and "
                           "I'll set one up. `/radio` still works in the meantime.")
         if "reload" in low:
             return None, ("YouTube wouldn't return a stream for that video. Try a "
@@ -7894,10 +7894,10 @@ async def _music_play_next(guild, _depth=0):
         # Bounded skip through the queue — never recurse for radio/loop (that's an
         # infinite loop) and cap depth so a bad queue can't blow the stack.
         if not st.get("radio") and not st.get("loop") and st["queue"] and _depth < 5:
-            await _music_announce(guild, error=f"Skipped **{track.get('title')}** — {err or 'no stream'}")
+            await _music_announce(guild, error=f"Skipped **{track.get('title')}**, {err or 'no stream'}")
             return await _music_play_next(guild, _depth + 1)
         st["current"] = None
-        await _music_announce(guild, error=f"Couldn't play **{track.get('title')}** — {err or 'no stream'}")
+        await _music_announce(guild, error=f"Couldn't play **{track.get('title')}**, {err or 'no stream'}")
         return
     # Never stack ffmpeg processes: stop whatever is playing first.
     try:
@@ -7937,7 +7937,7 @@ async def _music_play_next(guild, _depth=0):
             print("[Music] too many rapid failures — stopping to avoid a respawn loop")
             try:
                 asyncio.run_coroutine_threadsafe(
-                    _music_announce(guild, error="This source keeps failing to play — stopped. "
+                    _music_announce(guild, error="This source keeps failing to play, stopped. "
                                     "Try again, a different song, or another `/radio` genre."),
                     bot.loop)
             except Exception:
@@ -8035,7 +8035,7 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         await _music_play_next(interaction.guild)
         await interaction.followup.send(embed=success_embed("Playing", f"**{track['title']}**"), ephemeral=True)
     else:
-        await interaction.followup.send(embed=success_embed("Added to queue", f"**{track['title']}** — #{pos} in queue"), ephemeral=True)
+        await interaction.followup.send(embed=success_embed("Added to queue", f"**{track['title']}**, #{pos} in queue"), ephemeral=True)
 
 
 @bot.tree.command(name="skip", description="Skip the current song")
@@ -8117,7 +8117,7 @@ async def volume_cmd(interaction: discord.Interaction, percent: app_commands.Ran
         return
     st = _music_state(interaction.guild_id)
     st["volume"] = percent / 100.0
-    await interaction.response.send_message(embed=success_embed("Volume", f"Set to **{percent}%** — applies to the next song."), ephemeral=True)
+    await interaction.response.send_message(embed=success_embed("Volume", f"Set to **{percent}%**, applies to the next song."), ephemeral=True)
 
 
 @bot.tree.command(name="loop", description="Toggle looping the current song")
@@ -8141,10 +8141,10 @@ async def queue_cmd(interaction: discord.Interaction):
     cur = st.get("current")
     lines = []
     if cur:
-        lines.append(f"**Now:** [{cur.get('title')}]({cur.get('webpage_url') or ''}) — {cur.get('requester_name', '')}")
+        lines.append(f"**Now:** [{cur.get('title')}]({cur.get('webpage_url') or ''}), {cur.get('requester_name', '')}")
     if st["queue"]:
         for i, t in enumerate(st["queue"][:15], 1):
-            lines.append(f"`{i}.` {t.get('title')} — {t.get('requester_name', '')}")
+            lines.append(f"`{i}.` {t.get('title')}, {t.get('requester_name', '')}")
         extra = len(st["queue"]) - 15
         if extra > 0:
             lines.append(f"…and **{extra}** more")
