@@ -3051,11 +3051,37 @@ async def _post_qualitycheck(interaction, comps, files=None):
         await interaction.followup.send(embed=error_embed("No channel", "Pick a Quality Check channel in the dashboard first."), ephemeral=True)
         return
     submitter = interaction.user
+    files = list(files or [])
+
+    # Group uploaded files by their field label (e.g. "Reference", "Final
+    # Product"). Each distinct group becomes its OWN thread hanging off the QC
+    # channel, and the matching **Label** line in the card links to it — so
+    # "Reference" and "Final Product" each land in a separate, linked thread.
+    groups = {}
+    for up in files:
+        lbl = _clean_label(up.get("label") or "Files") or "Files"
+        groups.setdefault(lbl, []).append(up)
+
+    # Build each thread first so we can drop a clickable link into the card.
+    thread_links = {}  # cleaned label -> thread
+    qc_name = _san_name(getattr(submitter, "display_name", None) or submitter.name)
+    for lbl, ups in groups.items():
+        tname = f"{lbl} · {qc_name}"[:100]
+        thread = await _post_form_files_thread(ch, None, ups, thread_name=tname)
+        if thread is not None:
+            thread_links[lbl] = thread
+
+    ts = int(time.time())
 
     def _js(s):
         return json.dumps(str(s))[1:-1]
     raw = json.dumps(comps or [])
     raw = raw.replace("{user}", _js(submitter.mention)).replace("{username}", _js(submitter.display_name))
+    raw = raw.replace("{date}", _js(f"<t:{ts}:F>"))
+    # _apply_answers rendered each {File: LABEL} as "**LABEL**" — turn those into
+    # links to the thread that now holds those uploads.
+    for lbl, thread in thread_links.items():
+        raw = raw.replace(_js(f"**{lbl}**"), _js(f"**{lbl}:** <#{thread.id}>"))
     try:
         final = json.loads(raw)
     except Exception:
@@ -3064,11 +3090,8 @@ async def _post_qualitycheck(interaction, comps, files=None):
     accept = {"type": 2, "style": 3, "label": "Accept", "custom_id": f"qc_accept:{submitter.id}"}
     deny = {"type": 2, "style": 4, "label": "Deny", "custom_id": f"qc_deny:{submitter.id}"}
     _V2_LAST_ERROR["msg"] = ""
-    mid = None
-    if files:
-        mid = await _send_v2_with_files(ch, final, files, allowed_mentions={"parse": []}, buttons=[accept, deny])
-    if not mid:
-        mid = await send_v2_message(ch, final, allowed_mentions={"parse": []}, buttons=[accept, deny])
+    # Card carries the layout + thread links + Accept/Deny — files live in threads.
+    mid = await send_v2_message(ch, final, allowed_mentions={"parse": []}, buttons=[accept, deny])
     if mid:
         await interaction.followup.send(embed=success_embed("Submitted", f"Your quality check was sent to {ch.mention} for review."), ephemeral=True)
     else:
