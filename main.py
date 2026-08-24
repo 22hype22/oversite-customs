@@ -156,6 +156,7 @@ FORM_LOG_DEFS = {
     "customs-orderlog":   {"key": "orderlog",   "title": "Order Log"},
     "customs-infraction": {"key": "infraction", "title": "Infraction Log"},
     "customs-promotion":  {"key": "promotion",  "title": "Promotion Log"},
+    "customs-qualitycheck": {"key": "qualitycheck", "title": "Quality Check"},
 }
 form_log_configs = {
     d["key"]: {"components": [], "channel_id": "", "allowed_role_ids": [],
@@ -3026,6 +3027,135 @@ async def _post_form_log(interaction, key, comps, files=None):
         await interaction.followup.send(embed=error_embed("Couldn't post", f"Discord rejected the message: {reason}"), ephemeral=True)
 
 
+# ===================== Quality Check (/qualitycheck) =====================
+# /qualitycheck pops the configured form (upload files + questions), posts it to
+# the QC channel with Accept / Deny buttons. Accept DMs the submitter that they
+# passed; Deny asks the reviewer for a reason, then DMs the submitter the reason
+# and who denied it. The submitter's id rides in the button custom_ids.
+_qc_decided = {}  # channel_msg_id -> {"by": reviewer_id, "accepted": bool}
+
+
+def _qc_can_review(member):
+    try:
+        if member.guild_permissions.manage_guild:
+            return True
+    except Exception:
+        pass
+    return has_any_role(member, form_log_configs.get("qualitycheck", {}).get("allowed_role_ids", []))
+
+
+async def _post_qualitycheck(interaction, comps, files=None):
+    cfg = form_log_configs.get("qualitycheck", {})
+    ch = await resolve_channel(cfg.get("channel_id"))
+    if not ch:
+        await interaction.followup.send(embed=error_embed("No channel", "Pick a Quality Check channel in the dashboard first."), ephemeral=True)
+        return
+    submitter = interaction.user
+
+    def _js(s):
+        return json.dumps(str(s))[1:-1]
+    raw = json.dumps(comps or [])
+    raw = raw.replace("{user}", _js(submitter.mention)).replace("{username}", _js(submitter.display_name))
+    try:
+        final = json.loads(raw)
+    except Exception:
+        final = comps or []
+
+    accept = {"type": 2, "style": 3, "label": "Accept", "custom_id": f"qc_accept:{submitter.id}"}
+    deny = {"type": 2, "style": 4, "label": "Deny", "custom_id": f"qc_deny:{submitter.id}"}
+    _V2_LAST_ERROR["msg"] = ""
+    mid = None
+    if files:
+        mid = await _send_v2_with_files(ch, final, files, allowed_mentions={"parse": []}, buttons=[accept, deny])
+    if not mid:
+        mid = await send_v2_message(ch, final, allowed_mentions={"parse": []}, buttons=[accept, deny])
+    if mid:
+        await interaction.followup.send(embed=success_embed("Submitted", f"Your quality check was sent to {ch.mention} for review."), ephemeral=True)
+    else:
+        reason = _V2_LAST_ERROR.get("msg") or "unknown error"
+        await interaction.followup.send(embed=error_embed("Couldn't submit", f"Discord rejected the message: {reason}"), ephemeral=True)
+
+
+class _QCDenyModal(discord.ui.Modal):
+    def __init__(self, submitter_id, message_id):
+        super().__init__(title="Deny Quality Check", timeout=600)
+        self._submitter_id = str(submitter_id)
+        self._message_id = message_id
+        self.reason = discord.ui.TextInput(
+            label="Reason for denial", style=discord.TextStyle.paragraph,
+            required=True, max_length=800, placeholder="Tell them what to fix…")
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction):
+        await _qc_decide(interaction, self._submitter_id, accepted=False,
+                         reason=(self.reason.value or "").strip(), message_id=self._message_id)
+
+
+async def _qc_open_deny(interaction, submitter_id):
+    if not _qc_can_review(interaction.user):
+        await interaction.response.send_message(embed=error_embed("Not allowed", "You can't review quality checks."), ephemeral=True)
+        return
+    mid = interaction.message.id if interaction.message else 0
+    if mid in _qc_decided:
+        d = _qc_decided[mid]
+        await interaction.response.send_message(embed=error_embed("Already reviewed", f"This was already {'accepted' if d['accepted'] else 'denied'} by <@{d['by']}>."), ephemeral=True)
+        return
+    try:
+        await interaction.response.send_modal(_QCDenyModal(submitter_id, mid))
+    except Exception as e:
+        await interaction.response.send_message(embed=error_embed("Couldn't open form", str(e)[:150]), ephemeral=True)
+
+
+async def _qc_decide(interaction, submitter_id, accepted, reason=None, message_id=None):
+    if not _qc_can_review(interaction.user):
+        await interaction.response.send_message(embed=error_embed("Not allowed", "You can't review quality checks."), ephemeral=True)
+        return
+    mid = message_id if message_id else (interaction.message.id if interaction.message else 0)
+    if mid in _qc_decided:
+        d = _qc_decided[mid]
+        await interaction.response.send_message(embed=error_embed("Already reviewed", f"This was already {'accepted' if d['accepted'] else 'denied'} by <@{d['by']}>."), ephemeral=True)
+        return
+    _qc_decided[mid] = {"by": interaction.user.id, "accepted": accepted}
+    guild = interaction.guild
+    submitter = guild.get_member(int(submitter_id)) if (guild and str(submitter_id).isdigit()) else None
+    dm_ok = False
+    if submitter:
+        try:
+            dm = await submitter.create_dm()
+            if accepted:
+                await dm.send(embed=success_embed(
+                    "Quality Check Accepted",
+                    f"Your quality check was **accepted** by {interaction.user.mention}. 🎉"))
+            else:
+                await dm.send(embed=error_embed(
+                    "Quality Check Denied",
+                    f"Your quality check was **denied** by {interaction.user.mention}.\n\n"
+                    f"**Reason:** {reason or 'No reason provided.'}"))
+            dm_ok = True
+        except Exception as e:
+            print(f"[QC] DM to submitter failed: {e}")
+    # Post a short status under the submission and disable further review.
+    try:
+        ch = interaction.channel
+        if ch:
+            if accepted:
+                note = f"✅ **Accepted** by {interaction.user.mention}."
+            else:
+                note = f"❌ **Denied** by {interaction.user.mention} — {reason or 'No reason provided.'}"
+            if submitter and not dm_ok:
+                note += f"\n⚠️ Couldn't DM {submitter.mention} (their DMs are closed)."
+            ref = discord.MessageReference(message_id=mid, channel_id=ch.id, fail_if_not_exists=False) if mid else None
+            await ch.send(note, reference=ref, allowed_mentions=discord.AllowedMentions(users=False, roles=False))
+    except Exception as e:
+        print(f"[QC] status post failed: {e}")
+    try:
+        await interaction.response.send_message(
+            embed=success_embed("Done", f"{'Accepted' if accepted else 'Denied'} — "
+                                        f"{'DM sent.' if dm_ok else 'could not DM the submitter.'}"), ephemeral=True)
+    except Exception:
+        pass
+
+
 async def _run_form_log(interaction, key):
     """Shared /orderlog, /infraction, /promote flow: gate → pop the form built
     from {Question:} tokens → post the filled-in design to the channel."""
@@ -3063,6 +3193,11 @@ async def infraction_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="promote", description="Log a promotion — fills in a quick form")
 async def promote_cmd(interaction: discord.Interaction):
     await _run_form_log(interaction, "promotion")
+
+
+@bot.tree.command(name="qualitycheck", description="Submit work for a quality check — upload files + fill the form")
+async def qualitycheck_cmd(interaction: discord.Interaction):
+    await _run_form_log(interaction, "qualitycheck")
 
 
 # ===================== Auto infraction / promotion logging =====================
@@ -4258,6 +4393,10 @@ async def on_interaction(interaction: discord.Interaction):
         await _joinsetup_done(interaction)
     elif cid.startswith("infrreason:"):
         await _rolelog_open_reason(interaction, cid)
+    elif cid.startswith("qc_accept:"):
+        await _qc_decide(interaction, cid.split(":", 1)[1], accepted=True)
+    elif cid.startswith("qc_deny:"):
+        await _qc_open_deny(interaction, cid.split(":", 1)[1])
     elif cid.startswith("pkg_buy:"):
         await _pkg_handle_buy(interaction, cid.split(":", 1)[1])
     elif cid.startswith("pkg_claim:gp:"):
@@ -4448,7 +4587,7 @@ def _san_filename(name, fallback="file"):
     return n[:80]
 
 
-async def _send_v2_with_files(channel, components_v2, files, allowed_mentions=None):
+async def _send_v2_with_files(channel, components_v2, files, allowed_mentions=None, buttons=None):
     """Send a Components-V2 message with uploaded files embedded INSIDE it — each
     as a labelled File component (type 13) or, for images, a Media Gallery (type
     12) — sent as multipart with the real attachments. `files` = [{label, url,
@@ -4484,6 +4623,8 @@ async def _send_v2_with_files(channel, components_v2, files, allowed_mentions=No
     ALLOWED_TOP = {1, 9, 10, 12, 13, 14, 17}
     if not {c.get("type") for c in built}.issubset(ALLOWED_TOP):
         built = [{"type": 17, "components": built}]
+    if buttons:
+        built.append({"type": 1, "components": list(buttons)})
     payload = {"components": built, "flags": 1 << 15, "attachments": attachments}
     if allowed_mentions is not None:
         payload["allowed_mentions"] = allowed_mentions
@@ -4732,6 +4873,9 @@ async def handle_ticket_form_submit(interaction, key, page=0):
             await _post_package_form(interaction, open_comps, mapping, files=files)
             return
         substituted = _apply_answers(open_comps, mapping)
+        if key == "qualitycheck":
+            await _post_qualitycheck(interaction, substituted, files=files)
+            return
         if key in form_log_configs:
             await _post_form_log(interaction, key, substituted, files=files)
             return
@@ -7051,7 +7195,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
