@@ -3244,6 +3244,35 @@ async def qualitycheck_cmd(interaction: discord.Interaction):
     await _run_form_log(interaction, "qualitycheck")
 
 
+# Roblox takes a 30% marketplace fee, so a seller keeps 70% of any Robux sale.
+ROBLOX_KEEP = 0.70
+
+
+@bot.tree.command(name="tax", description="Roblox 30% tax — see your take-home and what to charge to hit a target")
+@app_commands.describe(amount="An amount in Robux")
+async def tax_cmd(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 1000000000]):
+    # Roblox skims 30% off every sale. Two things people want to know:
+    #  • charge this amount  -> what actually lands in your account (70%)
+    #  • want this amount     -> what you must charge so 70% == that amount
+    take_home = amount * 7 // 10            # floor(amount * 0.70)
+    need_to_charge = (amount * 10 + 6) // 7  # ceil(amount / 0.70)
+    embed = info_embed(
+        "Roblox Tax Calculator",
+        f"Roblox keeps **30%** of every sale — you keep **70%**.",
+    )
+    embed.add_field(
+        name=f"If you charge R$ {amount:,}",
+        value=f"You take home **R$ {take_home:,}** after tax.",
+        inline=False,
+    )
+    embed.add_field(
+        name=f"To take home R$ {amount:,}",
+        value=f"You need to charge **R$ {need_to_charge:,}**.",
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # ===================== Auto infraction / promotion logging =====================
 # When a dashboard-configured "watched" team role is REMOVED from a member we open
 # an Infraction log; when one is ADDED we open a Promotion log. The staff member
