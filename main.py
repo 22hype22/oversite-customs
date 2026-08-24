@@ -3091,7 +3091,9 @@ async def _post_qualitycheck(interaction, comps, files=None):
     deny = {"type": 2, "style": 4, "label": "Deny", "custom_id": f"qc_deny:{submitter.id}"}
     _V2_LAST_ERROR["msg"] = ""
     # Card carries the layout + thread links + Accept/Deny — files live in threads.
-    mid = await send_v2_message(ch, final, allowed_mentions={"parse": []}, buttons=[accept, deny])
+    # Allow role/user mentions written into the design (e.g. @Quality Control) to
+    # actually ping; @everyone/@here stay suppressed.
+    mid = await send_v2_message(ch, final, allowed_mentions={"parse": ["users", "roles"]}, buttons=[accept, deny])
     if mid:
         await interaction.followup.send(embed=success_embed("Submitted", f"Your quality check was sent to {ch.mention} for review."), ephemeral=True)
     else:
