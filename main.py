@@ -3302,10 +3302,12 @@ def _rolelog_hits(changed_roles, groups):
 
 
 # member_id -> {"removed": {id: role}, "added": {id: role}, "task": Task}
-# Role changes are accumulated over a short window so a "set" still fires whether
-# the roles are pulled all at once or one-by-one.
+# Role changes are accumulated over a window so a "set" still fires whether the
+# roles are pulled all at once or one-by-one. The timer RESETS on every new role
+# change for that member, so it keeps watching until you STOP removing roles for
+# this long — then it logs everything you removed together (whether that's 3 or 5).
 _rolelog_accum = {}
-_ROLELOG_WINDOW = 4.0
+_ROLELOG_WINDOW = 12.0
 
 
 async def _rolelog_eval_later(guild_id, member_id):
