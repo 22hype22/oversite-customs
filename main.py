@@ -3148,7 +3148,7 @@ async def _qc_decide(interaction, submitter_id, accepted, reason=None, message_i
             if accepted:
                 await dm.send(embed=success_embed(
                     "Quality Check Accepted",
-                    f"Your quality check was **accepted** by {interaction.user.mention}. 🎉"))
+                    f"Your quality check was **accepted** by {interaction.user.mention}."))
             else:
                 await dm.send(embed=error_embed(
                     "Quality Check Denied",
