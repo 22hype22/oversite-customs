@@ -3033,6 +3033,7 @@ async def _post_form_log(interaction, key, comps, files=None):
 # passed; Deny asks the reviewer for a reason, then DMs the submitter the reason
 # and who denied it. The submitter's id rides in the button custom_ids.
 _qc_decided = {}  # channel_msg_id -> {"by": reviewer_id, "accepted": bool}
+_qc_threads = {}  # channel_msg_id -> [thread, ...]  (deleted with the post on decision)
 
 
 def _qc_can_review(member):
@@ -3095,6 +3096,12 @@ async def _post_qualitycheck(interaction, comps, files=None):
     # actually ping; @everyone/@here stay suppressed.
     mid = await send_v2_message(ch, final, allowed_mentions={"parse": ["users", "roles"]}, buttons=[accept, deny])
     if mid:
+        # Remember the threads so Accept/Deny can delete them along with the post.
+        try:
+            if thread_links:
+                _qc_threads[int(mid)] = list(thread_links.values())
+        except Exception:
+            pass
         await interaction.followup.send(embed=success_embed("Submitted", f"Your quality check was sent to {ch.mention} for review."), ephemeral=True)
     else:
         reason = _V2_LAST_ERROR.get("msg") or "unknown error"
@@ -3182,6 +3189,12 @@ async def _qc_decide(interaction, submitter_id, accepted, reason=None, message_i
             await target.delete()
     except Exception as e:
         print(f"[QC] delete submission failed: {e}")
+    # Delete the Reference / Final Product threads too so nothing is left behind.
+    for th in _qc_threads.pop(int(mid) if mid else 0, []):
+        try:
+            await th.delete()
+        except Exception as e:
+            print(f"[QC] delete thread failed: {e}")
 
 
 async def _run_form_log(interaction, key):
