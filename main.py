@@ -160,7 +160,7 @@ FORM_LOG_DEFS = {
 }
 form_log_configs = {
     d["key"]: {"components": [], "channel_id": "", "allowed_role_ids": [],
-               "watched_role_ids": [], "groups": []}
+               "run_role_ids": [], "watched_role_ids": [], "groups": []}
     for d in FORM_LOG_DEFS.values()
 }
 form_log_titles = {d["key"]: d["title"] for d in FORM_LOG_DEFS.values()}
@@ -452,7 +452,10 @@ def _rebuild_ticket_registry():
 def _form_log_can_run(key, member):
     """Allowed if no roles set (open to all), member has an allowed role, or has
     Manage Server."""
-    role_ids = form_log_configs.get(key, {}).get("allowed_role_ids", [])
+    cfg = form_log_configs.get(key, {})
+    # Quality Check separates "who can run /qualitycheck" (run_role_ids) from
+    # "who can Accept/Deny" (allowed_role_ids). Other form logs use allowed_role_ids.
+    role_ids = (cfg.get("run_role_ids") if key == "qualitycheck" else cfg.get("allowed_role_ids")) or []
     if not role_ids:
         return True
     try:
@@ -6067,6 +6070,7 @@ async def apply_config(feature, cfg, post_panel=False):
         fc["components"] = comps if isinstance(comps, list) else []
         fc["channel_id"] = str(cfg.get("channel_id") or "")
         fc["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
+        fc["run_role_ids"] = [str(x) for x in (cfg.get("run_role_ids") or []) if x]
         # Watched role SETS: each set auto-triggers a log when at least `min` of its
         # roles are added (promotion) / removed (infraction) from a member.
         fc["groups"] = _parse_role_groups(cfg)
