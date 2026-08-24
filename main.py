@@ -3169,21 +3169,23 @@ async def _rolelog_trigger(guild, member, kind, roles):
     }
     asyncio.create_task(_rolelog_expire(log_id))
 
-    # 2) DM the person who made the change: a copy + a Reason button.
+    # 2) DM the person who made the change: a copy of the log with the reason
+    #    button attached directly to it (green, no emoji, "{noun} Reasoning").
+    btn = {"type": 2, "style": 3, "label": f"{meta['noun']} Reasoning",
+           "custom_id": f"infrreason:{log_id}"}
     view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(label="Reason", style=discord.ButtonStyle.primary,
-                                    custom_id=f"infrreason:{log_id}", emoji="📝"))
+    view.add_item(discord.ui.Button(label=f"{meta['noun']} Reasoning",
+                                    style=discord.ButtonStyle.success, custom_id=f"infrreason:{log_id}"))
     dmed = False
     if issuer:
         try:
             dm = await issuer.create_dm()
             if final:
-                await send_v2_message(dm, final, allowed_mentions={"parse": []})
+                mid = await send_v2_message(dm, final, allowed_mentions={"parse": []}, buttons=[btn])
+                dmed = bool(mid)
             else:
-                await dm.send(txt)
-            await dm.send(f"You {meta['verb']} {roles_text} {meta['prep']} {target_txt}. "
-                          f"Add the reason within 10 minutes:", view=view)
-            dmed = True
+                await dm.send(txt, view=view)
+                dmed = True
         except Exception as e:
             print(f"[RoleLog] DM to issuer failed: {e}")
     if not dmed:
@@ -3191,7 +3193,7 @@ async def _rolelog_trigger(guild, member, kind, roles):
         # in the channel so someone can still add the reason.
         try:
             who = issuer.mention if issuer else "A staff member"
-            await ch.send(f"{meta['emoji']} {who} — add the reason (10 min):", view=view,
+            await ch.send(f"{who} — add the reason (10 min):", view=view,
                           allowed_mentions=discord.AllowedMentions(users=[issuer] if issuer else False, roles=False))
         except Exception as e:
             print(f"[RoleLog] channel prompt failed: {e}")
@@ -5461,7 +5463,7 @@ def _build_v2(comp, guild):
     return None
 
 
-async def send_v2_message(channel, components_v2, content=None, interaction=None, ephemeral=False, allowed_mentions=None):
+async def send_v2_message(channel, components_v2, content=None, interaction=None, ephemeral=False, allowed_mentions=None, buttons=None):
     _guild = getattr(channel, "guild", None)
 
     built = [b for b in (_build_v2(c, _guild) for c in components_v2) if b]
@@ -5474,6 +5476,9 @@ async def send_v2_message(channel, components_v2, content=None, interaction=None
     top_types = {c.get("type") for c in built}
     if not top_types.issubset(ALLOWED_TOP):
         built = [{"type": 17, "components": built}]
+    # Attach buttons as an action row directly on this message (raw button dicts).
+    if buttons:
+        built.append({"type": 1, "components": list(buttons)})
     flags = 1 << 15
     if ephemeral:
         flags |= 1 << 6
