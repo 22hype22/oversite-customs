@@ -3157,26 +3157,29 @@ async def _qc_decide(interaction, submitter_id, accepted, reason=None, message_i
             dm_ok = True
         except Exception as e:
             print(f"[QC] DM to submitter failed: {e}")
-    # Post a short status under the submission and disable further review.
-    try:
-        ch = interaction.channel
-        if ch:
-            if accepted:
-                note = f"✅ **Accepted** by {interaction.user.mention}."
-            else:
-                note = f"❌ **Denied** by {interaction.user.mention} — {reason or 'No reason provided.'}"
-            if submitter and not dm_ok:
-                note += f"\n⚠️ Couldn't DM {submitter.mention} (their DMs are closed)."
-            ref = discord.MessageReference(message_id=mid, channel_id=ch.id, fail_if_not_exists=False) if mid else None
-            await ch.send(note, reference=ref, allowed_mentions=discord.AllowedMentions(users=False, roles=False))
-    except Exception as e:
-        print(f"[QC] status post failed: {e}")
+    # Acknowledge the reviewer privately, then delete the QC post to keep the
+    # channel clean — the outcome lives in the submitter's DM (and the
+    # Reference / Final Product threads stay for the record).
+    warn = "" if dm_ok or not submitter else f" (couldn't DM {submitter.display_name} — DMs closed)"
     try:
         await interaction.response.send_message(
             embed=success_embed("Done", f"{'Accepted' if accepted else 'Denied'} — "
-                                        f"{'DM sent.' if dm_ok else 'could not DM the submitter.'}"), ephemeral=True)
+                                        f"{'DM sent' if dm_ok else 'could not DM the submitter'}{warn}."), ephemeral=True)
     except Exception:
         pass
+    try:
+        target = interaction.message if (interaction.message and mid and interaction.message.id == mid) else None
+        if target is None and mid:
+            ch = interaction.channel
+            if ch:
+                try:
+                    target = await ch.fetch_message(mid)
+                except Exception:
+                    target = None
+        if target is not None:
+            await target.delete()
+    except Exception as e:
+        print(f"[QC] delete submission failed: {e}")
 
 
 async def _run_form_log(interaction, key):
