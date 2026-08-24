@@ -3271,6 +3271,13 @@ async def on_member_update(before, after):
         pro_ids = _rolelog_watched_ids("promotion")
         w_removed = [r for r in (bset - aset) if str(r.id) in inf_ids]
         w_added = [r for r in (aset - bset) if str(r.id) in pro_ids]
+        # Diagnostic: show every role change and whether it matched the watch list.
+        rem_ids = [str(r.id) for r in (bset - aset)]
+        add_ids = [str(r.id) for r in (aset - bset)]
+        if rem_ids or add_ids:
+            print(f"[RoleLog] member_update {after.id} ({after.display_name}): "
+                  f"removed={rem_ids} added={add_ids} | watched={sorted(inf_ids)} | "
+                  f"matched_removed={[str(r.id) for r in w_removed]}")
         if not w_removed and not w_added:
             return
         acc = _rolelog_accum.get(after.id)
