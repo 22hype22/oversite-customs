@@ -3160,19 +3160,47 @@ async def _rolelog_post(interaction, kind, target_id, roles_text, reason, channe
     target = guild.get_member(target_id) if guild else None
     target_txt = target.mention if target else f"<@{target_id}>"
     ts = int(discord.utils.utcnow().timestamp())
+    date_txt = f"<t:{ts}:F>"
+    logger_txt = interaction.user.mention
     header = "Infraction Logs" if kind == "infraction" else "Promotion Logs"
-    content = (
-        f"## **{header}**\n\n"
-        f"User: {target_txt}\n"
-        f"Reason: {reason}\n"
-        f"Logger: {interaction.user.mention}\n\n"
-        f"Date: <t:{ts}:F>"
-    )
-    try:
-        await ch.send(content, allowed_mentions=discord.AllowedMentions(users=False, roles=False))
-    except Exception as ex:
-        await interaction.followup.send(embed=error_embed("Couldn't post", str(ex)[:150]), ephemeral=True)
-        return
+
+    posted = False
+    # Prefer the dashboard's V2 design (with images/formatting) if one is set.
+    # Tokens: {Question:...}=reason, {user}=logger, {target}/{infractor}=affected
+    # member, {date}=timestamp, {roles}=the changed roles.
+    comps = form_log_configs.get(kind, {}).get("components") or []
+    if comps:
+        def _js(s):
+            return json.dumps(str(s))[1:-1]
+        try:
+            raw = json.dumps(comps)
+            raw = re.sub(r"\{Question:[^}]*\}", _js(reason), raw)
+            raw = re.sub(r"\{File:[^}]*\}", "", raw)
+            raw = (raw.replace("{user}", _js(logger_txt))
+                      .replace("{username}", _js(interaction.user.display_name))
+                      .replace("{target}", _js(target_txt))
+                      .replace("{infractor}", _js(target_txt))
+                      .replace("{date}", _js(date_txt))
+                      .replace("{roles}", _js(roles_text or "—")))
+            final = json.loads(raw)
+            mid = await send_v2_message(ch, final, allowed_mentions={"parse": []})
+            posted = bool(mid)
+        except Exception as ex:
+            print(f"[RoleLog] V2 design render failed, using plain text: {ex}")
+
+    if not posted:
+        content = (
+            f"## **{header}**\n\n"
+            f"User: {target_txt}\n"
+            f"Reason: {reason}\n"
+            f"Logger: {logger_txt}\n\n"
+            f"Date: {date_txt}"
+        )
+        try:
+            await ch.send(content, allowed_mentions=discord.AllowedMentions(users=False, roles=False))
+        except Exception as ex:
+            await interaction.followup.send(embed=error_embed("Couldn't post", str(ex)[:150]), ephemeral=True)
+            return
     if prompt_msg_id:
         try:
             pm = await ch.fetch_message(prompt_msg_id)
