@@ -3099,40 +3099,110 @@ async def _find_role_changer(guild, target_id):
     return None
 
 
+_ROLELOG_EDIT_WINDOW = 600  # seconds the reason can still be added / changed
+
+
+async def _rolelog_render(kind, target_txt, logger_txt, roles_text, reason, date_txt):
+    """Return (v2_components_or_None, plain_text) for the log, rendered from the
+    dashboard V2 design if one is set."""
+    comps = form_log_configs.get(kind, {}).get("components") or []
+    if comps:
+        try:
+            def _js(s):
+                return json.dumps(str(s))[1:-1]
+            roles_val = _js(roles_text or "—")
+            raw = json.dumps(comps)
+            raw = re.sub(r"\{Question:[^}]*\}", _js(reason), raw)
+            raw = re.sub(r"\{File:[^}]*\}", "", raw)
+            raw = (raw.replace("{user}", _js(logger_txt))
+                      .replace("{target}", _js(target_txt)).replace("{infractor}", _js(target_txt))
+                      .replace("{date}", _js(date_txt))
+                      .replace("{roles}", roles_val)
+                      .replace("{roles removed}", roles_val).replace("{roles_removed}", roles_val)
+                      .replace("{roles added}", roles_val).replace("{roles_added}", roles_val))
+            return json.loads(raw), None
+        except Exception as e:
+            print(f"[RoleLog] design render failed, using plain text: {e}")
+    header = "Infraction Logs" if kind == "infraction" else "Promotion Logs"
+    return None, (f"## **{header}**\n\nUser: {target_txt}\nReason: {reason}\n"
+                  f"Logger: {logger_txt}\n\nDate: {date_txt}")
+
+
+async def _rolelog_expire(log_id):
+    try:
+        await asyncio.sleep(_ROLELOG_EDIT_WINDOW)
+    except asyncio.CancelledError:
+        return
+    _pending_rolelog.pop(log_id, None)
+
+
 async def _rolelog_trigger(guild, member, kind, roles):
+    """Post the log immediately (Reason: N/A), then DM the person who made the
+    change a copy + a Reason button that fills it in (editable for 10 minutes)."""
     meta = _ROLELOG[kind]
-    cfg = form_log_configs.get(meta["key"], {})
-    ch = await resolve_channel(cfg.get("channel_id"))
+    ch = await resolve_channel(form_log_configs.get(kind, {}).get("channel_id"))
     if not ch:
         return
     issuer = await _find_role_changer(guild, member.id)
     if issuer and issuer.bot:
-        issuer = None  # change made by an integration/bot — don't ping a bot
+        issuer = None  # change made by an integration/bot
     roles_text = ", ".join(r.mention for r in roles) if roles else "—"
-    _pending_rolelog[(kind, member.id)] = {"roles": roles_text, "issuer_id": issuer.id if issuer else 0}
-    who = issuer.mention if issuer else "A staff member"
-    cid = f"infr:{_ROLELOG_SHORT[kind]}:{member.id}:{issuer.id if issuer else 0}"
+    target_txt = member.mention
+    logger_txt = issuer.mention if issuer else "*unknown*"
+    date_txt = f"<t:{int(time.time())}:F>"
+
+    # 1) Post the log right now with Reason: N/A.
+    final, txt = await _rolelog_render(kind, target_txt, logger_txt, roles_text, "N/A", date_txt)
+    if final:
+        log_id = await send_v2_message(ch, final, allowed_mentions={"parse": []})
+    else:
+        m = await ch.send(txt, allowed_mentions=discord.AllowedMentions.none())
+        log_id = str(m.id) if m else None
+    if not log_id:
+        print("[RoleLog] failed to post the log")
+        return
+    log_id = str(log_id)
+    _pending_rolelog[log_id] = {
+        "kind": kind, "target_txt": target_txt, "issuer_id": issuer.id if issuer else 0,
+        "logger_txt": logger_txt, "roles_text": roles_text, "channel_id": str(ch.id),
+        "date_txt": date_txt, "ts": time.time(),
+    }
+    asyncio.create_task(_rolelog_expire(log_id))
+
+    # 2) DM the person who made the change: a copy + a Reason button.
     view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(label=f"Add {meta['noun']} Reason",
-                                    style=discord.ButtonStyle.primary, custom_id=cid, emoji="📝"))
-    txt = (f"{meta['emoji']} **{meta['noun']} pending** — {who}, add the reason for "
-           f"{meta['verb']} {roles_text} {meta['prep']} {member.mention}.")
-    try:
-        await ch.send(txt, view=view,
-                      allowed_mentions=discord.AllowedMentions(users=[issuer] if issuer else False, roles=False))
-    except Exception as e:
-        print(f"[RoleLog] prompt post failed: {e}")
+    view.add_item(discord.ui.Button(label="Reason", style=discord.ButtonStyle.primary,
+                                    custom_id=f"infrreason:{log_id}", emoji="📝"))
+    dmed = False
+    if issuer:
+        try:
+            dm = await issuer.create_dm()
+            if final:
+                await send_v2_message(dm, final, allowed_mentions={"parse": []})
+            else:
+                await dm.send(txt)
+            await dm.send(f"You {meta['verb']} {roles_text} {meta['prep']} {target_txt}. "
+                          f"Add the reason within 10 minutes:", view=view)
+            dmed = True
+        except Exception as e:
+            print(f"[RoleLog] DM to issuer failed: {e}")
+    if not dmed:
+        # Couldn't DM (unknown remover or their DMs are closed) — put the button
+        # in the channel so someone can still add the reason.
+        try:
+            who = issuer.mention if issuer else "A staff member"
+            await ch.send(f"{meta['emoji']} {who} — add the reason (10 min):", view=view,
+                          allowed_mentions=discord.AllowedMentions(users=[issuer] if issuer else False, roles=False))
+        except Exception as e:
+            print(f"[RoleLog] channel prompt failed: {e}")
 
 
 class _RoleLogReasonModal(discord.ui.Modal):
-    def __init__(self, kind, target_id, roles_text, channel_id, prompt_msg_id):
+    def __init__(self, log_id, kind):
         meta = _ROLELOG[kind]
         super().__init__(title=meta["noun"], timeout=600)
+        self._log_id = str(log_id)
         self._kind = kind
-        self._target_id = int(target_id)
-        self._roles_text = roles_text
-        self._channel_id = str(channel_id)
-        self._prompt_msg_id = int(prompt_msg_id) if prompt_msg_id else 0
         self.reason = discord.ui.TextInput(style=discord.TextStyle.paragraph, required=True,
                                            max_length=800, placeholder="Type the reason…")
         self.ack = discord.ui.Checkbox(custom_id="ack")
@@ -3146,93 +3216,58 @@ class _RoleLogReasonModal(discord.ui.Modal):
             return
         reason = (self.reason.value or "").strip() or "No reason provided."
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await _rolelog_post(interaction, self._kind, self._target_id, self._roles_text, reason,
-                            self._channel_id, self._prompt_msg_id)
+        await _rolelog_apply_reason(interaction, self._log_id, reason)
 
 
-async def _rolelog_post(interaction, kind, target_id, roles_text, reason, channel_id, prompt_msg_id):
-    meta = _ROLELOG[kind]
-    guild = interaction.guild
-    ch = await resolve_channel(channel_id)
-    if not ch:
-        await interaction.followup.send(embed=error_embed("No channel", "No log channel is configured."), ephemeral=True)
+async def _rolelog_apply_reason(interaction, log_id, reason):
+    pend = _pending_rolelog.get(log_id)
+    if not pend or time.time() - pend.get("ts", 0) > _ROLELOG_EDIT_WINDOW:
+        _pending_rolelog.pop(log_id, None)
+        await interaction.followup.send(
+            embed=error_embed("Time's up", "The 10-minute window to add a reason has passed."), ephemeral=True)
         return
-    target = guild.get_member(target_id) if guild else None
-    target_txt = target.mention if target else f"<@{target_id}>"
-    ts = int(discord.utils.utcnow().timestamp())
-    date_txt = f"<t:{ts}:F>"
-    logger_txt = interaction.user.mention
-    header = "Infraction Logs" if kind == "infraction" else "Promotion Logs"
-
-    posted = False
-    # Prefer the dashboard's V2 design (with images/formatting) if one is set.
-    # Tokens: {Question:...}=reason, {user}=logger, {target}/{infractor}=affected
-    # member, {date}=timestamp, {roles}=the changed roles.
-    comps = form_log_configs.get(kind, {}).get("components") or []
-    if comps:
-        def _js(s):
-            return json.dumps(str(s))[1:-1]
-        try:
-            raw = json.dumps(comps)
-            raw = re.sub(r"\{Question:[^}]*\}", _js(reason), raw)
-            raw = re.sub(r"\{File:[^}]*\}", "", raw)
-            roles_val = _js(roles_text or "—")
-            raw = (raw.replace("{user}", _js(logger_txt))
-                      .replace("{username}", _js(interaction.user.display_name))
-                      .replace("{target}", _js(target_txt))
-                      .replace("{infractor}", _js(target_txt))
-                      .replace("{date}", _js(date_txt))
-                      .replace("{roles}", roles_val)
-                      .replace("{roles removed}", roles_val)
-                      .replace("{roles_removed}", roles_val)
-                      .replace("{roles added}", roles_val)
-                      .replace("{roles_added}", roles_val))
-            final = json.loads(raw)
-            mid = await send_v2_message(ch, final, allowed_mentions={"parse": []})
-            posted = bool(mid)
-        except Exception as ex:
-            print(f"[RoleLog] V2 design render failed, using plain text: {ex}")
-
-    if not posted:
-        content = (
-            f"## **{header}**\n\n"
-            f"User: {target_txt}\n"
-            f"Reason: {reason}\n"
-            f"Logger: {logger_txt}\n\n"
-            f"Date: {date_txt}"
-        )
-        try:
-            await ch.send(content, allowed_mentions=discord.AllowedMentions(users=False, roles=False))
-        except Exception as ex:
-            await interaction.followup.send(embed=error_embed("Couldn't post", str(ex)[:150]), ephemeral=True)
-            return
-    if prompt_msg_id:
-        try:
-            pm = await ch.fetch_message(prompt_msg_id)
-            await pm.delete()
-        except Exception:
-            pass
-    _pending_rolelog.pop((kind, target_id), None)
-    await interaction.followup.send(embed=success_embed("Logged", f"Posted in {ch.mention}."), ephemeral=True)
+    kind = pend["kind"]
+    ch = await resolve_channel(pend["channel_id"])
+    # If the remover was unknown, whoever adds the reason becomes the logger.
+    logger_txt = pend["logger_txt"] if pend.get("issuer_id") else interaction.user.mention
+    final, txt = await _rolelog_render(kind, pend["target_txt"], logger_txt, pend["roles_text"], reason, pend["date_txt"])
+    ok = False
+    if ch:
+        if final:
+            ok = await edit_v2_message(ch, log_id, final, allowed_mentions={"parse": []})
+        else:
+            try:
+                m = await ch.fetch_message(int(log_id))
+                await m.edit(content=txt)
+                ok = True
+            except Exception as e:
+                print(f"[RoleLog] edit failed: {e}")
+    _pending_rolelog.pop(log_id, None)  # reason set — lock it
+    if ok:
+        await interaction.followup.send(embed=success_embed("Reason added", "The log has been updated."), ephemeral=True)
+    else:
+        await interaction.followup.send(embed=error_embed("Couldn't update", "The log couldn't be edited."), ephemeral=True)
 
 
 async def _rolelog_open_reason(interaction, cid):
-    # cid = infr:{i|p}:{target_id}:{issuer_id}
-    parts = cid.split(":")
-    kind = _ROLELOG_CODE.get(parts[1] if len(parts) > 1 else "i", "infraction")
-    target_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
-    issuer_id = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
-    if issuer_id and interaction.user.id != issuer_id and not interaction.user.guild_permissions.manage_guild:
+    # cid = infrreason:{log_id}
+    log_id = cid.split(":", 1)[1] if ":" in cid else ""
+    pend = _pending_rolelog.get(log_id)
+    if not pend or time.time() - pend.get("ts", 0) > _ROLELOG_EDIT_WINDOW:
+        _pending_rolelog.pop(log_id, None)
+        await interaction.response.send_message(
+            embed=error_embed("Time's up", "The 10-minute window to add a reason has passed."), ephemeral=True)
+        return
+    issuer_id = pend.get("issuer_id") or 0
+    is_admin = interaction.guild is not None and getattr(
+        getattr(interaction.user, "guild_permissions", None), "manage_guild", False)
+    if issuer_id and interaction.user.id != issuer_id and not is_admin:
         await interaction.response.send_message(
             embed=error_embed("Not yours", "Only the staff member who made this change (or an admin) can add the reason."),
             ephemeral=True)
         return
-    pend = _pending_rolelog.get((kind, target_id), {})
-    roles_text = pend.get("roles", "the role(s)")
-    prompt_msg_id = interaction.message.id if interaction.message else 0
     try:
-        await interaction.response.send_modal(
-            _RoleLogReasonModal(kind, target_id, roles_text, str(interaction.channel_id), prompt_msg_id))
+        await interaction.response.send_modal(_RoleLogReasonModal(log_id, pend["kind"]))
     except Exception as e:
         await interaction.response.send_message(embed=error_embed("Couldn't open form", str(e)[:150]), ephemeral=True)
 
@@ -4217,7 +4252,7 @@ async def on_interaction(interaction: discord.Interaction):
         await _joinsetup_open_one(interaction, si, ii)
     elif cid == "joinsetup_done":
         await _joinsetup_done(interaction)
-    elif cid.startswith("infr:"):
+    elif cid.startswith("infrreason:"):
         await _rolelog_open_reason(interaction, cid)
     elif cid.startswith("pkg_buy:"):
         await _pkg_handle_buy(interaction, cid.split(":", 1)[1])
@@ -5468,6 +5503,29 @@ async def send_v2_message(channel, components_v2, content=None, interaction=None
     except Exception as e:
         _V2_LAST_ERROR["msg"] = str(e)[:400]
         print(f"[V2] send failed: {e}")
+        return False
+
+
+async def edit_v2_message(channel, message_id, components_v2, allowed_mentions=None):
+    """Edit an existing Components V2 message in place (used to fill in a log's
+    Reason after it was first posted as N/A)."""
+    _guild = getattr(channel, "guild", None)
+    built = [b for b in (_build_v2(c, _guild) for c in components_v2) if b]
+    if not built:
+        return False
+    ALLOWED_TOP = {1, 9, 10, 12, 13, 14, 17}
+    if not {c.get("type") for c in built}.issubset(ALLOWED_TOP):
+        built = [{"type": 17, "components": built}]
+    payload = {"components": built, "flags": 1 << 15}
+    if allowed_mentions is not None:
+        payload["allowed_mentions"] = allowed_mentions
+    route = discord.http.Route("PATCH", "/channels/{channel_id}/messages/{message_id}",
+                               channel_id=channel.id, message_id=int(message_id))
+    try:
+        await bot.http.request(route, json=payload)
+        return True
+    except Exception as e:
+        print(f"[V2] edit failed: {e}")
         return False
 
 
