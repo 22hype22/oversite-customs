@@ -8918,16 +8918,21 @@ async def setup_wavelink():
         print("[Music] LAVALINK_URI/PASSWORD not set — music disabled")
         return
     try:
-        node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD)
-        await wavelink.Pool.connect(nodes=[node], client=bot, cache_capacity=100)
+        # Failover support: LAVALINK_URI / LAVALINK_PASSWORD may each be a
+        # comma-separated list. One password + many URIs = same password for all.
+        uris = [u.strip() for u in LAVALINK_URI.split(",") if u.strip()]
+        pws = [p.strip() for p in LAVALINK_PASSWORD.split(",")]
+        nodes = [wavelink.Node(uri=u, password=(pws[i] if i < len(pws) and pws[i] else pws[0]))
+                 for i, u in enumerate(uris)]
+        await wavelink.Pool.connect(nodes=nodes, client=bot, cache_capacity=100)
         music_available = True
-        print(f"[Music] connecting to Lavalink at {LAVALINK_URI}")
+        print(f"[Music] connecting to Lavalink node(s): {', '.join(uris)}")
         # Only hand our private YouTube OAuth token to a node WE trust —
         # never to a public/community node (its operator would receive it).
         _trust_node = os.getenv("LAVALINK_TRUSTED", "true").lower() == "true"
         if YOUTUBE_OAUTH_REFRESH_TOKEN and _trust_node:
             try:
-                _url = f"{LAVALINK_URI.rstrip('/')}/youtube"
+                _url = f"{uris[0].rstrip('/')}/youtube"
                 async with aiohttp.ClientSession() as _s:
                     async with _s.post(_url, headers={"Authorization": LAVALINK_PASSWORD, "Content-Type": "application/json"},
                                        json={"refreshToken": YOUTUBE_OAUTH_REFRESH_TOKEN},
