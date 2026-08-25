@@ -3735,7 +3735,9 @@ async def grouproleupdate_cmd(interaction: discord.Interaction):
         return
     # Send in batches so one call never runs too long against Roblox.
     totals = {"changed": 0, "unchanged": 0, "skipped": 0, "failed": 0}
-    sample_errors = []
+    skip_reasons = {}          # reason code -> count
+    no_perm = []               # discord ids Roblox refused (owner / bot ranked too low)
+    other_fails = []           # (discord id, short error) for anything else
     for i in range(0, len(desired), 40):
         res = await _group_sync_call("sync", {"desired": desired[i:i + 40]})
         if res.get("error"):
@@ -3746,18 +3748,40 @@ async def grouproleupdate_cmd(interaction: discord.Interaction):
         for k in totals:
             totals[k] += int(res.get(k) or 0)
         for d in (res.get("details") or []):
-            if d.get("error") and len(sample_errors) < 3:
-                sample_errors.append(str(d["error"])[:120])
+            err = d.get("error")
+            if err:
+                if "permission to manage" in str(err).lower():
+                    no_perm.append(d.get("discordId"))
+                elif len(other_fails) < 5:
+                    other_fails.append((d.get("discordId"), str(err)[:100]))
+            elif d.get("reason"):
+                skip_reasons[d["reason"]] = skip_reasons.get(d["reason"], 0) + 1
+
+    def _mentions(ids, cap=10):
+        picked = [f"<@{i}>" for i in ids if i][:cap]
+        extra = len([i for i in ids if i]) - len(picked)
+        return ", ".join(picked) + (f" +{extra} more" if extra > 0 else "")
+
+    reason_label = {
+        "not_verified": "haven't linked their Roblox (Verify button)",
+        "not_in_group": "aren't in the group",
+        "no_such_rank": "mapped to a rank number that doesn't exist in the group",
+    }
     lines = [
         f"**Checked:** {len(desired)} member(s) with a mapped role",
         f"**Updated:** {totals['changed']}",
         f"**Already correct:** {totals['unchanged']}",
-        f"**Skipped:** {totals['skipped']} (not verified / not in the group / rank not found)",
+        f"**Skipped:** {totals['skipped']}",
     ]
+    for code, n in sorted(skip_reasons.items(), key=lambda kv: -kv[1]):
+        lines.append(f"  • {n} — {reason_label.get(code, code)}")
     if totals["failed"]:
         lines.append(f"**Failed:** {totals['failed']}")
-        if sample_errors:
-            lines.append("\n" + "\n".join(f"• {e}" for e in sample_errors))
+        if no_perm:
+            lines.append(f"  • Roblox won't let the bot rank these (they're the group owner, or ranked at/above the bot account): {_mentions(no_perm)}")
+        for did, err in other_fails:
+            who = f"<@{did}>" if did else "someone"
+            lines.append(f"  • {who}: {err}")
     embed = success_embed("Group ranks synced", "\n".join(lines)) if not totals["failed"] \
         else error_embed("Group ranks synced (with errors)", "\n".join(lines))
     await interaction.followup.send(embed=embed, ephemeral=True)
