@@ -8026,8 +8026,8 @@ async def get_genre_playlist_tracks(genre: str, count: int = 50, guild_id=None, 
     tracks = []
     for song in picks:
         try:
-            results = await _wl.Playable.search(f"scsearch:{song}")
-            if results:
+            results, _sp = await search_any(song)
+            if results and not isinstance(results, _wl.Playlist):
                 tracks.append(best_track(results, song) or results[0])
         except Exception as e:
             print(f"[AutoRadio] Search error for {song}: {e}")
@@ -8816,8 +8816,8 @@ async def _dj_fetch_artist_set(guild, artist):
             if len(tracks) >= DJ_SET_SIZE:
                 break
             try:
-                res = await _wl.Playable.search(f"scsearch:{n}")
-                if res:
+                res, _sp = await search_any(n)
+                if res and not isinstance(res, _wl.Playlist):
                     tracks.append(res[0])
             except Exception:
                 pass
@@ -8958,6 +8958,102 @@ async def on_wavelink_node_ready(payload):
         print(f"[Music] Lavalink node ready: {getattr(payload.node, 'identifier', '?')}")
     except Exception:
         pass
+    asyncio.create_task(_probe_music_sources())
+
+
+# ---- Source probe + cascade ----
+# Different Lavalink nodes have different sources alive (YouTube blocked here,
+# SoundCloud there...). Instead of hardcoding one, we PROBE the connected node
+# at startup to learn which search prefixes actually return tracks, then every
+# search cascades through the working ones in order. `/musicdebug` re-runs the
+# probe on demand so problems are diagnosable from inside Discord.
+_SOURCE_CANDIDATES = ["scsearch", "dzsearch", "ytmsearch", "ytsearch"]
+_music_sources = []      # prefixes that returned results on this node, in order
+_probe_summary = "not run yet"
+_RADIO_TEST_URL = "https://ice1.somafm.com/groovesalad-128-mp3"
+_http_source_ok = False
+
+
+async def _probe_music_sources():
+    """Ask the connected node what actually works. Cheap, read-only searches."""
+    global _music_sources, _probe_summary, _http_source_ok
+    if wavelink is None:
+        return
+    results = []
+    working = []
+    for prefix in _SOURCE_CANDIDATES:
+        try:
+            res = await wavelink.Playable.search(f"{prefix}:counting stars onerepublic")
+            n = len(res.tracks) if isinstance(res, wavelink.Playlist) else len(res or [])
+            results.append(f"{prefix}={n}")
+            if n > 0:
+                working.append(prefix)
+        except Exception as e:
+            results.append(f"{prefix}=ERR({str(e)[:40]})")
+    try:
+        r = await wavelink.Playable.search(_RADIO_TEST_URL)
+        _http_source_ok = bool(r)
+    except Exception:
+        _http_source_ok = False
+    results.append(f"http={'ok' if _http_source_ok else 'no'}")
+    _music_sources = working
+    _probe_summary = " | ".join(results)
+    print(f"[MusicProbe] {_probe_summary}")
+    print(f"[MusicProbe] usable search sources: {working if working else 'NONE — this node cannot search anything'}")
+
+
+async def search_any(query: str, exclude=None):
+    """Search across every WORKING source in order. Returns (results, prefix)."""
+    if wavelink is None:
+        return None, None
+    q = (query or "").strip()
+    if q.lower().startswith(("http://", "https://")):
+        try:
+            return await wavelink.Playable.search(q), "direct"
+        except Exception as e:
+            print(f"[Music] direct load failed: {e}")
+            return None, None
+    order = _music_sources or _SOURCE_CANDIDATES
+    for prefix in order:
+        if exclude and prefix in exclude:
+            continue
+        try:
+            res = await wavelink.Playable.search(f"{prefix}:{q}")
+            if res:
+                return res, prefix
+        except Exception as e:
+            print(f"[Music] {prefix} search failed: {e}")
+    return None, None
+
+
+def _track_source_prefix(track) -> str:
+    """Best-effort mapping of a Playable back to its search prefix."""
+    u = ((getattr(track, "uri", "") or "") + " " + (getattr(track, "source", "") or "")).lower()
+    if "soundcloud" in u:
+        return "scsearch"
+    if "deezer" in u:
+        return "dzsearch"
+    if "youtube" in u or "youtu.be" in u:
+        return "ytsearch"
+    return ""
+
+
+@bot.tree.command(name="musicdebug", description="Test which music sources work right now (admin)")
+async def musicdebug_cmd(interaction: discord.Interaction):
+    if not _is_admin(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "Admins only."), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    node_uri = LAVALINK_URI or "(not set)"
+    await _probe_music_sources()
+    lines = [
+        f"**Node:** `{node_uri}`",
+        f"**Connected:** {'yes' if getattr(wavelink.Pool, 'nodes', None) else 'NO'}",
+        f"**Probe:** `{_probe_summary}`",
+        f"**Usable sources:** {', '.join(_music_sources) if _music_sources else '**NONE — the node cannot search any source**'}",
+        f"**Radio streams (http):** {'working' if _http_source_ok else 'not working'}",
+    ]
+    await interaction.followup.send(embed=info_embed("Music Diagnostics", "\n".join(lines)), ephemeral=True)
 
 
 # ---- Commands ----
@@ -9009,8 +9105,8 @@ async def music_play(interaction: discord.Interaction, query: str):
         queued = 0
         for s in songs:
             try:
-                results = await wavelink.Playable.search(f"scsearch:{s}")
-                if results:
+                results, _sp = await search_any(s)
+                if results and not isinstance(results, wavelink.Playlist):
                     await vc.queue.put_wait(results[0])
                     queued += 1
                     if not vc.playing and vc.queue:
@@ -9051,8 +9147,8 @@ async def music_play(interaction: discord.Interaction, query: str):
         else:
             first = None
             for st in sp[:1]:
-                yt = await wavelink.Playable.search(f"scsearch:{st['name']} {st['artist']}")
-                if yt:
+                yt, _sp = await search_any(f"{st['name']} {st['artist']}")
+                if yt and not isinstance(yt, wavelink.Playlist):
                     first = best_track(yt, f"{st['name']} {st['artist']}") or yt[0]
             if not first:
                 await interaction.followup.send(embed=error_embed("Not found", "Couldn't find those tracks."))
@@ -9065,8 +9161,8 @@ async def music_play(interaction: discord.Interaction, query: str):
             async def _queue_rest():
                 for st in sp[1:]:
                     try:
-                        yt = await wavelink.Playable.search(f"scsearch:{st['name']} {st['artist']}")
-                        if yt:
+                        yt, _sp = await search_any(f"{st['name']} {st['artist']}")
+                        if yt and not isinstance(yt, wavelink.Playlist):
                             await vc.queue.put_wait(best_track(yt, f"{st['name']} {st['artist']}") or yt[0])
                         await asyncio.sleep(0.5)
                     except Exception:
@@ -9074,10 +9170,14 @@ async def music_play(interaction: discord.Interaction, query: str):
             asyncio.create_task(_queue_rest())
             return
 
-    tracks = await wavelink.Playable.search(f"scsearch:{query}" if not query.startswith("http") else query)
+    tracks, _used_src = await search_any(query)
     if not tracks:
-        await interaction.followup.send(embed=error_embed("Not found", "Couldn't find that song."))
+        await interaction.followup.send(embed=error_embed(
+            "Not found",
+            "Couldn't find that song on any working source. An admin can run `/musicdebug` to see what's wrong."))
         return
+    if isinstance(tracks, wavelink.Playlist):
+        tracks = tracks.tracks
     track = best_track(tracks, query) or tracks[0]
     _adjust_taste(interaction.guild.id, getattr(track, "author", None), 3.0)
     was_playing = vc.playing
@@ -9252,6 +9352,68 @@ async def stopmusic_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=success_embed("Stopped"))
 
 
+# Direct internet-radio streams (SomaFM). These are plain HTTP MP3 streams that
+# no IP-reputation wall ever blocks — so /radio ALWAYS has audio, even when every
+# search source on the node is down.
+_RADIO_STREAMS = [
+    (("lofi", "lo-fi", "chill", "study", "ambient", "relax"), "SomaFM Groove Salad", "https://ice1.somafm.com/groovesalad-128-mp3"),
+    (("indie",), "SomaFM Indie Pop Rocks", "https://ice1.somafm.com/indiepop-128-mp3"),
+    (("metal", "heavy"), "SomaFM Metal Detector", "https://ice1.somafm.com/metal-128-mp3"),
+    (("rock", "alt", "alternative", "punk"), "SomaFM BAGeL Radio", "https://ice1.somafm.com/bagel-128-mp3"),
+    (("hip", "rap", "trap", "soul", "rnb"), "SomaFM Fluid", "https://ice1.somafm.com/fluid-128-mp3"),
+    (("edm", "electronic", "house", "techno", "dance", "dubstep", "bass"), "SomaFM Beat Blender", "https://ice1.somafm.com/beatblender-128-mp3"),
+    (("jazz", "lounge"), "SomaFM Sonic Universe", "https://ice1.somafm.com/sonicuniverse-128-mp3"),
+    (("country", "americana", "folk", "blues"), "SomaFM Boot Liquor", "https://ice1.somafm.com/bootliquor-128-mp3"),
+    (("80s", "eighties", "retro", "synth"), "SomaFM Underground 80s", "https://ice1.somafm.com/u80s-128-mp3"),
+    (("70s", "seventies"), "SomaFM Left Coast 70s", "https://ice1.somafm.com/seventies-128-mp3"),
+    (("pop", "top", "hits"), "SomaFM PopTron", "https://ice1.somafm.com/poptron-128-mp3"),
+]
+_RADIO_DEFAULT = ("SomaFM Groove Salad", "https://ice1.somafm.com/groovesalad-128-mp3")
+
+
+def _radio_stream_for(genre):
+    g = (genre or "").lower().strip()
+    for keys, name, url in _RADIO_STREAMS:
+        if any(k in g for k in keys):
+            return name, url
+    return _RADIO_DEFAULT
+
+
+@bot.tree.command(name="radio", description="Start a 24/7 internet-radio stream in your voice channel (DJ)")
+@app_commands.describe(genre="Genre, e.g. lofi, rock, country, jazz, edm, pop")
+async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
+    if not is_dj(interaction.user):
+        await interaction.response.send_message(embed=error_embed("DJ only", "You need a DJ role (or admin) for the radio."), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if not interaction.user.voice:
+        await interaction.followup.send(embed=error_embed("Not in voice", "Join a voice channel first."))
+        return
+    vc = get_player(interaction.guild)
+    if not vc:
+        vc = await interaction.user.voice.channel.connect(cls=wavelink.Player)
+    station, stream_url = _radio_stream_for(genre or auto_radio_config.get("genre") or "lofi")
+    results = None
+    try:
+        results = await wavelink.Playable.search(stream_url)
+    except Exception as e:
+        print(f"[Radio] stream load failed: {e}")
+    track = results[0] if (results and not isinstance(results, wavelink.Playlist)) else None
+    if not track:
+        await interaction.followup.send(embed=error_embed("Radio unavailable", "Couldn't start that stream. Try again in a moment."))
+        return
+    auto_music_sessions.pop(interaction.guild.id, None)
+    _dj_mode.discard(interaction.guild.id)
+    play_channels[interaction.guild.id] = interaction.channel.id
+    try:
+        vc.queue.clear()
+    except Exception:
+        pass
+    vol = max(1, min(100, int(music_config.get("default_volume") or 50)))
+    await vc.play(track, volume=vol)
+    await interaction.followup.send(embed=success_embed("Radio on", f"Now streaming **{station}**. Use `/stop` to end it."))
+
+
 @bot.tree.command(name="votegenre", description="Change the auto radio genre")
 @app_commands.describe(genre="Genre to switch to")
 async def votegenre_command(interaction: discord.Interaction, genre: str):
@@ -9348,32 +9510,29 @@ async def on_wavelink_track_exception(payload):
         player = payload.player
         track = getattr(payload, "track", None)
 
-        # Resilience: when YouTube chokes on a track, retry the SAME song on
-        # SoundCloud. Guarded hard against loops — we ONLY play a result that is
-        # genuinely a SoundCloud track (if the node has no working SoundCloud,
-        # scsearch just returns more YouTube, which we refuse), and cap the number
-        # of fallbacks per guild so it can never spin.
+        # Resilience: when a source chokes on a track, retry the SAME song on the
+        # next WORKING source (per the boot probe). Hard loop guards: the retry
+        # must come from a genuinely different source than the one that failed,
+        # and attempts are capped per guild until a track successfully starts.
         try:
-            uri = (getattr(track, "uri", "") or "").lower()
-            src = (getattr(track, "source", "") or "").lower()
+            failed_prefix = _track_source_prefix(track)
             fb_used = _sc_fallback_counts.get(guild.id, 0)
-            if track and "soundcloud" not in uri and "soundcloud" not in src and fb_used < 2:
+            if track and fb_used < 2:
                 q = f"{getattr(track, 'author', '') or ''} {track.title}".strip()
-                alts = await wavelink.Playable.search(f"scsearch:{q}")
-                sc_alt = None
-                for a in (alts or []):
-                    au = (getattr(a, "uri", "") or "").lower()
-                    asrc = (getattr(a, "source", "") or "").lower()
-                    if "soundcloud" in au or "soundcloud" in asrc:
-                        sc_alt = a
-                        break
-                if sc_alt is not None:
-                    _sc_fallback_counts[guild.id] = fb_used + 1
-                    print(f"[Music] YouTube failed — SoundCloud fallback: {sc_alt.title}")
-                    await player.play(sc_alt)
-                    return  # recovered with a real SoundCloud track
+                alts, used_prefix = await search_any(q, exclude={failed_prefix} if failed_prefix else None)
+                if alts and not isinstance(alts, wavelink.Playlist):
+                    alt = None
+                    for a in alts:
+                        if _track_source_prefix(a) != failed_prefix:
+                            alt = a
+                            break
+                    if alt is not None:
+                        _sc_fallback_counts[guild.id] = fb_used + 1
+                        print(f"[Music] {failed_prefix or 'source'} failed — fallback via {used_prefix}: {alt.title}")
+                        await player.play(alt)
+                        return  # recovered on a different source
         except Exception as fe:
-            print(f"[Music] SoundCloud fallback error: {fe}")
+            print(f"[Music] source fallback error: {fe}")
 
         import time as _t
         _track_last_failure_time[guild.id] = _t.time()
