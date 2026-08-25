@@ -8026,7 +8026,7 @@ async def get_genre_playlist_tracks(genre: str, count: int = 50, guild_id=None, 
     tracks = []
     for song in picks:
         try:
-            results = await _wl.Playable.search(f"ytmsearch:{song}")
+            results = await _wl.Playable.search(f"scsearch:{song}")
             if results:
                 tracks.append(best_track(results, song) or results[0])
         except Exception as e:
@@ -8816,7 +8816,7 @@ async def _dj_fetch_artist_set(guild, artist):
             if len(tracks) >= DJ_SET_SIZE:
                 break
             try:
-                res = await _wl.Playable.search(f"ytmsearch:{n}")
+                res = await _wl.Playable.search(f"scsearch:{n}")
                 if res:
                     tracks.append(res[0])
             except Exception:
@@ -9009,7 +9009,7 @@ async def music_play(interaction: discord.Interaction, query: str):
         queued = 0
         for s in songs:
             try:
-                results = await wavelink.Playable.search(f"ytmsearch:{s}")
+                results = await wavelink.Playable.search(f"scsearch:{s}")
                 if results:
                     await vc.queue.put_wait(results[0])
                     queued += 1
@@ -9051,7 +9051,7 @@ async def music_play(interaction: discord.Interaction, query: str):
         else:
             first = None
             for st in sp[:1]:
-                yt = await wavelink.Playable.search(f"ytmsearch:{st['name']} {st['artist']}")
+                yt = await wavelink.Playable.search(f"scsearch:{st['name']} {st['artist']}")
                 if yt:
                     first = best_track(yt, f"{st['name']} {st['artist']}") or yt[0]
             if not first:
@@ -9065,7 +9065,7 @@ async def music_play(interaction: discord.Interaction, query: str):
             async def _queue_rest():
                 for st in sp[1:]:
                     try:
-                        yt = await wavelink.Playable.search(f"ytmsearch:{st['name']} {st['artist']}")
+                        yt = await wavelink.Playable.search(f"scsearch:{st['name']} {st['artist']}")
                         if yt:
                             await vc.queue.put_wait(best_track(yt, f"{st['name']} {st['artist']}") or yt[0])
                         await asyncio.sleep(0.5)
@@ -9074,7 +9074,7 @@ async def music_play(interaction: discord.Interaction, query: str):
             asyncio.create_task(_queue_rest())
             return
 
-    tracks = await wavelink.Playable.search(f"ytmsearch:{query}" if not query.startswith("http") else query)
+    tracks = await wavelink.Playable.search(f"scsearch:{query}" if not query.startswith("http") else query)
     if not tracks:
         await interaction.followup.send(embed=error_embed("Not found", "Couldn't find that song."))
         return
