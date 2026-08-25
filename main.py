@@ -4311,6 +4311,9 @@ async def on_interaction(interaction: discord.Interaction):
     if interaction.type != discord.InteractionType.component:
         return
     cid = (interaction.data or {}).get("custom_id", "")
+    if cid.startswith("npv2_"):
+        await handle_npv2_button(interaction, cid)
+        return
     if cid.startswith(("ticket_msg:", "ticket_form:", "eph:", "ticket_cat:")) or cid in ("ticket_select", "ticket_open"):
         print(f"[Tickets] interaction cid={cid!r} values={(interaction.data or {}).get('values')}")
     if cid == "ticket_select":
@@ -7504,33 +7507,1346 @@ async def before_metrics():
     await bot.wait_until_ready()
 
 
-# ============================ Music / DJ (Lavalink) ============================
-# All audio is handled by a shared Lavalink node via wavelink — the bot forwards
-# voice state and sends control JSON; Lavalink does the streaming. Default search
-# source is SoundCloud (native, no credentials, no YouTube bot-check). Spotify /
-# Apple links resolve through LavaSrc and play via SoundCloud. Direct HTTP streams
-# (SomaFM radio) play through Lavalink's built-in http source.
+# ==================== Music / DJ (Lavalink + AI DJ "Carla") ====================
+# Faithful port of the Oversite Utilities music system: rich Now Playing card
+# (album art + live progress bar + button controls; classic V1 and Components V2),
+# YouTube Music search via the shared Lavalink node, Spotify link/genre resolution,
+# adaptive genre radio, favorites, and the AI DJ ("Carla").
+#
+# This repo is PUBLIC, so every secret comes from env (never hardcoded):
+#   SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET   album art + genre/link resolution
+#   YOUTUBE_OAUTH_REFRESH_TOKEN                 registers the node's YT OAuth (optional
+#                                               if the node already has it)
+#   ANTHROPIC_API_KEY                           AI DJ lines/picks (optional; templates otherwise)
+#   ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID    DJ voice (optional; Edge-TTS otherwise)
+#   DJ_PUBLIC_URL                               this service's public URL, for the DJ clip server
+
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
+YOUTUBE_OAUTH_REFRESH_TOKEN = os.getenv("YOUTUBE_OAUTH_REFRESH_TOKEN", "")
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://oversite.shop/bot-dashboard")
+ACCENT_COLOR = ACCENT  # customs' accent, reused by the ported UI
+MUSIC_ALERT_CHANNEL = 0  # Utilities-only alert channel; disabled here
+
+music_available = False
+
+# Auto radio config (dashboard "Auto Radio" block).
+auto_radio_config = {
+    "voice_channel_id": None, "text_channel_id": None,
+    "genre": "pop", "auto_start": False, "allow_vote": True,
+}
 
 
-async def _connect_lavalink():
-    """Connect this bot to the shared Lavalink node (idempotent)."""
-    global _lavalink_connected
-    if _lavalink_connected or wavelink is None:
+async def supabase_rpc(op: str, payload: dict | None = None):
+    """Best-effort music persistence via the runtime_music_op RPC. If the RPC
+    isn't present on this project it simply no-ops (favorites/taste stay
+    in-memory for the session)."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/runtime_music_op",
+                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                         "Content-Type": "application/json"},
+                json={"p_token": WORKER_TOKEN, "p_op": op, "p_payload": payload or {}},
+                timeout=10)
+            if r.status_code == 200:
+                j = r.json()
+                if isinstance(j, dict):
+                    for k in ("rows", "data", "result"):
+                        if isinstance(j.get(k), list):
+                            return j[k]
+                return [] if j is None else j
+    except Exception as e:
+        print(f"[RPC] {op} error: {e}")
+    return None
+
+
+def get_player(guild):
+    return guild.voice_client
+
+
+def is_dj(member: discord.Member) -> bool:
+    """DJ = Administrator, or a configured DJ role. No DJ roles set = everyone."""
+    try:
+        if member.guild_permissions.administrator or member.guild_permissions.manage_guild:
+            return True
+    except Exception:
+        pass
+    dj_role_ids = music_config.get("dj_role_ids", [])
+    if not dj_role_ids:
+        return True
+    return has_any_role(member, dj_role_ids)
+
+
+def _is_admin(member) -> bool:
+    try:
+        return member.guild_permissions.administrator or member.guild_permissions.manage_guild
+    except Exception:
+        return False
+
+
+# ---- Genre search pools ----
+GENRE_QUERIES = [
+    "greatest {genre} songs of all time",
+    "best {genre} hits ever",
+    "top {genre} songs all time",
+    "classic {genre} songs",
+]
+
+GENRE_SONGS = {
+    "pop": [
+        "Taylor Swift Anti-Hero", "Ed Sheeran Shape Of You", "Ariana Grande 7 Rings",
+        "The Weeknd Blinding Lights", "Dua Lipa Levitating", "Harry Styles As It Was",
+        "Billie Eilish Bad Guy", "Olivia Rodrigo Good 4 U", "Justin Bieber Peaches",
+        "Bruno Mars Uptown Funk", "Lady Gaga Bad Romance", "Katy Perry Roar",
+        "Doja Cat Say So", "Post Malone Circles", "Miley Cyrus Flowers",
+    ],
+    "country": [
+        "Morgan Wallen Last Night", "Luke Combs Fast Car", "Chris Stapleton Tennessee Whiskey",
+        "Zach Bryan Something In The Orange", "Kacey Musgraves Golden Hour", "Jelly Roll Need A Favor",
+        "Lainey Wilson Heart Like A Truck", "Carrie Underwood Before He Cheats",
+        "Garth Brooks Friends In Low Places", "George Strait Check Yes or No",
+        "Kane Brown Heaven", "Blake Shelton God's Country", "Dolly Parton Jolene",
+    ],
+    "rnbhiphop": [
+        "Drake God's Plan", "Kendrick Lamar HUMBLE", "SZA Kill Bill", "Frank Ocean Nights",
+        "The Weeknd Save Your Tears", "Usher Yeah", "Daniel Caesar Get You",
+        "Beyonce Crazy In Love", "Rihanna We Found Love", "Eminem Lose Yourself",
+        "Kanye West Stronger", "Tyler The Creator EARFQUAKE", "Childish Gambino Redbone",
+    ],
+    "rockalternative": [
+        "Queen Bohemian Rhapsody", "Led Zeppelin Stairway To Heaven", "Nirvana Smells Like Teen Spirit",
+        "Foo Fighters Everlong", "Red Hot Chili Peppers Californication", "Green Day Basket Case",
+        "Arctic Monkeys Do I Wanna Know", "The Strokes Reptilia", "Imagine Dragons Radioactive",
+        "Coldplay Yellow", "Radiohead Creep", "Pearl Jam Black", "Hozier Take Me To Church",
+    ],
+    "latin": [
+        "Bad Bunny Titi Me Pregunto", "J Balvin Mi Gente", "Daddy Yankee Gasolina",
+        "Karol G Provenza", "Rauw Alejandro Todo De Ti", "Maluma Hawai", "Shakira Hips Don't Lie",
+        "Enrique Iglesias Bailando", "Ozuna Taki Taki", "Feid Classy 101",
+    ],
+    "dance": [
+        "Daft Punk Get Lucky", "Calvin Harris Summer", "Avicii Wake Me Up", "David Guetta Titanium",
+        "Marshmello Alone", "The Chainsmokers Closer", "Martin Garrix Animals", "Alan Walker Faded",
+        "Kygo Firestone", "Swedish House Mafia Don't You Worry Child", "Zedd Clarity",
+    ],
+    "christian": [
+        "Hillsong Oceans", "Chris Tomlin How Great Is Our God", "Elevation Worship Graves Into Gardens",
+        "Lauren Daigle You Say", "Phil Wickham Living Hope", "Maverick City Music Jireh",
+        "For King And Country God Only Knows", "Cory Asbury Reckless Love",
+    ],
+    "gospel": [
+        "Kirk Franklin Love Theory", "Tasha Cobbs Leonard Break Every Chain", "CeCe Winans Believe For It",
+        "Tamela Mann Take Me To The King", "Travis Greene Made A Way", "Marvin Sapp Never Would Have Made It",
+    ],
+    "jazz": [
+        "Miles Davis So What", "John Coltrane My Favorite Things", "Louis Armstrong What A Wonderful World",
+        "Dave Brubeck Take Five", "Norah Jones Don't Know Why", "Frank Sinatra Fly Me To The Moon",
+        "Nina Simone Feeling Good", "Ella Fitzgerald Dream A Little Dream",
+    ],
+    "classical": [
+        "Beethoven Moonlight Sonata", "Mozart Eine Kleine Nachtmusik", "Bach Air On G String",
+        "Chopin Nocturne Op 9", "Debussy Clair De Lune", "Vivaldi Four Seasons Spring",
+        "Tchaikovsky Swan Lake", "Pachelbel Canon In D",
+    ],
+    "lofi": [
+        "Lofi hip hop beats to relax", "Chillhop essentials", "Jinsang affection",
+        "Idealism controlla", "Nujabes Feather", "tomppabeats harbor",
+    ],
+}
+
+# Spotify "artist:X" queries per genre (fetched live, ranked by popularity).
+SPOTIFY_GENRE_QUERIES = {
+    "country": ["artist:Morgan Wallen", "artist:Luke Combs", "artist:Zach Bryan", "artist:Jelly Roll",
+                "artist:Lainey Wilson", "artist:Chris Stapleton", "artist:Kacey Musgraves", "artist:Cody Johnson",
+                "artist:Shaboozey", "artist:Megan Moroney", "artist:Jordan Davis", "artist:Bailey Zimmerman",
+                "artist:HARDY", "artist:Kane Brown", "artist:Thomas Rhett", "artist:Post Malone"],
+    "pop": ["artist:Taylor Swift", "artist:Olivia Rodrigo", "artist:Sabrina Carpenter", "artist:Chappell Roan",
+            "artist:Billie Eilish", "artist:Dua Lipa", "artist:The Weeknd", "artist:Ariana Grande",
+            "artist:Ed Sheeran", "artist:Benson Boone", "artist:Teddy Swims", "artist:Gracie Abrams",
+            "artist:Post Malone", "artist:Bruno Mars", "artist:Charlie Puth", "artist:Doja Cat"],
+    "rnbhiphop": ["artist:Drake", "artist:Kendrick Lamar", "artist:SZA", "artist:Travis Scott",
+                  "artist:21 Savage", "artist:Future", "artist:Lil Baby", "artist:Doja Cat",
+                  "artist:Chris Brown", "artist:Brent Faiyaz", "artist:Summer Walker", "artist:Metro Boomin",
+                  "artist:J. Cole", "artist:Tyler The Creator", "artist:Giveon", "artist:PARTYNEXTDOOR"],
+    "rockalternative": ["artist:Imagine Dragons", "artist:Arctic Monkeys", "artist:The 1975", "artist:Hozier",
+                        "artist:Noah Kahan", "artist:Tame Impala", "artist:Coldplay", "artist:Foo Fighters",
+                        "artist:Red Hot Chili Peppers", "artist:The Killers", "artist:Linkin Park", "artist:Nirvana",
+                        "artist:Green Day", "artist:Twenty One Pilots", "artist:Paramore", "artist:Metallica"],
+    "latin": ["artist:Bad Bunny", "artist:Karol G", "artist:Peso Pluma", "artist:Feid",
+              "artist:Rauw Alejandro", "artist:J Balvin", "artist:Ozuna", "artist:Maluma",
+              "artist:Shakira", "artist:Grupo Frontera", "artist:Fuerza Regida", "artist:Anitta"],
+    "dance": ["artist:Calvin Harris", "artist:David Guetta", "artist:Martin Garrix", "artist:Marshmello",
+              "artist:Kygo", "artist:The Chainsmokers", "artist:Tiesto", "artist:Fisher",
+              "artist:Skrillex", "artist:Odesza", "artist:Illenium", "artist:Fred again"],
+    "christian": ["artist:Lauren Daigle", "artist:Elevation Worship", "artist:Chris Tomlin", "artist:Phil Wickham",
+                  "artist:Maverick City Music", "artist:Hillsong Worship", "artist:Bethel Music", "artist:Cody Carnes",
+                  "artist:Brandon Lake", "artist:For King And Country", "artist:CAIN", "artist:Zach Williams"],
+    "gospel": ["artist:Kirk Franklin", "artist:Tasha Cobbs Leonard", "artist:CeCe Winans", "artist:Travis Greene",
+               "artist:Maverick City Music", "artist:Tamela Mann", "artist:Marvin Sapp", "artist:Jekalyn Carr"],
+    "jazz": ["artist:Norah Jones", "artist:Miles Davis", "artist:John Coltrane", "artist:Frank Sinatra",
+             "artist:Louis Armstrong", "artist:Nina Simone", "artist:Ella Fitzgerald", "artist:Michael Buble",
+             "artist:Gregory Porter", "artist:Diana Krall", "artist:Chet Baker", "artist:Bill Evans"],
+    "classical": ["artist:Ludovico Einaudi", "artist:Hans Zimmer", "artist:Lang Lang", "artist:Yo-Yo Ma",
+                  "artist:Beethoven", "artist:Mozart", "artist:Chopin", "artist:Bach",
+                  "artist:Debussy", "artist:Vivaldi", "artist:Max Richter", "artist:Tchaikovsky"],
+    "lofi": ["artist:Lofi Girl", "artist:Chillhop Music", "artist:Jinsang", "artist:Idealism",
+             "artist:tomppabeats", "artist:Kupla", "artist:Sleepy Fish", "artist:Nujabes"],
+}
+
+_used_songs: dict = {}
+_used_genre_queries: dict = {}
+
+
+def get_genre_query(genre: str) -> str:
+    import random as _r
+    genre_lower = genre.lower().replace(" ", "").replace("-", "")
+    pool = GENRE_SONGS.get(genre_lower)
+    if not pool:
+        return _r.choice(GENRE_QUERIES).format(genre=genre)
+    used = _used_genre_queries.get(genre_lower, [])
+    available = [q for q in pool if q not in used]
+    if not available:
+        _used_genre_queries[genre_lower] = []
+        available = pool[:]
+    query = _r.choice(available)
+    _used_genre_queries.setdefault(genre_lower, []).append(query)
+    return query
+
+
+KARAOKE_KEYWORDS = [
+    "karaoke", "instrumental", "cover", "tribute", "made famous", "in the style of",
+    "backing track", "minus one", "no vocal", "sing along", "originally performed",
+    "as made", "workout remix", "nightcore", "sped up", "slowed", "reverb", "lofi", "lo-fi",
+]
+
+
+def best_track(tracks, query: str):
+    """Pick the best result, filtering karaoke/cover/instrumental versions."""
+    if not tracks:
+        return None
+    query_lower = query.lower()
+    query_words = set(query_lower.split())
+    HARD_FILTER = ["karaoke", "instrumental", "tribute", "made famous", "in the style of",
+                   "backing track", "minus one", "no vocal", "sing along", "originally performed",
+                   "as made", "nightcore", "cover version", "cover by"]
+    clean = [t for t in tracks if not any(kw in t.title.lower() for kw in HARD_FILTER)]
+    if not clean:
+        clean = tracks
+
+    def score(track):
+        title_lower = track.title.lower()
+        author_lower = (track.author or "").lower()
+        s = 0
+        overlap = len(query_words & (set(title_lower.split()) | set(author_lower.split())))
+        s += overlap * 15
+        for w in query_words:
+            if len(w) > 3 and w in author_lower:
+                s += 20
+        for kw in ["cover", "sped up", "slowed", "reverb", "lofi", "lo-fi", "workout", "remix", "version", "acoustic"]:
+            if kw in title_lower:
+                s -= 15
+        if len(track.title) > 80:
+            s -= 10
+        return s
+
+    scored = sorted(((score(t), t) for t in clean[:10]), key=lambda x: x[0], reverse=True)
+    return scored[0][1]
+
+
+# ---- Spotify integration ----
+_spotify_token = None
+_spotify_token_expiry = 0.0
+
+
+async def get_spotify_token() -> str | None:
+    global _spotify_token, _spotify_token_expiry
+    import time as _t
+    if _spotify_token and _t.time() < _spotify_token_expiry - 60:
+        return _spotify_token
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        return None
+    try:
+        import base64
+        creds = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://accounts.spotify.com/api/token",
+                headers={"Authorization": f"Basic {creds}", "Content-Type": "application/x-www-form-urlencoded"},
+                data="grant_type=client_credentials") as r:
+                data = await r.json()
+                _spotify_token = data.get("access_token")
+                _spotify_token_expiry = _t.time() + data.get("expires_in", 3600)
+                return _spotify_token
+    except Exception as e:
+        print(f"[Spotify] Token error: {e}")
+        return None
+
+
+async def spotify_get_tracks(url: str) -> list:
+    token = await get_spotify_token()
+    if not token:
+        return []
+    headers = {"Authorization": f"Bearer {token}"}
+    results = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            if "track/" in url:
+                tid = url.split("track/")[1].split("?")[0].split("/")[0]
+                async with session.get(f"https://api.spotify.com/v1/tracks/{tid}", headers=headers) as r:
+                    data = await r.json()
+                    results.append({"name": data["name"], "artist": data["artists"][0]["name"]})
+            elif "playlist/" in url:
+                pid = url.split("playlist/")[1].split("?")[0].split("/")[0]
+                offset = 0
+                while len(results) < 50:
+                    async with session.get(
+                        f"https://api.spotify.com/v1/playlists/{pid}/tracks?limit=50&offset={offset}",
+                        headers=headers) as r:
+                        data = await r.json()
+                        items = data.get("items", [])
+                        if not items:
+                            break
+                        for item in items:
+                            t = item.get("track")
+                            if t and t.get("name"):
+                                results.append({"name": t["name"], "artist": t["artists"][0]["name"]})
+                        if not data.get("next"):
+                            break
+                        offset += 50
+            elif "album/" in url:
+                aid = url.split("album/")[1].split("?")[0].split("/")[0]
+                async with session.get(f"https://api.spotify.com/v1/albums/{aid}/tracks?limit=50", headers=headers) as r:
+                    data = await r.json()
+                    for t in data.get("items", []):
+                        results.append({"name": t["name"], "artist": t["artists"][0]["name"]})
+    except Exception as e:
+        print(f"[Spotify] Fetch error: {e}")
+    return results
+
+
+_artwork_cache: dict = {}
+
+
+async def get_spotify_artwork(title: str, artist: str = "") -> str | None:
+    cache_key = f"{title}|{artist}".lower()
+    if cache_key in _artwork_cache:
+        return _artwork_cache[cache_key]
+    token = await get_spotify_token()
+    if not token:
+        return None
+    try:
+        query = f"{title} {artist}".strip()
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://api.spotify.com/v1/search?q={query}&type=track&limit=1",
+                headers={"Authorization": f"Bearer {token}"}) as r:
+                if r.status == 429:
+                    return None
+                data = await r.json()
+                items = data.get("tracks", {}).get("items", [])
+                if items:
+                    images = items[0].get("album", {}).get("images", [])
+                    if images:
+                        url = images[0]["url"]
+                        _artwork_cache[cache_key] = url
+                        return url
+    except Exception as e:
+        if "429" not in str(e):
+            print(f"[Spotify] Artwork lookup error: {e}")
+    return None
+
+
+_spotify_genre_cache: dict = {}
+_genre_fetch_locks: dict = {}
+_spotify_genre_cache_ttl = 6 * 3600
+
+
+async def fetch_spotify_genre_songs(genre_lower: str) -> list:
+    import time, urllib.parse
+    queries = SPOTIFY_GENRE_QUERIES.get(genre_lower)
+    if not queries:
+        return []
+    cached = _spotify_genre_cache.get(genre_lower)
+    if cached and time.time() - cached[0] < _spotify_genre_cache_ttl:
+        return cached[1]
+    try:
+        token = await get_spotify_token()
+        if not token:
+            return []
+        song_popularity: dict = {}
+        headers = {"Authorization": f"Bearer {token}"}
+        import random as _rq
+        selected = _rq.sample(queries, min(15, len(queries)))
+        async with aiohttp.ClientSession() as session:
+            for query in selected:
+                url = f"https://api.spotify.com/v1/search?q={urllib.parse.quote(query)}&type=track&limit=10&market=US"
+                try:
+                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                        if resp.status != 200:
+                            continue
+                        data = await resp.json()
+                except Exception:
+                    continue
+                for track in data.get("tracks", {}).get("items", []):
+                    name = track.get("name", "").strip()
+                    artists = track.get("artists", [])
+                    artist = artists[0].get("name", "").strip() if artists else ""
+                    pop = track.get("popularity", 0)
+                    if name and artist:
+                        entry = f"{artist} {name}"
+                        if pop > song_popularity.get(entry, -1):
+                            song_popularity[entry] = pop
+        songs = [e for e, _p in sorted(song_popularity.items(), key=lambda kv: kv[1], reverse=True)][:60]
+        if len(songs) < 5:
+            return []
+        _spotify_genre_cache[genre_lower] = (time.time(), songs)
+        return songs
+    except Exception as e:
+        print(f"[Spotify Genre] Failed for {genre_lower}: {e}")
+        return []
+
+
+# ---- Adaptive taste (in-memory) ----
+music_taste = {}
+_artist_song_cache = {}
+
+
+def _adjust_taste(guild_id, artist, delta):
+    if not guild_id or not artist:
+        return
+    t = music_taste.setdefault(guild_id, {})
+    a = str(artist).strip().lower()
+    if not a:
+        return
+    t[a] = max(-8.0, min(12.0, t.get(a, 0.0) + delta))
+
+
+def _taste_event_current(guild, delta):
+    try:
+        vc = guild.voice_client
+        if vc and getattr(vc, "current", None):
+            _adjust_taste(guild.id, getattr(vc.current, "author", None), delta)
+    except Exception:
+        pass
+
+
+def _decay_taste(guild_id):
+    t = music_taste.get(guild_id)
+    if t:
+        for a in list(t):
+            t[a] *= 0.985
+            if abs(t[a]) < 0.05:
+                del t[a]
+
+
+async def fetch_artist_songs(artist: str) -> list:
+    import time as _t
+    key = artist.lower()
+    cached = _artist_song_cache.get(key)
+    if cached and (_t.time() - cached[0]) < 21600:
+        return cached[1]
+    out = []
+    try:
+        token = await get_spotify_token()
+        if token:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(
+                    "https://api.spotify.com/v1/search",
+                    params={"q": f'artist:"{artist}"', "type": "track", "limit": 10, "market": "US"},
+                    headers={"Authorization": f"Bearer {token}"}, timeout=10)
+                for t in r.json().get("tracks", {}).get("items", []):
+                    nm = t.get("name", "").strip()
+                    ar = (t.get("artists") or [{}])[0].get("name", "").strip()
+                    if nm and ar and ar.lower() == key:
+                        e = f"{ar} {nm}"
+                        if e not in out:
+                            out.append(e)
+    except Exception as e:
+        print(f"[Adaptive] Artist fetch failed for {artist}: {e}")
+    _artist_song_cache[key] = (_t.time(), out)
+    return out
+
+
+async def get_genre_playlist_tracks(genre: str, count: int = 50, guild_id=None, source: str = "?") -> list:
+    import random as _r
+    import wavelink as _wl
+    genre_lower = genre.lower().replace(" ", "").replace("-", "").replace("&", "").replace("/", "")
+    genre_aliases = {
+        "rock": "rockalternative", "alternative": "rockalternative", "rockandalt": "rockalternative",
+        "rnb": "rnbhiphop", "hiphop": "rnbhiphop", "hip hop": "rnbhiphop", "rb": "rnbhiphop",
+        "randb": "rnbhiphop", "rbhiphop": "rnbhiphop",
+    }
+    genre_lower = genre_aliases.get(genre_lower, genre_lower)
+    if genre_lower == "all":
+        import itertools as _it
+        songs = list(_it.chain.from_iterable(GENRE_SONGS.values()))
+    else:
+        _gl = _genre_fetch_locks.setdefault(genre_lower, asyncio.Lock())
+        async with _gl:
+            spotify_songs = await fetch_spotify_genre_songs(genre_lower)
+        songs = spotify_songs or GENRE_SONGS.get(genre_lower, [])
+    if not songs:
+        return []
+    taste = music_taste.get(guild_id, {}) if guild_id else {}
+    if taste:
+        for fa in [a for a, s in sorted(taste.items(), key=lambda kv: -kv[1]) if s >= 4][:3]:
+            try:
+                for e in await fetch_artist_songs(fa):
+                    if e not in songs:
+                        songs.append(e)
+            except Exception:
+                pass
+    used = _used_songs.get(genre_lower, [])
+    available = [s for s in songs if s not in used]
+    if not available:
+        _used_songs[genre_lower] = []
+        available = songs[:]
+    if taste:
+        def _w(entry):
+            el = entry.lower()
+            for artist, s in taste.items():
+                if el.startswith(artist):
+                    return max(0.15, 1.0 + s * 0.35)
+            return 1.0
+        pool = available[:]
+        picks = []
+        weighted_target = max(1, int(count * 0.7))
+        while pool and len(picks) < weighted_target:
+            choice = _r.choices(pool, weights=[_w(s) for s in pool], k=1)[0]
+            pool.remove(choice)
+            picks.append(choice)
+        _r.shuffle(pool)
+        picks.extend(pool[:count - len(picks)])
+        _r.shuffle(picks)
+    else:
+        _r.shuffle(available)
+        picks = available[:count]
+    _used_songs.setdefault(genre_lower, []).extend(picks)
+    tracks = []
+    for song in picks:
+        try:
+            results = await _wl.Playable.search(f"ytmsearch:{song}")
+            if results:
+                tracks.append(best_track(results, song) or results[0])
+        except Exception as e:
+            print(f"[AutoRadio] Search error for {song}: {e}")
+    print(f"[AutoRadio] Loaded {len(tracks)} tracks for {genre} (via {source}, target {count})")
+    return tracks
+
+
+# ---- Favorites (in-memory + best-effort persistence) ----
+liked_songs = {}
+track_history = {}
+play_channels = {}
+repeat_enabled = {}
+
+
+async def save_liked_song_to_supabase(user_id, track_title):
+    await supabase_rpc("like_add", {"user_id": str(user_id), "track_title": track_title})
+
+
+async def delete_liked_song_from_supabase(user_id, track_title):
+    await supabase_rpc("like_remove", {"user_id": str(user_id), "track_title": track_title})
+
+
+async def clear_liked_songs_in_supabase(user_id):
+    await supabase_rpc("likes_clear", {"user_id": str(user_id)})
+
+
+async def set_vc_status(voice_channel, status):
+    try:
+        route = discord.http.Route("PUT", "/channels/{channel_id}/voice-status", channel_id=voice_channel.id)
+        await bot.http.request(route, json={"status": (status or "")[:500]})
+    except Exception as e:
+        print(f"[Music] VC status error: {e}")
+
+
+# ---- Now Playing card (album art + live progress bar + buttons) ----
+now_playing_messages = {}
+_np_artwork = {}
+_progress_tasks = {}
+_np_swept_channels = set()
+_resume_card_pos = {}
+
+# Portable unicode button icons (this is a different Discord app than Utilities).
+EMOJI_HEART = "🤍"
+EMOJI_HEART_RED = "❤️"
+EMOJI_SKIP = "⏭️"
+EMOJI_BACK = "⏮️"
+EMOJI_DJ_OFF = "🎧"
+EMOJI_DJ_ON = "🎧"
+EMOJI_PAUSE = "⏸️"
+EMOJI_PLAY = "▶️"
+MUSIC_X_LABEL = "ㅤㅤㅤㅤㅤㅤ    ㅤ  ㅤ     ㅤㅤ✕ㅤㅤㅤㅤㅤㅤ   ㅤ  ㅤ     ㅤㅤ"
+
+PROGRESS_IMG_WIDTH = 300
+PROGRESS_FONT_SIZE = 16
+PROGRESS_BAR_THICKNESS = 5
+PROGRESS_BAR_SEGMENTS = 18
+PROGRESS_UPDATE_SECONDS = 5
+
+
+def _fmt_time(ms) -> str:
+    m, s = divmod(int(ms or 0) // 1000, 60)
+    return f"{m}:{s:02d}"
+
+
+def build_progress_bar(position_ms, length_ms) -> str:
+    if not length_ms:
+        return ""
+    frac = max(0.0, min(1.0, (position_ms or 0) / length_ms))
+    idx = int(frac * (PROGRESS_BAR_SEGMENTS - 1))
+    return "━" * idx + "●" + "─" * (PROGRESS_BAR_SEGMENTS - 1 - idx)
+
+
+def _progress_line(track, position_ms, v2: bool = False) -> str:
+    bar = build_progress_bar(position_ms, track.length or 0)
+    times = f"{_fmt_time(position_ms)} / {_fmt_time(track.length or 0)}"
+    if not bar:
+        return times
+    return f"{bar}\n-# {times}" if v2 else f"{bar}\n{times}"
+
+
+def _render_progress_image(position_ms, length_ms):
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+    try:
+        if not length_ms:
+            return None
+        frac = max(0.0, min(1.0, (position_ms or 0) / length_ms))
+        bar_h = PROGRESS_BAR_THICKNESS
+        knob_h = bar_h * 2 + 1
+        knob_w = max(6, bar_h + 2)
+        W, H = PROGRESS_IMG_WIDTH, PROGRESS_FONT_SIZE + knob_h + 10
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        font = None
+        for _fp in ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+                    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"):
+            try:
+                font = ImageFont.truetype(_fp, PROGRESS_FONT_SIZE)
+                break
+            except Exception:
+                continue
+        if font is None:
+            try:
+                font = ImageFont.load_default(size=PROGRESS_FONT_SIZE)
+            except Exception:
+                font = ImageFont.load_default()
+        left_txt, right_txt = _fmt_time(position_ms), _fmt_time(length_ms)
+        text_color = (181, 184, 190, 255)
+        d.text((0, 2), left_txt, font=font, fill=text_color)
+        d.text((W - d.textlength(right_txt, font=font), 2), right_txt, font=font, fill=text_color)
+        bx0, bx1 = 0, W - 1
+        y0 = H - 6 - bar_h
+        r = bar_h // 2
+        d.rounded_rectangle([bx0, y0, bx1, y0 + bar_h], radius=r, fill=(66, 68, 75, 255))
+        fill_x = bx0 + max(bar_h, int(frac * (bx1 - bx0)))
+        d.rounded_rectangle([bx0, y0, fill_x, y0 + bar_h], radius=r, fill=(59, 130, 246, 255))
+        kx = min(max(bx0 + int(frac * (bx1 - bx0)) - knob_w // 2, bx0), bx1 - knob_w)
+        ky = y0 + bar_h // 2 - knob_h // 2
+        d.rounded_rectangle([kx, ky, kx + knob_w, ky + knob_h], radius=max(2, knob_w // 2 - 1), fill=(214, 220, 232, 255))
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        print(f"[Music] Progress image render failed: {e}")
+        return None
+
+
+def _build_np_embed(track, artwork, position_ms, with_image: bool = False):
+    artist = getattr(track, "author", None)
+    if with_image:
+        value = artist if artist else "​"
+    else:
+        value = f"{artist}\n{_progress_line(track, position_ms)}" if artist else _progress_line(track, position_ms)
+    embed = discord.Embed(color=0x242429)
+    embed.set_author(name="Now Playing")
+    embed.add_field(name=track.title, value=value, inline=False)
+    if artwork:
+        embed.set_thumbnail(url=artwork)
+    if with_image:
+        embed.set_image(url="attachment://progress.png")
+    return embed
+
+
+def _npv2_emoji(pe):
+    if isinstance(pe, str):
+        return {"name": pe}
+    try:
+        return {"id": str(pe.id), "name": pe.name}
+    except Exception:
+        return None
+
+
+def _build_npv2_container(track, artwork, position_ms, with_image: bool = False):
+    artist = getattr(track, "author", None)
+    title_line = f"**{track.title} - {artist}**" if artist else f"**{track.title}**"
+    section = {"type": 9, "components": [{"type": 10, "content": f"**Now playing**\n{title_line}"}]}
+    if artwork:
+        section["accessory"] = {"type": 11, "media": {"url": artwork}}
+    if with_image:
+        progress_components = [{"type": 12, "items": [{"media": {"url": "attachment://progress.png"}}]}]
+    else:
+        progress_components = [{"type": 10, "content": _progress_line(track, position_ms, v2=True)}]
+    return {
+        "type": 17,
+        "components": [
+            section, *progress_components,
+            {"type": 14, "divider": True, "spacing": 1},
+            {"type": 1, "components": [
+                {"type": 2, "style": 2, "custom_id": "npv2_like", "emoji": _npv2_emoji(EMOJI_HEART)},
+                {"type": 2, "style": 2, "custom_id": "npv2_back", "emoji": _npv2_emoji(EMOJI_BACK)},
+                {"type": 2, "style": 2, "custom_id": "npv2_pause", "emoji": _npv2_emoji(EMOJI_PAUSE)},
+                {"type": 2, "style": 2, "custom_id": "npv2_skip", "emoji": _npv2_emoji(EMOJI_SKIP)},
+                {"type": 2, "style": 2, "custom_id": "npv2_dj", "emoji": _npv2_emoji(EMOJI_DJ_OFF)},
+            ]},
+            {"type": 1, "components": [
+                {"type": 2, "style": 4, "custom_id": "npv2_disconnect", "label": MUSIC_X_LABEL},
+            ]},
+        ],
+    }
+
+
+class NowPlayingView(discord.ui.View):
+    def __init__(self, guild_id):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+
+    @discord.ui.button(emoji=EMOJI_HEART, style=discord.ButtonStyle.secondary, row=0)
+    async def like(self, interaction, button):
+        vc = interaction.guild.voice_client
+        if vc and vc.current:
+            title = vc.current.title
+            _artist = getattr(vc.current, "author", None)
+            if _artist:
+                title = f"{title} — {_artist}"
+            liked_songs.setdefault(interaction.user.id, [])
+            if title not in liked_songs[interaction.user.id]:
+                liked_songs[interaction.user.id].append(title)
+                asyncio.create_task(save_liked_song_to_supabase(interaction.user.id, title))
+                _adjust_taste(interaction.guild.id, _artist, 3.0)
+                await interaction.response.send_message(f"Added **{title}** to your favorites.", ephemeral=True, delete_after=5)
+            else:
+                liked_songs[interaction.user.id].remove(title)
+                asyncio.create_task(delete_liked_song_from_supabase(interaction.user.id, title))
+                _adjust_taste(interaction.guild.id, _artist, -1.0)
+                await interaction.response.send_message(f"Removed **{title}** from your favorites.", ephemeral=True, delete_after=5)
+        else:
+            await interaction.response.send_message("Nothing playing.", ephemeral=True)
+
+    @discord.ui.button(emoji=EMOJI_BACK, style=discord.ButtonStyle.secondary, row=0)
+    async def back(self, interaction, button):
+        vc = interaction.guild.voice_client
+        hist = track_history.get(interaction.guild.id, [])
+        if not vc or len(hist) < 2:
+            await interaction.response.send_message("No previous song.", ephemeral=True)
+            return
+        prev = hist[-2]
+        del hist[-2:]
+        try:
+            _adjust_taste(interaction.guild.id, getattr(prev, "author", None), 2.0)
+            await vc.play(prev)
+            await interaction.response.send_message("Playing previous song.", ephemeral=True, delete_after=3)
+        except Exception as e:
+            print(f"[Music] Back error: {e}")
+            await interaction.response.send_message("Couldn't go back.", ephemeral=True)
+
+    @discord.ui.button(emoji=EMOJI_PAUSE, style=discord.ButtonStyle.secondary, custom_id="music_pause_toggle", row=0)
+    async def pause(self, interaction, button):
+        vc = interaction.guild.voice_client
+        if vc:
+            await vc.pause(not vc.paused)
+            button.emoji = EMOJI_PLAY if vc.paused else EMOJI_PAUSE
+            await interaction.response.edit_message(view=self)
+        else:
+            await interaction.response.send_message("Not connected.", ephemeral=True)
+
+    @discord.ui.button(emoji=EMOJI_SKIP, style=discord.ButtonStyle.secondary, row=0)
+    async def skip(self, interaction, button):
+        vc = interaction.guild.voice_client
+        if vc and vc.playing:
+            _taste_event_current(interaction.guild, -1.5)
+            session = auto_music_sessions.get(interaction.guild.id)
+            if session and len(vc.queue) < 2 and interaction.guild.id not in _dj_mode:
+                try:
+                    genre = session.get("genre", "pop")
+                    for t in await get_genre_playlist_tracks(genre, count=20, guild_id=interaction.guild.id, source="skip-refill"):
+                        await vc.queue.put_wait(t)
+                except Exception as _e:
+                    print(f"[Skip] Refill error: {_e}")
+            await vc.skip(force=True)
+            await interaction.response.send_message("Skipped.", ephemeral=True, delete_after=3)
+        else:
+            await interaction.response.send_message("Nothing playing.", ephemeral=True)
+
+    @discord.ui.button(emoji=EMOJI_DJ_OFF, style=discord.ButtonStyle.secondary, row=0)
+    async def dj_toggle(self, interaction, button):
+        guild = interaction.guild
+        if not (DJ_ENABLED and DJ_PUBLIC_URL):
+            return await interaction.response.send_message("DJ mode isn't set up on this bot yet.", ephemeral=True)
+        if guild.id in _dj_mode:
+            await interaction.response.send_message("Next set coming up.", ephemeral=True, delete_after=3)
+            asyncio.create_task(_dj_start_set(guild))
+        else:
+            _dj_mode.add(guild.id)
+            _dj_counters[guild.id] = 0
+            await interaction.response.send_message("DJ mode on.", ephemeral=True, delete_after=3)
+            asyncio.create_task(_dj_start_set(guild, first_activation=True))
+
+    @discord.ui.button(label=MUSIC_X_LABEL, style=discord.ButtonStyle.danger, row=1)
+    async def disconnect(self, interaction, button):
+        if not is_dj(interaction.user):
+            await interaction.response.send_message("You need a DJ role to disconnect.", ephemeral=True)
+            return
+        vc = interaction.guild.voice_client
+        if vc and vc.channel:
+            _cancel_progress(interaction.guild.id)
+            try:
+                await set_vc_status(vc.channel, None)
+            except Exception:
+                pass
+            old_msg = now_playing_messages.pop(interaction.guild.id, None)
+            if old_msg:
+                try:
+                    await old_msg.delete()
+                except Exception:
+                    pass
+            await vc.disconnect()
+        await interaction.response.send_message("Disconnected.", ephemeral=True, delete_after=3)
+
+
+def _cancel_progress(guild_id: int):
+    t = _progress_tasks.pop(guild_id, None)
+    if t:
+        t.cancel()
+    _np_artwork.pop(guild_id, None)
+
+
+def _npv2_multipart(payload, buf):
+    file = discord.File(buf, "progress.png")
+    form = [
+        {"name": "payload_json", "value": json.dumps(payload)},
+        {"name": "files[0]", "value": file.fp, "filename": file.filename, "content_type": "application/octet-stream"},
+    ]
+    return form, [file]
+
+
+async def _progress_updater(guild_id: int):
+    try:
+        while True:
+            await asyncio.sleep(PROGRESS_UPDATE_SECONDS)
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                return
+            vc = guild.voice_client
+            msg = now_playing_messages.get(guild_id)
+            if not vc or not getattr(vc, "current", None) or not msg:
+                return
+            if getattr(vc, "paused", False):
+                continue
+            track = vc.current
+            position = int(getattr(vc, "position", 0) or 0)
+            artwork = _np_artwork.get(guild_id)
+            try:
+                buf = _render_progress_image(position, track.length or 0)
+                if music_config.get("now_playing_v2"):
+                    container = _build_npv2_container(track, artwork, position, with_image=buf is not None)
+                    edit_payload = {"components": [container]}
+                    route = discord.http.Route("PATCH", "/channels/{channel_id}/messages/{message_id}",
+                                               channel_id=msg.channel.id, message_id=msg.id)
+                    if buf:
+                        edit_payload["attachments"] = [{"id": "0"}]
+                        form, files = _npv2_multipart(edit_payload, buf)
+                        await bot.http.request(route, form=form, files=files)
+                    else:
+                        await bot.http.request(route, json=edit_payload)
+                else:
+                    embed = _build_np_embed(track, artwork, position, with_image=buf is not None)
+                    if buf:
+                        await msg.edit(embed=embed, attachments=[discord.File(buf, "progress.png")])
+                    else:
+                        await msg.edit(embed=embed)
+            except Exception as e:
+                print(f"[Music] Progress update stopped: {e}")
+                return
+    except asyncio.CancelledError:
+        pass
+
+
+async def send_now_playing_v2(guild, track, channel, artwork, position_ms: int = 0):
+    buf = _render_progress_image(position_ms, track.length or 0)
+    container = _build_npv2_container(track, artwork, position_ms, with_image=buf is not None)
+    payload = {"flags": 32768, "components": [container]}
+    route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
+    if buf:
+        form, files = _npv2_multipart(payload, buf)
+        data = await bot.http.request(route, form=form, files=files)
+    else:
+        data = await bot.http.request(route, json=payload)
+    try:
+        return channel.get_partial_message(int(data["id"]))
+    except Exception:
+        try:
+            return await channel.fetch_message(int(data["id"]))
+        except Exception:
+            return None
+
+
+async def purge_old_now_playing(channel):
+    try:
+        async for m in channel.history(limit=25):
+            if m.author.id != bot.user.id:
+                continue
+            is_card = any((e.author and e.author.name == "Now Playing") for e in m.embeds) or bool(getattr(m.flags, "value", 0) & 32768)
+            if is_card:
+                try:
+                    await m.delete()
+                    await asyncio.sleep(0.6)
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[Music] Stale card sweep failed: {e}")
+
+
+async def handle_npv2_button(interaction, cid):
+    try:
+        guild = interaction.guild
+        if not guild:
+            return
+        vc = guild.voice_client
+        if cid == "npv2_like":
+            if not vc or not vc.current:
+                return await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            title = vc.current.title
+            _artist = getattr(vc.current, "author", None)
+            if _artist:
+                title = f"{title} — {_artist}"
+            uid = interaction.user.id
+            liked_songs.setdefault(uid, [])
+            if title not in liked_songs[uid]:
+                liked_songs[uid].append(title)
+                asyncio.create_task(save_liked_song_to_supabase(uid, title))
+                _adjust_taste(guild.id, _artist, 3.0)
+                await interaction.response.send_message(f"Added **{title}** to your favorites.", ephemeral=True, delete_after=5)
+            else:
+                liked_songs[uid].remove(title)
+                asyncio.create_task(delete_liked_song_from_supabase(uid, title))
+                _adjust_taste(guild.id, _artist, -1.0)
+                await interaction.response.send_message(f"Removed **{title}** from your favorites.", ephemeral=True, delete_after=5)
+        elif cid == "npv2_dj":
+            if not (DJ_ENABLED and DJ_PUBLIC_URL):
+                return await interaction.response.send_message("DJ mode isn't set up on this bot yet.", ephemeral=True)
+            if guild.id in _dj_mode:
+                await interaction.response.send_message("Next set coming up.", ephemeral=True, delete_after=3)
+                asyncio.create_task(_dj_start_set(guild))
+            else:
+                _dj_mode.add(guild.id)
+                _dj_counters[guild.id] = 0
+                await interaction.response.send_message("DJ mode on.", ephemeral=True, delete_after=3)
+                asyncio.create_task(_dj_start_set(guild, first_activation=True))
+        elif cid == "npv2_back":
+            hist = track_history.get(guild.id, [])
+            if not vc or len(hist) < 2:
+                return await interaction.response.send_message("No previous song.", ephemeral=True)
+            prev = hist[-2]
+            del hist[-2:]
+            try:
+                _adjust_taste(guild.id, getattr(prev, "author", None), 2.0)
+                await vc.play(prev)
+                await interaction.response.send_message("Playing previous song.", ephemeral=True, delete_after=3)
+            except Exception as e:
+                print(f"[Music] Back error: {e}")
+                await interaction.response.send_message("Couldn't go back.", ephemeral=True)
+        elif cid == "npv2_skip":
+            if not vc or not vc.playing:
+                return await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            _taste_event_current(guild, -1.5)
+            session = auto_music_sessions.get(guild.id)
+            if session and len(vc.queue) < 2 and guild.id not in _dj_mode:
+                try:
+                    for t in await get_genre_playlist_tracks(session.get("genre", "pop"), count=20, guild_id=guild.id, source="skip-v2-refill"):
+                        await vc.queue.put_wait(t)
+                except Exception as _e:
+                    print(f"[Skip] Refill error: {_e}")
+            await vc.skip(force=True)
+            await interaction.response.send_message("Skipped.", ephemeral=True, delete_after=3)
+        elif cid == "npv2_pause":
+            if not vc:
+                return await interaction.response.send_message("Not connected.", ephemeral=True)
+            await vc.pause(not vc.paused)
+            await interaction.response.send_message("Paused." if vc.paused else "Resumed.", ephemeral=True, delete_after=3)
+        elif cid == "npv2_disconnect":
+            if not is_dj(interaction.user):
+                return await interaction.response.send_message("You need a DJ role to disconnect.", ephemeral=True)
+            if vc and vc.channel:
+                _cancel_progress(guild.id)
+                try:
+                    await set_vc_status(vc.channel, None)
+                except Exception:
+                    pass
+                old_msg = now_playing_messages.pop(guild.id, None)
+                if old_msg:
+                    try:
+                        await old_msg.delete()
+                    except Exception:
+                        pass
+                await vc.disconnect()
+            await interaction.response.send_message("Disconnected.", ephemeral=True, delete_after=3)
+    except Exception as e:
+        print(f"[Music] V2 button error: {e}")
+
+
+async def send_now_playing(guild, track, channel):
+    try:
+        artist_name = getattr(track, "author", "") or ""
+        artwork = await get_spotify_artwork(track.title, artist_name)
+        if not artwork:
+            artwork = getattr(track, "artwork", None) or getattr(track, "thumbnail", None)
+        if not artwork and getattr(track, "identifier", None):
+            artwork = f"https://img.youtube.com/vi/{track.identifier}/maxresdefault.jpg"
+
+        _pos0 = _resume_card_pos.pop(guild.id, None)
+        if _pos0 is None:
+            _pos0 = 0
+            try:
+                if guild.voice_client and getattr(guild.voice_client, "current", None) is track:
+                    _pos0 = int(getattr(guild.voice_client, "position", 0) or 0)
+            except Exception:
+                _pos0 = 0
+        _buf0 = _render_progress_image(_pos0, track.length or 0)
+        embed = _build_np_embed(track, artwork, _pos0, with_image=_buf0 is not None)
+
+        if guild.voice_client and guild.voice_client.channel:
+            try:
+                import time as _vt
+                _last = getattr(bot, "_last_vc_status", {})
+                if _vt.time() - _last.get(guild.id, 0) > 15:
+                    author = getattr(track, "author", None)
+                    await set_vc_status(guild.voice_client.channel, f"{track.title} - {author}" if author else track.title)
+                    _last[guild.id] = _vt.time()
+                    bot._last_vc_status = _last
+            except Exception:
+                pass
+
+        if guild.id not in now_playing_messages and channel.id not in _np_swept_channels:
+            _np_swept_channels.add(channel.id)
+            await purge_old_now_playing(channel)
+
+        _cancel_progress(guild.id)
+        old_msg = now_playing_messages.pop(guild.id, None)
+        if old_msg:
+            try:
+                await old_msg.delete()
+            except Exception:
+                pass
+
+        if music_config.get("now_playing_v2"):
+            msg = await send_now_playing_v2(guild, track, channel, artwork, _pos0)
+            if msg:
+                now_playing_messages[guild.id] = msg
+                _np_artwork[guild.id] = artwork
+                _progress_tasks[guild.id] = asyncio.create_task(_progress_updater(guild.id))
+            return
+
+        if _buf0:
+            msg = await channel.send(embed=embed, view=NowPlayingView(guild.id), file=discord.File(_buf0, "progress.png"))
+        else:
+            msg = await channel.send(embed=embed, view=NowPlayingView(guild.id))
+        now_playing_messages[guild.id] = msg
+        _np_artwork[guild.id] = artwork
+        _progress_tasks[guild.id] = asyncio.create_task(_progress_updater(guild.id))
+    except Exception as e:
+        print(f"[Music] Now playing error: {e}")
+
+
+# ---- AI DJ "Carla" ----
+DJ_ENABLED = True
+DJ_VOICE = "en-US-GuyNeural"
+DJ_PUBLIC_URL = os.getenv("DJ_PUBLIC_URL", "").rstrip("/")
+DJ_SET_SIZE = 5
+DJ_VOICE_BOOST = 2.2
+_dj_clip_dir = "/tmp/dj"
+_dj_mode = set()
+_dj_counters = {}
+_dj_pending = {}
+_dj_set = {}
+_dj_sets_since_artist = {}
+_dj_recent_artists = {}
+_dj_recent_genres = {}
+_dj_prev_volume = {}
+auto_music_sessions = {}
+
+ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVEN_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
+
+DJ_VIBES = {
+    "rnbhiphop": "R&B and hip hop", "dance": "pump-up dance tracks", "pop": "pop hits",
+    "country": "country", "rockalternative": "rock and alternative", "latin": "Latin heat",
+}
+DJ_INTRO_LINES = [
+    "Hey, DJ Carla here — you're listening to Oversite Radio. Next up, some {vibe}.",
+    "Welcome to Oversite Radio! It's DJ Carla, starting us off with some {vibe}.",
+    "You're locked in to Oversite Radio with DJ Carla. First up — a little {vibe}.",
+]
+DJ_SWITCH_LINES = [
+    "Alright — here comes some {vibe}.",
+    "Time for a change of pace. Next up: {vibe}.",
+    "DJ Carla back with you — let's slide into some {vibe}.",
+    "New vibe incoming. Rolling into {vibe} now.",
+]
+
+
+async def _dj_make_clip(text: str) -> str | None:
+    if not DJ_PUBLIC_URL:
+        return None
+    try:
+        import uuid
+        os.makedirs(_dj_clip_dir, exist_ok=True)
+        name = f"{uuid.uuid4().hex}.mp3"
+        path = os.path.join(_dj_clip_dir, name)
+        made = False
+        if ELEVEN_API_KEY and ELEVEN_VOICE_ID:
+            try:
+                async with httpx.AsyncClient() as client:
+                    r = await client.post(
+                        f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}",
+                        headers={"xi-api-key": ELEVEN_API_KEY, "Content-Type": "application/json"},
+                        json={"text": text, "model_id": "eleven_turbo_v2_5",
+                              "voice_settings": {"stability": 0.5, "similarity_boost": 0.8}}, timeout=20)
+                    if r.status_code == 200:
+                        with open(path, "wb") as f:
+                            f.write(r.content)
+                        made = True
+            except Exception as ee:
+                print(f"[DJ] ElevenLabs failed ({ee}) — Edge-TTS")
+        if not made:
+            import edge_tts
+            await edge_tts.Communicate(text, DJ_VOICE).save(path)
+        for f in sorted(os.listdir(_dj_clip_dir))[:-10]:
+            try:
+                os.remove(os.path.join(_dj_clip_dir, f))
+            except Exception:
+                pass
+        return f"{DJ_PUBLIC_URL}/dj/{name}"
+    except Exception as e:
+        print(f"[DJ] Clip generation failed: {e}")
+        return None
+
+
+async def _dj_ai_line(vibe: str, first: bool):
+    key = os.getenv("ANTHROPIC_API_KEY")
+    if not key:
+        return None
+    try:
+        _style = random.choice(["high-energy and hyped", "smooth and laid-back", "playful and witty",
+                                "warm late-night vibes", "quick and punchy", "cool and confident"])
+        prompt = (f"You are DJ Carla, host of Oversite Radio, a Discord music station. "
+                  f"Write ONE short spoken intro (max 28 words) for a set of {vibe}. "
+                  + ("This is the start of the broadcast - welcome listeners to Oversite Radio. " if first
+                     else "You are switching vibes mid-broadcast. ")
+                  + f"Tone: {_style}. No emojis, no quotes. Output only the line.")
+        async with httpx.AsyncClient() as client:
+            r = await client.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": "claude-haiku-4-5", "max_tokens": 80, "temperature": 1.0,
+                      "messages": [{"role": "user", "content": prompt}]}, timeout=4)
+            if r.status_code == 200:
+                t = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+                if 0 < len(t) < 300:
+                    return t
+    except Exception as e:
+        print(f"[DJ-AI] line gen failed: {e}")
+    return None
+
+
+def _dj_pick_vibe(guild_id):
+    import random as _r
+    current = (_dj_set.get(guild_id) or {}).get("genre")
+    choices = [g for g in DJ_VIBES if g != current] or list(DJ_VIBES)
+    taste = music_taste.get(guild_id, {})
+    def _w(g):
+        pool = GENRE_SONGS.get(g, [])
+        s = sum(v for a, v in taste.items() if any(str(e).lower().startswith(a) for e in pool[:30]))
+        return max(1.0, 1.0 + s * 0.2)
+    return _r.choices(choices, weights=[_w(g) for g in choices], k=1)[0]
+
+
+async def _dj_ai_pick(guild):
+    key = os.getenv("ANTHROPIC_API_KEY")
+    if not key:
+        return (None, None)
+    _dj_sets_since_artist[guild.id] = _dj_sets_since_artist.get(guild.id, 0) + 1
+    allow_artist = _dj_sets_since_artist[guild.id] >= random.randint(6, 7)
+    try:
+        taste = music_taste.get(guild.id, {})
+        loved = [a for a, s in sorted(taste.items(), key=lambda kv: -kv[1]) if s >= 3][:8]
+        recent = _dj_recent_artists.get(guild.id, [])
+        recent_g = _dj_recent_genres.get(guild.id, [])
+        import json as _json
+        prompt = ("You are programming a Discord radio station. Pick what plays next. "
+                  "Options: a genre from this list: " + ", ".join(k for k in DJ_VIBES if k not in recent_g) + ". "
+                  + (("Or an artist set by a specific popular artist related to what this room loves: "
+                      + (", ".join(loved) if loved else "unknown") + ". ") if allow_artist else "Pick a genre only. ")
+                  + 'Respond with ONLY JSON: {"type":"genre","value":"<genre key>"} or {"type":"artist","value":"<artist name>"}')
+        async with httpx.AsyncClient() as client:
+            r = await client.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json={"model": "claude-haiku-4-5", "max_tokens": 60, "temperature": 1.0,
+                      "messages": [{"role": "user", "content": prompt}]}, timeout=4)
+            if r.status_code == 200:
+                t = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text").strip()
+                t = t.replace("```json", "").replace("```", "").strip()
+                d = _json.loads(t)
+                if d.get("type") == "genre" and d.get("value") in DJ_VIBES and d.get("value") not in recent_g:
+                    return ("genre", d["value"])
+                if allow_artist and d.get("type") == "artist" and isinstance(d.get("value"), str) and 0 < len(d["value"]) < 60 and d["value"].lower() not in [a.lower() for a in recent]:
+                    _dj_sets_since_artist[guild.id] = 0
+                    _dj_recent_artists.setdefault(guild.id, []).append(d["value"])
+                    _dj_recent_artists[guild.id] = _dj_recent_artists[guild.id][-5:]
+                    return ("artist", d["value"])
+    except Exception as e:
+        print(f"[DJ-AI] pick failed: {e}")
+    return (None, None)
+
+
+async def _dj_fetch_artist_set(guild, artist):
+    tracks = []
+    try:
+        import wavelink as _wl
+        names = list(await fetch_artist_songs(artist))
+        random.shuffle(names)
+        for n in names[:DJ_SET_SIZE + 3]:
+            if len(tracks) >= DJ_SET_SIZE:
+                break
+            try:
+                res = await _wl.Playable.search(f"ytmsearch:{n}")
+                if res:
+                    tracks.append(res[0])
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[DJ-AI] artist set failed: {e}")
+    if len(tracks) >= 3:
+        return tracks
+    return await get_genre_playlist_tracks(_dj_pick_vibe(guild.id), count=DJ_SET_SIZE, guild_id=guild.id, source="dj-set-fallback")
+
+
+async def _dj_start_set(guild, first_activation: bool = False):
+    try:
+        vc = guild.voice_client
+        if not vc:
+            return
+        pick_type, pick_val = await _dj_ai_pick(guild)
+        if pick_type == "artist":
+            genre = _dj_pick_vibe(guild.id)
+            _dj_set[guild.id] = {"genre": genre}
+            spoken = f"{pick_val}"
+            fetch_task = asyncio.create_task(_dj_fetch_artist_set(guild, pick_val))
+        else:
+            genre = pick_val if pick_type == "genre" else _dj_pick_vibe(guild.id)
+            for _ in range(6):
+                if genre not in _dj_recent_genres.get(guild.id, []):
+                    break
+                genre = _dj_pick_vibe(guild.id)
+            _dj_set[guild.id] = {"genre": genre}
+            spoken = DJ_VIBES.get(genre, genre)
+            _dj_recent_genres.setdefault(guild.id, []).append(genre)
+            _dj_recent_genres[guild.id] = _dj_recent_genres[guild.id][-3:]
+            fetch_task = asyncio.create_task(get_genre_playlist_tracks(genre, count=DJ_SET_SIZE, guild_id=guild.id, source="dj-set"))
+        pool = DJ_INTRO_LINES if first_activation else DJ_SWITCH_LINES
+        line = await _dj_ai_line(spoken, first_activation) or random.choice(pool).format(vibe=spoken)
+        clip = await _dj_make_clip(line)
+        if clip:
+            import wavelink as _wl
+            clips = await _wl.Playable.search(clip)
+            if clips:
+                try:
+                    vc.queue.clear()
+                except Exception:
+                    pass
+                _dj_pending[guild.id] = {"fetch": fetch_task}
+                try:
+                    _prev = int(getattr(vc, "volume", 100) or 100)
+                    _dj_prev_volume[guild.id] = _prev
+                    await vc.set_volume(min(300, int(_prev * DJ_VOICE_BOOST)))
+                except Exception:
+                    pass
+                await vc.play(clips[0])
+                print(f"[DJ] Speaking: {line}")
+                return
+        tracks = await fetch_task
+        if tracks:
+            try:
+                vc.queue.clear()
+            except Exception:
+                pass
+            for t in tracks[1:]:
+                await vc.queue.put_wait(t)
+            await vc.play(tracks[0])
+    except Exception as e:
+        print(f"[DJ] Set start error: {e}")
+
+
+def _is_dj_clip(track) -> bool:
+    u = getattr(track, "uri", "") or ""
+    return "/dj/" in u and (not DJ_PUBLIC_URL or u.startswith(DJ_PUBLIC_URL))
+
+
+async def _dj_serve():
+    """Tiny web server so Lavalink can fetch the generated DJ clips."""
+    if not DJ_PUBLIC_URL:
+        return
+    try:
+        from aiohttp import web
+        app = web.Application()
+        os.makedirs(_dj_clip_dir, exist_ok=True)
+        app.router.add_static("/dj/", _dj_clip_dir)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        port = int(os.getenv("PORT", 8080))
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        print(f"[DJ] Clip server listening on port {port}")
+    except Exception as e:
+        print(f"[DJ] Clip server failed to start: {e}")
+
+
+# ---- Wavelink connect (+ optional YT OAuth registration) ----
+async def setup_wavelink():
+    global music_available
+    if wavelink is None:
+        print("[Music] wavelink missing — music disabled")
         return
     if not (LAVALINK_URI and LAVALINK_PASSWORD):
-        print("[Music] Lavalink not configured (set LAVALINK_URI + LAVALINK_PASSWORD) — /play disabled")
+        print("[Music] LAVALINK_URI/PASSWORD not set — music disabled")
         return
     try:
         node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD)
         await wavelink.Pool.connect(nodes=[node], client=bot, cache_capacity=100)
-        _lavalink_connected = True
+        music_available = True
         print(f"[Music] connecting to Lavalink at {LAVALINK_URI}")
+        if YOUTUBE_OAUTH_REFRESH_TOKEN:
+            try:
+                _url = f"{LAVALINK_URI.rstrip('/')}/youtube"
+                async with aiohttp.ClientSession() as _s:
+                    async with _s.post(_url, headers={"Authorization": LAVALINK_PASSWORD, "Content-Type": "application/json"},
+                                       json={"refreshToken": YOUTUBE_OAUTH_REFRESH_TOKEN},
+                                       timeout=aiohttp.ClientTimeout(total=10)) as _r:
+                        print(f"[OAuth] Registered YT refresh token — status {_r.status}")
+            except Exception as _oe:
+                print(f"[OAuth] Register failed: {_oe}")
     except Exception as e:
         print(f"[Music] Lavalink connect failed: {e}")
 
 
-# Chain our node connection into the bot's setup_hook without clobbering the
-# existing one.
+# Chain node connect + DJ clip server into setup_hook without clobbering existing.
 _prev_setup_hook = bot.setup_hook
 
 
@@ -7539,7 +8855,8 @@ async def _music_setup_hook():
         if _prev_setup_hook:
             await _prev_setup_hook()
     finally:
-        await _connect_lavalink()
+        await setup_wavelink()
+        asyncio.create_task(_dj_serve())
 
 
 bot.setup_hook = _music_setup_hook
@@ -7553,418 +8870,550 @@ async def on_wavelink_node_ready(payload):
         pass
 
 
-# Per-guild extras we track alongside wavelink's own Player/Queue: the text
-# channel to announce in, and whether we're in radio mode.
-_music_home = {}   # guild_id -> text channel id
-_music_radio = {}  # guild_id -> bool
-
-
-def _music_is_dj(member):
-    try:
-        if member.guild_permissions.manage_guild:
-            return True
-    except Exception:
-        pass
-    return has_any_role(member, music_config.get("dj_role_ids", []))
-
-
-def _music_node_ready():
-    try:
-        return bool(wavelink and getattr(wavelink.Pool, "nodes", None))
-    except Exception:
-        return False
-
-
-def _music_gate(interaction, need_dj=False):
-    """(ok, error_embed). Enabled + node reachable + (optionally) DJ."""
-    if not music_config.get("enabled"):
-        return False, error_embed("Music is off", "The Music Add-On isn't enabled in the dashboard.")
-    if wavelink is None:
-        return False, error_embed("Music unavailable", "The host is missing the `wavelink` library.")
-    if not _music_node_ready():
-        return False, error_embed("Music offline", "The music server isn't connected right now. Try again in a moment.")
-    if need_dj and not _music_is_dj(interaction.user):
-        return False, error_embed("DJ only", "Only a DJ (or Manage Server) can control playback.")
-    return True, None
-
-
-def _fmt_ms(ms):
-    try:
-        sec = int((ms or 0) // 1000)
-    except Exception:
-        return ""
-    if sec <= 0:
-        return "🔴 live"
-    m, s = divmod(sec, 60)
-    h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-def _track_requester(track):
-    """(id, name) of who queued a track, from its extras (best-effort)."""
-    try:
-        ex = track.extras
-        rid = getattr(ex, "requester_id", None)
-        rname = getattr(ex, "requester_name", None)
-        if rid or rname:
-            return (str(rid) if rid else None), (rname or "")
-    except Exception:
-        pass
-    return None, ""
-
-
-def _music_np_embed(track, player):
-    who = _track_requester(track)[1]
-    dur = _fmt_ms(getattr(track, "length", 0))
-    desc = f"**[{track.title}]({getattr(track, 'uri', '') or ''})**"
-    if getattr(track, "author", None):
-        desc += f"\nby {track.author}"
-    meta = []
-    if dur:
-        meta.append(dur)
-    if who:
-        meta.append(f"queued by {who}")
-    vol = int(getattr(player, "volume", 100) or 100)
-    meta.append(f"vol {vol}%")
-    if meta:
-        desc += "\n" + " · ".join(meta)
-    e = info_embed("Now Playing", desc)
-    art = getattr(track, "artwork", None)
-    if art:
-        try:
-            e.set_thumbnail(url=art)
-        except Exception:
-            pass
-    return e
-
-
-async def _music_connect(interaction):
-    """Join the caller's voice channel, returning (player, err_embed)."""
-    user = interaction.user
-    if not (getattr(user, "voice", None) and user.voice.channel):
-        return None, error_embed("Join a voice channel", "Hop into a voice channel first, then run the command.")
-    ch = user.voice.channel
-    player = interaction.guild.voice_client
-    try:
-        if player is None:
-            player = await ch.connect(cls=wavelink.Player, self_deaf=True)
-        elif player.channel and player.channel.id != ch.id:
-            await player.move_to(ch)
-    except Exception as e:
-        return None, error_embed("Couldn't join", str(e)[:200])
-    try:
-        player.autoplay = wavelink.AutoPlayMode.partial  # auto-advance queue, no YT recommendations
-    except Exception:
-        pass
-    return player, None
-
-
-async def _music_search(query):
-    """Resolve a query/URL into a Playable list or Playlist. Plain text searches
-    SoundCloud; URLs (SoundCloud / Spotify / direct stream) resolve as-is."""
-    q = (query or "").strip()
-    is_url = q.lower().startswith(("http://", "https://"))
-    search = q if is_url else f"scsearch:{q}"
-    try:
-        return await wavelink.Playable.search(search)
-    except Exception as e:
-        print(f"[Music] search failed: {e}")
-        return None
-
-
+# ---- Commands ----
 @bot.tree.command(name="play", description="Play a song in your voice channel")
-@app_commands.describe(query="A song name, or a SoundCloud / Spotify link")
-async def play_cmd(interaction: discord.Interaction, query: str):
-    ok, err = _music_gate(interaction)
-    if not ok:
-        await interaction.response.send_message(embed=err, ephemeral=True)
+@app_commands.describe(query="Song name, a link, a genre, or 'favorites'")
+async def music_play(interaction: discord.Interaction, query: str):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception:
         return
-    if not music_config.get("everyone_can_queue", True) and not _music_is_dj(interaction.user):
-        await interaction.response.send_message(embed=error_embed("DJ only", "Only a DJ can add songs right now."), ephemeral=True)
+    if wavelink is None:
+        await interaction.followup.send(embed=error_embed("Music unavailable", "Music isn't configured."))
         return
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    player, err = await _music_connect(interaction)
-    if not player:
-        await interaction.followup.send(embed=err, ephemeral=True)
+    if not (music_config.get("enabled") or music_available):
+        await interaction.followup.send(embed=error_embed("Music is off", "Enable the Music Add-On in the dashboard first."))
         return
-    maxq = int(music_config.get("max_queue_length") or 100)
-    if len(player.queue) >= maxq:
-        await interaction.followup.send(embed=error_embed("Queue full", f"The queue is capped at {maxq} songs."), ephemeral=True)
+    if not interaction.user.voice:
+        await interaction.followup.send(embed=error_embed("Not in voice", "Join a voice channel first."))
         return
-    _music_home[interaction.guild_id] = interaction.channel_id
-    _music_radio[interaction.guild_id] = False
+    if not music_config.get("everyone_can_queue", True) and not is_dj(interaction.user):
+        await interaction.followup.send(embed=error_embed("DJ only", "Only a DJ can add songs right now."))
+        return
+    vc = get_player(interaction.guild)
+    if not vc:
+        vc = await interaction.user.voice.channel.connect(cls=wavelink.Player)
 
-    results = await _music_search(query)
-    if not results:
-        await interaction.followup.send(embed=error_embed("Couldn't find it", "No results — try a different name or a SoundCloud link."), ephemeral=True)
-        return
-
-    def _tag(tr):
+    _was_dj = interaction.guild.id in _dj_mode
+    if _was_dj:
+        _dj_mode.discard(interaction.guild.id)
+        _dj_set.pop(interaction.guild.id, None)
+        _dj_pending.pop(interaction.guild.id, None)
         try:
-            tr.extras = {"requester_id": str(interaction.user.id), "requester_name": interaction.user.display_name}
+            vc.queue.clear()
         except Exception:
             pass
 
-    if isinstance(results, wavelink.Playlist):
-        added = 0
-        for tr in results.tracks:
-            if len(player.queue) >= maxq:
-                break
-            _tag(tr)
-            player.queue.put(tr)
-            added += 1
-        label = f"**{results.name}** — {added} track(s)"
-    else:
-        track = results[0]
-        _tag(track)
-        player.queue.put(track)
-        label = f"**{track.title}**"
+    _q = query.strip().lower()
+    play_channels[interaction.guild.id] = interaction.channel.id
 
-    if not player.playing:
-        nxt = player.queue.get()
-        vol = max(1, min(100, int(music_config.get("default_volume") or 50)))
-        await player.play(nxt, volume=vol)
-        await interaction.followup.send(embed=success_embed("Playing", f"**{nxt.title}**"), ephemeral=True)
+    # /play favorites
+    if _q in ("favorites", "favourites", "liked", "liked songs", "my favorites"):
+        songs = list(liked_songs.get(interaction.user.id, []))
+        if not songs:
+            await interaction.followup.send(embed=error_embed("No favorites yet", "Heart songs on the Now Playing card first."))
+            return
+        import random as _r
+        _r.shuffle(songs)
+        songs = songs[:20]
+        queued = 0
+        for s in songs:
+            try:
+                results = await wavelink.Playable.search(f"ytmsearch:{s}")
+                if results:
+                    await vc.queue.put_wait(results[0])
+                    queued += 1
+                    if not vc.playing and vc.queue:
+                        await vc.play(vc.queue.get())
+            except Exception:
+                pass
+        await interaction.followup.send(embed=success_embed("Favorites queued", f"Added **{queued}** liked songs."))
+        return
+
+    # /play <genre>
+    if _q in GENRE_SONGS:
+        tracks = await get_genre_playlist_tracks(_q, count=15, guild_id=interaction.guild.id, source="play-genre")
+        if not tracks:
+            await interaction.followup.send(embed=error_embed("Genre unavailable", f"Couldn't load **{_q}** right now."))
+            return
+        queued = 0
+        for t in tracks:
+            try:
+                await vc.queue.put_wait(t)
+                queued += 1
+            except Exception:
+                pass
+        if not vc.playing and vc.queue:
+            await vc.play(vc.queue.get())
+        elif _was_dj and vc.playing:
+            await vc.skip(force=True)
+        await interaction.followup.send(embed=success_embed("Genre mix queued", f"Added **{queued}** hot **{_q}** songs."))
+        return
+
+    # Spotify links
+    if "spotify.com" in query:
+        sp = await spotify_get_tracks(query)
+        if not sp:
+            await interaction.followup.send(embed=error_embed("Spotify error", "Couldn't read that Spotify link."))
+            return
+        if len(sp) == 1:
+            query = f"{sp[0]['name']} {sp[0]['artist']}"
+        else:
+            first = None
+            for st in sp[:1]:
+                yt = await wavelink.Playable.search(f"ytmsearch:{st['name']} {st['artist']}")
+                if yt:
+                    first = best_track(yt, f"{st['name']} {st['artist']}") or yt[0]
+            if not first:
+                await interaction.followup.send(embed=error_embed("Not found", "Couldn't find those tracks."))
+                return
+            was_playing = vc.playing
+            await vc.queue.put_wait(first)
+            if not was_playing:
+                await vc.play(vc.queue.get())
+            await interaction.followup.send(embed=success_embed("Spotify loading", f"Loading **{len(sp)}** tracks in the background."))
+            async def _queue_rest():
+                for st in sp[1:]:
+                    try:
+                        yt = await wavelink.Playable.search(f"ytmsearch:{st['name']} {st['artist']}")
+                        if yt:
+                            await vc.queue.put_wait(best_track(yt, f"{st['name']} {st['artist']}") or yt[0])
+                        await asyncio.sleep(0.5)
+                    except Exception:
+                        pass
+            asyncio.create_task(_queue_rest())
+            return
+
+    tracks = await wavelink.Playable.search(f"ytmsearch:{query}" if not query.startswith("http") else query)
+    if not tracks:
+        await interaction.followup.send(embed=error_embed("Not found", "Couldn't find that song."))
+        return
+    track = best_track(tracks, query) or tracks[0]
+    _adjust_taste(interaction.guild.id, getattr(track, "author", None), 3.0)
+    was_playing = vc.playing
+    await vc.queue.put_wait(track)
+    if not was_playing:
+        await vc.play(vc.queue.get())
+        await interaction.followup.send(embed=success_embed("Playing", f"**{track.title}**"))
+    elif _was_dj:
+        await vc.skip(force=True)
+        await interaction.followup.send(embed=success_embed("Playing", f"**{track.title}**"))
     else:
-        await interaction.followup.send(embed=success_embed("Added to queue", f"{label}, #{len(player.queue)} in queue"), ephemeral=True)
+        await interaction.followup.send(embed=success_embed("Added to queue", f"**{track.title}**"))
+
+
+@bot.tree.command(name="skip", description="Skip the current song")
+async def music_skip(interaction: discord.Interaction):
+    if not is_dj(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "You need a DJ role to skip."), ephemeral=True)
+        return
+    vc = get_player(interaction.guild)
+    if not vc or not vc.playing:
+        await interaction.response.send_message(embed=error_embed("Nothing playing"), ephemeral=True)
+        return
+    _taste_event_current(interaction.guild, -1.5)
+    await vc.skip(force=True)
+    await interaction.response.send_message(embed=success_embed("Skipped"), ephemeral=True, delete_after=3)
+
+
+@bot.tree.command(name="stop", description="Stop the music and disconnect (DJ)")
+async def music_stop(interaction: discord.Interaction):
+    if not is_dj(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "You need a DJ role to stop."), ephemeral=True)
+        return
+    vc = get_player(interaction.guild)
+    if not vc:
+        await interaction.response.send_message(embed=error_embed("Not connected"), ephemeral=True)
+        return
+    auto_music_sessions.pop(interaction.guild.id, None)
+    _dj_mode.discard(interaction.guild.id)
+    _cancel_progress(interaction.guild.id)
+    old = now_playing_messages.pop(interaction.guild.id, None)
+    if old:
+        try:
+            await old.delete()
+        except Exception:
+            pass
+    try:
+        await set_vc_status(vc.channel, None)
+    except Exception:
+        pass
+    await vc.disconnect()
+    await interaction.response.send_message(embed=success_embed("Stopped"))
+
+
+@bot.tree.command(name="pause", description="Pause or resume the music")
+async def music_pause(interaction: discord.Interaction):
+    vc = get_player(interaction.guild)
+    if not vc:
+        await interaction.response.send_message(embed=error_embed("Not connected"), ephemeral=True)
+        return
+    await vc.pause(not vc.paused)
+    await interaction.response.send_message(embed=success_embed("Paused" if vc.paused else "Resumed"), ephemeral=True)
+
+
+@bot.tree.command(name="resume", description="Resume the music")
+async def music_resume(interaction: discord.Interaction):
+    vc = get_player(interaction.guild)
+    if not vc:
+        await interaction.response.send_message(embed=error_embed("Not connected"), ephemeral=True)
+        return
+    if vc.paused:
+        await vc.pause(False)
+    await interaction.response.send_message(embed=success_embed("Resumed"), ephemeral=True)
+
+
+@bot.tree.command(name="queue", description="View the current queue")
+async def music_queue(interaction: discord.Interaction):
+    vc = get_player(interaction.guild)
+    if not vc:
+        await interaction.response.send_message(embed=error_embed("Nothing playing"), ephemeral=True)
+        return
+    embed = info_embed("🎵 Music Queue")
+    if vc.current:
+        embed.add_field(name="Now Playing", value=f"**{vc.current.title}**", inline=False)
+    if vc.queue:
+        embed.add_field(name="Up Next", value="\n".join([f"`{i+1}.` {t.title}" for i, t in enumerate(list(vc.queue)[:10])]), inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="volume", description="Set the volume 0-100 (DJ)")
+@app_commands.describe(volume="Volume level 0-100")
+async def music_volume(interaction: discord.Interaction, volume: app_commands.Range[int, 0, 100]):
+    if not is_dj(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "You need a DJ role."), ephemeral=True)
+        return
+    vc = get_player(interaction.guild)
+    if not vc:
+        await interaction.response.send_message(embed=error_embed("Not connected"), ephemeral=True)
+        return
+    await vc.set_volume(int(volume))
+    await interaction.response.send_message(embed=success_embed("Volume", f"Set to `{volume}%`"), ephemeral=True)
+
+
+@bot.tree.command(name="nowplaying", description="Show what's currently playing")
+async def music_nowplaying(interaction: discord.Interaction):
+    vc = get_player(interaction.guild)
+    if not vc or not vc.current:
+        await interaction.response.send_message(embed=error_embed("Nothing playing"), ephemeral=True)
+        return
+    await interaction.response.send_message(embed=info_embed("🎵 Now Playing", f"**{vc.current.title}**"), ephemeral=True)
+
+
+@bot.tree.command(name="favorites", description="View your liked songs")
+async def favorites_command(interaction: discord.Interaction):
+    songs = liked_songs.get(interaction.user.id, [])
+    if not songs:
+        await interaction.response.send_message(embed=info_embed("Your Liked Songs", "You haven't liked any songs yet. Heart one while it's playing!"), ephemeral=True)
+        return
+    embed = info_embed("Your Liked Songs", "\n".join([f"`{i+1}.` {s}" for i, s in enumerate(songs[-20:])]))
+    embed.set_thumbnail(url=interaction.user.display_avatar.url)
+    embed.set_footer(text=f"{len(songs)} song(s) liked")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="setmusic", description="Start a non-stop genre radio (admin)")
+@app_commands.describe(genre="Genre e.g. Country, Hip Hop, Rock, Pop, All")
+async def setmusic_command(interaction: discord.Interaction, genre: str):
+    if not _is_admin(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "Admins only."), ephemeral=True)
+        return
+    await interaction.response.defer()
+    if not interaction.user.voice:
+        await interaction.followup.send(embed=error_embed("Not in voice", "Join a voice channel first."))
+        return
+    vc = get_player(interaction.guild)
+    if not vc:
+        vc = await interaction.user.voice.channel.connect(cls=wavelink.Player)
+    try:
+        vc.queue.clear()
+    except Exception:
+        pass
+    if vc.playing:
+        await vc.skip(force=True)
+    auto_music_sessions[interaction.guild.id] = {"genre": genre, "channel_id": interaction.channel.id}
+    play_channels[interaction.guild.id] = interaction.channel.id
+    tracks = await get_genre_playlist_tracks(genre, count=20, guild_id=interaction.guild.id, source="setmusic")
+    if not tracks:
+        await interaction.followup.send(embed=error_embed("Not found", f"Couldn't load **{genre}**."))
+        return
+    for t in tracks[1:]:
+        await vc.queue.put_wait(t)
+    await vc.play(tracks[0])
+    await interaction.followup.send(embed=success_embed(f"{genre.title()} Radio Started", f"Now playing **{tracks[0].title}**"))
+
+
+@bot.tree.command(name="stopmusic", description="Stop the auto radio (admin)")
+async def stopmusic_command(interaction: discord.Interaction):
+    if not _is_admin(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "Admins only."), ephemeral=True)
+        return
+    vc = get_player(interaction.guild)
+    if not vc:
+        await interaction.response.send_message(embed=error_embed("Not connected"), ephemeral=True)
+        return
+    auto_music_sessions.pop(interaction.guild.id, None)
+    _dj_mode.discard(interaction.guild.id)
+    try:
+        vc.queue.clear()
+    except Exception:
+        pass
+    await vc.disconnect()
+    await interaction.response.send_message(embed=success_embed("Stopped"))
+
+
+@bot.tree.command(name="votegenre", description="Change the auto radio genre")
+@app_commands.describe(genre="Genre to switch to")
+async def votegenre_command(interaction: discord.Interaction, genre: str):
+    if not auto_radio_config.get("allow_vote", True):
+        await interaction.response.send_message(embed=error_embed("Voting disabled"), ephemeral=True)
+        return
+    session = auto_music_sessions.get(interaction.guild.id)
+    if not session:
+        await interaction.response.send_message(embed=error_embed("No radio", "Auto radio isn't playing."), ephemeral=True)
+        return
+    vc = interaction.guild.voice_client
+    if vc:
+        try:
+            vc.queue.clear()
+        except Exception:
+            pass
+        auto_music_sessions[interaction.guild.id]["genre"] = genre
+        tracks = await get_genre_playlist_tracks(genre, count=15, guild_id=interaction.guild.id, source="votegenre")
+        for t in tracks:
+            await vc.queue.put_wait(t)
+        if vc.playing:
+            await vc.skip(force=True)
+    await interaction.response.send_message(embed=success_embed("Genre changed", f"Auto radio switched to **{genre}**."))
+
+
+# ---- Wavelink events ----
+_track_failure_counts = {}
+_track_last_failure_time = {}
 
 
 @bot.event
 async def on_wavelink_track_start(payload):
-    """Announce the track in the channel where it was queued."""
     try:
         player = payload.player
-        if not (player and player.guild):
+        if not player or not player.guild:
             return
-        chan_id = _music_home.get(player.guild.id)
-        if not chan_id:
+        track = payload.track
+        guild = player.guild
+        import time as _time
+        if _time.time() - _track_last_failure_time.get(guild.id, 0) > 10:
+            _track_failure_counts[guild.id] = 0
+        _decay_taste(guild.id)
+
+        if _is_dj_clip(track):
+            try:
+                _pt = _progress_tasks.pop(guild.id, None)
+                if _pt:
+                    _pt.cancel()
+                if guild.voice_client and guild.voice_client.channel:
+                    await set_vc_status(guild.voice_client.channel, "DJ Carla")
+            except Exception:
+                pass
             return
-        channel = bot.get_channel(int(chan_id))
-        if channel:
-            await channel.send(embed=_music_np_embed(payload.track, player))
+
+        hist = track_history.setdefault(guild.id, [])
+        if not hist or getattr(hist[-1], "identifier", None) != getattr(track, "identifier", None):
+            hist.append(track)
+            if len(hist) > 15:
+                del hist[0]
+
+        if repeat_enabled.get(guild.id, False):
+            return
+
+        text_channel = None
+        ch_id = play_channels.get(guild.id)
+        if ch_id:
+            text_channel = guild.get_channel(ch_id)
+        if not text_channel and guild.voice_client and guild.voice_client.channel:
+            text_channel = guild.voice_client.channel
+        if text_channel:
+            await send_now_playing(guild, track, text_channel)
+
+        session = auto_music_sessions.get(guild.id)
+        if session and len(player.queue) < 2:
+            more = await get_genre_playlist_tracks(session.get("genre", "pop"), count=10, guild_id=guild.id, source="low-queue-topup")
+            for t in (more or []):
+                try:
+                    if not any(kw in t.title.lower() for kw in KARAOKE_KEYWORDS):
+                        await player.queue.put_wait(t)
+                except Exception:
+                    pass
     except Exception as e:
-        print(f"[Music] track-start announce failed: {e}")
+        print(f"[Music] Track start error: {e}")
 
 
-@bot.tree.command(name="skip", description="Skip the current song")
-async def skip_cmd(interaction: discord.Interaction):
-    ok, err = _music_gate(interaction)
-    if not ok:
-        await interaction.response.send_message(embed=err, ephemeral=True)
-        return
-    player = interaction.guild.voice_client
-    if not (player and player.playing):
-        await interaction.response.send_message(embed=error_embed("Nothing playing", "There's nothing to skip."), ephemeral=True)
-        return
-    rid = _track_requester(player.current)[0] if player.current else None
-    is_requester = rid is not None and rid == str(interaction.user.id)
-    if not (_music_is_dj(interaction.user) or is_requester):
-        await interaction.response.send_message(embed=error_embed("Can't skip", "Only a DJ or the person who queued this can skip it."), ephemeral=True)
-        return
-    await player.skip(force=True)
-    await interaction.response.send_message(embed=success_embed("Skipped", "Playing the next song…"), ephemeral=True)
-
-
-@bot.tree.command(name="stop", description="Stop the music and clear the queue (DJ)")
-async def stop_cmd(interaction: discord.Interaction):
-    ok, err = _music_gate(interaction, need_dj=True)
-    if not ok:
-        await interaction.response.send_message(embed=err, ephemeral=True)
-        return
-    player = interaction.guild.voice_client
-    _music_radio.pop(interaction.guild_id, None)
-    if player:
-        try:
-            player.queue.clear()
-            await player.disconnect()
-        except Exception:
-            pass
-    await interaction.response.send_message(embed=success_embed("Stopped", "Queue cleared and left the channel."), ephemeral=True)
-
-
-@bot.tree.command(name="pause", description="Pause the music (DJ)")
-async def pause_cmd(interaction: discord.Interaction):
-    ok, err = _music_gate(interaction, need_dj=True)
-    if not ok:
-        await interaction.response.send_message(embed=err, ephemeral=True)
-        return
-    player = interaction.guild.voice_client
-    if player and player.playing and not player.paused:
-        await player.pause(True)
-        await interaction.response.send_message(embed=success_embed("Paused", "Use /resume to continue."), ephemeral=True)
-    else:
-        await interaction.response.send_message(embed=error_embed("Nothing playing", "There's nothing to pause."), ephemeral=True)
-
-
-@bot.tree.command(name="resume", description="Resume the music (DJ)")
-async def resume_cmd(interaction: discord.Interaction):
-    ok, err = _music_gate(interaction, need_dj=True)
-    if not ok:
-        await interaction.response.send_message(embed=err, ephemeral=True)
-        return
-    player = interaction.guild.voice_client
-    if player and player.paused:
-        await player.pause(False)
-        await interaction.response.send_message(embed=success_embed("Resumed", "Back to it."), ephemeral=True)
-    else:
-        await interaction.response.send_message(embed=error_embed("Not paused", "Nothing is paused."), ephemeral=True)
-
-
-@bot.tree.command(name="volume", description="Set the volume 1–100 (DJ)")
-@app_commands.describe(percent="Volume from 1 to 100")
-async def volume_cmd(interaction: discord.Interaction, percent: app_commands.Range[int, 1, 100]):
-    ok, err = _music_gate(interaction, need_dj=True)
-    if not ok:
-        await interaction.response.send_message(embed=err, ephemeral=True)
-        return
-    player = interaction.guild.voice_client
-    if player:
-        try:
-            await player.set_volume(int(percent))
-        except Exception:
-            pass
-    await interaction.response.send_message(embed=success_embed("Volume", f"Set to **{percent}%**."), ephemeral=True)
-
-
-@bot.tree.command(name="loop", description="Toggle looping the current song")
-async def loop_cmd(interaction: discord.Interaction):
-    ok, err = _music_gate(interaction, need_dj=True)
-    if not ok:
-        await interaction.response.send_message(embed=err, ephemeral=True)
-        return
-    player = interaction.guild.voice_client
-    if not player:
-        await interaction.response.send_message(embed=error_embed("Nothing playing", "Start a song with `/play` first."), ephemeral=True)
-        return
-    now_loop = player.queue.mode != wavelink.QueueMode.loop
-    player.queue.mode = wavelink.QueueMode.loop if now_loop else wavelink.QueueMode.normal
-    await interaction.response.send_message(embed=success_embed("Loop", "Looping **on**." if now_loop else "Looping **off**."), ephemeral=True)
-
-
-@bot.tree.command(name="queue", description="Show the music queue")
-async def queue_cmd(interaction: discord.Interaction):
-    ok, err = _music_gate(interaction)
-    if not ok:
-        await interaction.response.send_message(embed=err, ephemeral=True)
-        return
-    player = interaction.guild.voice_client
-    lines = []
-    if player and player.current:
-        who = _track_requester(player.current)[1]
-        lines.append(f"**Now:** [{player.current.title}]({getattr(player.current, 'uri', '') or ''}){f', {who}' if who else ''}")
-    if player and len(player.queue):
-        for i, t in enumerate(list(player.queue)[:15], 1):
-            who = _track_requester(t)[1]
-            lines.append(f"`{i}.` {t.title}{f', {who}' if who else ''}")
-        extra = len(player.queue) - 15
-        if extra > 0:
-            lines.append(f"…and **{extra}** more")
-    if not lines:
-        lines = ["The queue is empty. Add a song with `/play`."]
-    await interaction.response.send_message(embed=info_embed("Music Queue", "\n".join(lines)[:4000]), ephemeral=True)
-
-
-@bot.tree.command(name="nowplaying", description="Show the current song")
-async def nowplaying_cmd(interaction: discord.Interaction):
-    ok, err = _music_gate(interaction)
-    if not ok:
-        await interaction.response.send_message(embed=err, ephemeral=True)
-        return
-    player = interaction.guild.voice_client
-    if not (player and player.current):
-        await interaction.response.send_message(embed=error_embed("Nothing playing", "Queue a song with `/play`."), ephemeral=True)
-        return
-    await interaction.response.send_message(embed=_music_np_embed(player.current, player), ephemeral=True)
-
-
-# Direct internet-radio streams (SomaFM — commercial-free, bot-friendly, no auth).
-# Lavalink's built-in `http` source plays these MP3 streams straight through, so
-# radio never touches YouTube. Genre is matched by keyword.
-_RADIO_STREAMS = [
-    (("lofi", "lo-fi", "chill", "study", "ambient", "sleep", "relax"),
-     "SomaFM Groove Salad", "https://ice1.somafm.com/groovesalad-128-mp3"),
-    (("indie",), "SomaFM Indie Pop Rocks", "https://ice1.somafm.com/indiepop-128-mp3"),
-    (("synth", "electropop", "electro pop"),
-     "SomaFM PopTron", "https://ice1.somafm.com/poptron-128-mp3"),
-    (("metal", "heavy"), "SomaFM Metal Detector", "https://ice1.somafm.com/metal-128-mp3"),
-    (("rock", "alt", "alternative", "punk"),
-     "SomaFM BAGeL Radio", "https://ice1.somafm.com/bagel-128-mp3"),
-    (("hip", "rap", "trap", "soul"), "SomaFM Fluid", "https://ice1.somafm.com/fluid-128-mp3"),
-    (("trance", "progressive", "psy"),
-     "SomaFM The Trip", "https://ice1.somafm.com/thetrip-128-mp3"),
-    (("edm", "electronic", "electronica", "house", "techno", "dance", "dubstep", "bass"),
-     "SomaFM Beat Blender", "https://ice1.somafm.com/beatblender-128-mp3"),
-    (("jazz", "lounge"), "SomaFM Sonic Universe", "https://ice1.somafm.com/sonicuniverse-128-mp3"),
-    (("country", "americana", "folk", "blues"),
-     "SomaFM Boot Liquor", "https://ice1.somafm.com/bootliquor-128-mp3"),
-    (("80s", "eighties", "retro"), "SomaFM Underground 80s", "https://ice1.somafm.com/u80s-128-mp3"),
-    (("70s", "seventies"), "SomaFM Left Coast 70s", "https://ice1.somafm.com/seventies-128-mp3"),
-    (("pop", "top", "hits"), "SomaFM PopTron", "https://ice1.somafm.com/poptron-128-mp3"),
-]
-_RADIO_DEFAULT = ("SomaFM Groove Salad", "https://ice1.somafm.com/groovesalad-128-mp3")
-
-
-def _radio_stream_for(genre):
-    g = (genre or "").lower().strip()
-    for keys, name, url in _RADIO_STREAMS:
-        if any(k in g for k in keys):
-            return name, url
-    return _RADIO_DEFAULT
-
-
-@bot.tree.command(name="radio", description="Start a 24/7 genre radio in your voice channel (DJ)")
-@app_commands.describe(genre="Genre to stream (defaults to the dashboard setting)")
-async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
-    ok, err = _music_gate(interaction, need_dj=True)
-    if not ok:
-        await interaction.response.send_message(embed=err, ephemeral=True)
-        return
-    await interaction.response.defer(thinking=True, ephemeral=True)
-    player, err = await _music_connect(interaction)
-    if not player:
-        await interaction.followup.send(embed=err, ephemeral=True)
-        return
-    g = (genre or music_config.get("radio_genre") or "lofi").strip()
-    station, stream_url = _radio_stream_for(g)
-    results = await _music_search(stream_url)
-    track = results[0] if (results and not isinstance(results, wavelink.Playlist)) else None
-    if not track:
-        await interaction.followup.send(embed=error_embed("Radio unavailable", "Couldn't start that stream. Try again."), ephemeral=True)
-        return
-    _music_home[interaction.guild_id] = interaction.channel_id
-    _music_radio[interaction.guild_id] = True
+@bot.event
+async def on_wavelink_track_exception(payload):
     try:
-        player.queue.mode = wavelink.QueueMode.normal
-        player.queue.clear()
-        player.autoplay = wavelink.AutoPlayMode.partial
-    except Exception:
-        pass
-    vol = max(1, min(100, int(music_config.get("default_volume") or 50)))
-    await player.play(track, volume=vol)
-    await interaction.followup.send(embed=success_embed("Radio on", f"Now streaming **{station}** ({g}). Use `/stop` to end it."), ephemeral=True)
+        if not payload.player or not payload.player.guild:
+            return
+        guild = payload.player.guild
+        import time as _t
+        _track_last_failure_time[guild.id] = _t.time()
+        _track_failure_counts[guild.id] = _track_failure_counts.get(guild.id, 0) + 1
+        print(f"[Music] Track exception in {guild.name} — #{_track_failure_counts[guild.id]}: {getattr(payload, 'exception', '')}")
+        if _track_failure_counts[guild.id] >= 5:
+            player = payload.player
+            try:
+                player.queue.clear()
+            except Exception:
+                pass
+            auto_music_sessions.pop(guild.id, None)
+            _track_failure_counts[guild.id] = 0
+    except Exception as e:
+        print(f"[Music] TrackException handler error: {e}")
+
+
+@bot.event
+async def on_wavelink_track_end(payload):
+    try:
+        if str(getattr(payload, "reason", "")).lower() == "replaced":
+            return
+        if not payload.player or not payload.player.guild:
+            return
+        guild = payload.player.guild
+        player = payload.player
+
+        if repeat_enabled.get(guild.id, False) and payload.track:
+            try:
+                repeat_enabled[guild.id] = False
+                await player.play(payload.track)
+            except Exception as re:
+                print(f"[Music] Repeat error: {re}")
+            return
+
+        # DJ clip finished -> play the set it introduced
+        if _is_dj_clip(getattr(payload, "track", None)):
+            real = _dj_pending.pop(guild.id, None)
+            _prev = _dj_prev_volume.pop(guild.id, None)
+            if _prev is not None:
+                try:
+                    await player.set_volume(_prev)
+                except Exception:
+                    pass
+            if real and "fetch" in real:
+                try:
+                    tracks = await real["fetch"]
+                except Exception:
+                    tracks = []
+                if tracks:
+                    for t in tracks[1:]:
+                        await player.queue.put_wait(t)
+                    await player.play(tracks[0])
+                elif player.queue:
+                    await player.play(player.queue.get())
+                return
+            if player.queue:
+                await player.play(player.queue.get())
+            return
+
+        if player.queue:
+            await player.play(player.queue.get())
+            return
+
+        # Empty queue: DJ mode rolls into next set
+        if guild.id in _dj_mode and DJ_PUBLIC_URL:
+            asyncio.create_task(_dj_start_set(guild))
+            return
+
+        # Empty queue: refill genre radio
+        session = auto_music_sessions.get(guild.id)
+        if session:
+            tracks = await get_genre_playlist_tracks(session.get("genre", "pop"), count=30, guild_id=guild.id, source="empty-queue-reload")
+            for t in tracks:
+                await player.queue.put_wait(t)
+            if player.queue:
+                await player.play(player.queue.get())
+            return
+
+        # Truly empty: clear card + VC status
+        _cancel_progress(guild.id)
+        if guild.voice_client and guild.voice_client.channel:
+            try:
+                await set_vc_status(guild.voice_client.channel, None)
+            except Exception:
+                pass
+        old = now_playing_messages.pop(guild.id, None)
+        if old:
+            try:
+                await old.delete()
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[Music] Track end error: {e}")
 
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    """Auto-leave: when the bot is left alone in a voice channel, disconnect (if
-    the dashboard's Auto-leave toggle is on)."""
+    """Auto-leave + cleanup when the bot is alone or gets disconnected."""
     try:
+        if member.bot and member.id == bot.user.id and before.channel and not after.channel:
+            _cancel_progress(member.guild.id)
+            try:
+                await set_vc_status(before.channel, None)
+            except Exception:
+                pass
+            old = now_playing_messages.pop(member.guild.id, None)
+            if old:
+                try:
+                    await old.delete()
+                except Exception:
+                    pass
+            auto_music_sessions.pop(member.guild.id, None)
+            _dj_mode.discard(member.guild.id)
+            _dj_set.pop(member.guild.id, None)
+            _dj_pending.pop(member.guild.id, None)
+            return
         if member.bot or not music_config.get("auto_leave", True):
             return
         guild = member.guild
-        player = guild.voice_client if guild else None
-        if not (player and player.channel):
+        vc = guild.voice_client if guild else None
+        if not (vc and vc.channel):
             return
-        humans = [m for m in player.channel.members if not m.bot]
-        if not humans:
-            _music_radio.pop(guild.id, None)
+        if not [m for m in vc.channel.members if not m.bot]:
+            if member.guild.id in auto_music_sessions and auto_radio_config.get("auto_start"):
+                return
             try:
-                player.queue.clear()
-                await player.disconnect()
+                await set_vc_status(vc.channel, None)
+            except Exception:
+                pass
+            try:
+                await vc.disconnect()
             except Exception:
                 pass
     except Exception as e:
         print(f"[Music] voice-state hook error: {e}")
+
+
+async def apply_music_config(config: dict):
+    """Re-render the Now Playing card when the dashboard toggles the UI style."""
+    for guild in bot.guilds:
+        try:
+            vc = guild.voice_client
+            if not vc or not getattr(vc, "current", None):
+                continue
+            old_msg = now_playing_messages.get(guild.id)
+            if old_msg is not None:
+                try:
+                    if (discord.utils.utcnow() - old_msg.created_at).total_seconds() < 30:
+                        continue
+                except Exception:
+                    pass
+            channel = getattr(old_msg, "channel", None)
+            if channel is None:
+                ch_id = play_channels.get(guild.id)
+                channel = guild.get_channel(ch_id) if ch_id else None
+            if channel is None and vc.channel:
+                channel = vc.channel
+            if channel:
+                await send_now_playing(guild, vc.current, channel)
+        except Exception as e:
+            print(f"[Music] UI re-render error in {guild.name}: {e}")
 
 
 async def apply_bot_identity():
