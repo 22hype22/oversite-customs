@@ -125,9 +125,10 @@ portfolio_config = {"channel_id": "", "components": [], "allowed_role_ids": []}
 packages_config = {"panel_components": [], "allowed_role_ids": []}
 
 # ---- Music / DJ (dashboard "Music Add-On" + "Auto Radio" blocks) ----
-# Voice playback via yt-dlp + FFmpeg. `enabled` flips true once the dashboard
-# saves the Music Add-On config. Needs PyNaCl + yt-dlp (requirements.txt) and the
-# ffmpeg binary on the host (nixpacks.toml).
+# Voice playback is delegated to a shared Lavalink node (see /music) via wavelink.
+# The bot never touches audio — no PyNaCl/ffmpeg/yt-dlp — so there's no YouTube
+# bot-check treadmill. `enabled` flips true once the dashboard saves the Music
+# Add-On config. Needs LAVALINK_URI + LAVALINK_PASSWORD env vars.
 music_config = {
     "enabled": False,
     "dj_role_ids": [],
@@ -139,6 +140,17 @@ music_config = {
     "radio_channel_id": "",
     "radio_genre": "pop",
 }
+
+# wavelink talks to the shared Lavalink node. Imported here so the boot status
+# line can report it; the actual node connection happens in setup_hook.
+try:
+    import wavelink
+except Exception:
+    wavelink = None
+# e.g. https://oversite-music.up.railway.app  (wavelink derives wss:// from https)
+LAVALINK_URI = os.getenv("LAVALINK_URI") or os.getenv("LAVALINK_URL") or ""
+LAVALINK_PASSWORD = os.getenv("LAVALINK_PASSWORD") or os.getenv("LAVALINK_SERVER_PASSWORD") or ""
+_lavalink_connected = False
 
 # ---- Payment ----
 # The dashboard "Payment" block only picks who may run /payment.
@@ -536,75 +548,16 @@ async def on_ready():
     print(f"[Boot] bot {BOT_ORDER_ID} using worker token prefix {WORKER_TOKEN[:12] if WORKER_TOKEN else 'MISSING'} (len {len(WORKER_TOKEN) if WORKER_TOKEN else 0})")
     # Dropdown-in-modal (Close Order form) needs discord.py 2.6+ (discord.ui.Label).
     print(f"[Boot] discord.py {discord.__version__} | dropdown-in-modal supported: {hasattr(discord.ui, 'Label')}")
-    # Voice/music dependency check — this is what /play needs at runtime.
-    # discord.py's own `has_nacl` is the real gate (it imports nacl.secret +
-    # nacl.utils; those C bindings can fail even when `import nacl` succeeds).
+    # Music is served by a shared Lavalink node (wavelink client). The bot itself
+    # needs no voice deps; playback works as long as LAVALINK_URI/PASSWORD are set
+    # and the node is reachable. Connection is established in setup_hook.
     try:
-        import nacl.secret, nacl.utils  # noqa: F401
-        _nacl_ok = True
-    except Exception as _ne:
-        _nacl_ok = False
-        print(f"[Boot] nacl bindings failed to import: {_ne}")
-    # discord.py 2.7 requires BOTH PyNaCl AND `davey` (Discord's DAVE E2EE lib)
-    # for ALL voice — VoiceClient.__init__ raises if either is missing.
-    _dave_ok = "?"
-    try:
-        from discord import voice_client as _vcmod
-        from discord import voice_state as _vsmod
-        _dave_ok = getattr(_vsmod, "has_dave", "?")
-        print(f"[Boot] discord has_nacl = {getattr(_vcmod, 'has_nacl', '?')} | "
-              f"has_dave = {_dave_ok} (python {__import__('sys').version.split()[0]})")
-    except Exception as _de:
-        print(f"[Boot] voice gate check failed: {_de!r}")
-    import os as _os
-    _ff = globals().get("_FFMPEG_EXE") or ""
-    _ff_ok = bool(_ff) and (_ff == "ffmpeg" or _os.path.exists(_ff))
-    print(f"[Boot] voice deps — PyNaCl:{_nacl_ok} davey:{_dave_ok} yt_dlp:{yt_dlp is not None} "
-          f"ffmpeg:{_ff_ok} ({_ff}) — Opus handled by ffmpeg")
-    try:
-        _ytver = getattr(yt_dlp, "version", None)
-        _ytver = getattr(_ytver, "__version__", None) or getattr(yt_dlp, "__version__", "?")
-        if _env_clients:
-            _strat = "env:" + ",".join(_YT_PLAYER_CLIENTS)
-        elif _BGUTIL_URL:
-            _strat = "web+PO-token"
-        else:
-            _strat = "tv-anon→tv-cookies→web→app"
-        _po = "on" if _BGUTIL_URL else "off"
-        _px = "on" if _YT_PROXY else "off"
-        _v6 = f"on ({_IPV6_SUBNET})" if _ipv6_net else "off"
-        print(f"[Boot] yt-dlp {_ytver} — /play: {_strat} | ipv6_rotate={_v6} | po_token={_po} "
-              f"proxy={_px} cookies={'yes' if _YT_COOKIEFILE else 'no'} | radio=direct-stream")
-        # Prove what IP YouTube actually sees, direct vs through the proxy.
-        try:
-            import httpx as _hx
-            try:
-                _dip = _hx.get("https://api.ipify.org", timeout=8).text.strip()
-                print(f"[Boot] egress IP (direct)  = {_dip}")
-            except Exception as _e1:
-                print(f"[Boot] direct IP check failed: {str(_e1)[:100]}")
-            if _YT_PROXY:
-                try:
-                    with _hx.Client(proxy=_YT_PROXY, timeout=12) as _pc:
-                        _pip = _pc.get("https://api.ipify.org").text.strip()
-                    print(f"[Boot] egress IP (proxy)   = {_pip}  <-- YouTube sees this for /play")
-                except Exception as _e2:
-                    print(f"[Boot] PROXY TEST FAILED: {type(_e2).__name__}: {str(_e2)[:160]} "
-                          f"— proxy unreachable/misconfigured; yt-dlp requests are NOT going through it")
-            if _ipv6_net:
-                try:
-                    _s6 = _random_ipv6()
-                    _t6 = _hx.HTTPTransport(local_address=_s6)
-                    with _hx.Client(transport=_t6, timeout=12) as _c6:
-                        _e6 = _c6.get("https://api64.ipify.org").text.strip()
-                    print(f"[Boot] egress IP (ipv6)    = {_e6}  <-- rotates per request (bound {_s6})")
-                except Exception as _e3:
-                    print(f"[Boot] IPV6 ROTATION TEST FAILED: {type(_e3).__name__}: {str(_e3)[:160]} "
-                          f"— OS not set up for non-local bind; run the setup script")
-        except Exception:
-            pass
-    except Exception:
-        pass
+        _nodes = getattr(wavelink.Pool, "nodes", {}) if wavelink else {}
+        print(f"[Boot] music — wavelink {'ok' if wavelink else 'MISSING'} | "
+              f"node {'set' if LAVALINK_URI else 'UNSET (LAVALINK_URI)'} | "
+              f"connected nodes: {len(_nodes)}")
+    except Exception as _me:
+        print(f"[Boot] music status check failed: {_me!r}")
 
     if BOT_ORDER_ID and WORKER_TOKEN:
         for loop in (send_heartbeat, poll_configs, poll_shutdown, record_metrics_loop, poll_roblox_apply, poll_about_me):
@@ -6079,7 +6032,7 @@ async def apply_config(feature, cfg, post_panel=False):
             music_config["default_volume"] = 50
         music_config["auto_leave"] = bool(cfg.get("auto_leave", True))
         music_config["now_playing_v2"] = bool(cfg.get("now_playing_v2", False))
-        print(f"[Config] music — dj_roles {music_config['dj_role_ids']} everyone_queue {music_config['everyone_can_queue']} maxq {music_config['max_queue_length']} vol {music_config['default_volume']} yt_dlp {'yes' if yt_dlp else 'MISSING'}")
+        print(f"[Config] music — dj_roles {music_config['dj_role_ids']} everyone_queue {music_config['everyone_can_queue']} maxq {music_config['max_queue_length']} vol {music_config['default_volume']} node {'set' if LAVALINK_URI else 'UNSET'}")
     elif feature in ("auto-radio", "customs-auto-radio"):
         music_config["enabled"] = True  # radio implies the music engine is on
         music_config["radio_channel_id"] = str(cfg.get("voice_channel_id") or "")
@@ -7551,150 +7504,59 @@ async def before_metrics():
     await bot.wait_until_ready()
 
 
-# ============================ Music / DJ ============================
-# On-demand music (/play, /skip, /queue, …) + a simple genre radio, gated by the
-# DJ roles from the dashboard. Audio comes from yt-dlp streams played through
-# FFmpeg over Discord voice.
-try:
-    import yt_dlp
-except Exception:
-    yt_dlp = None
-
-# FFmpeg from a pip-bundled static binary (imageio-ffmpeg) so we don't depend on
-# the host having ffmpeg. We use FFmpegOpusAudio (ffmpeg encodes to Opus), which
-# also means libopus isn't required on the host.
-try:
-    import imageio_ffmpeg
-    _FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
-except Exception:
-    import shutil as _shutil_ff
-    _FFMPEG_EXE = _shutil_ff.which("ffmpeg") or "ffmpeg"
-
-# YouTube blocks yt-dlp from datacenter IPs (Railway) with "Sign in to confirm
-# you're not a bot" unless the request looks like a real client. Two mitigations:
-#   1) Rotate player clients that don't require a PO token (env YTDLP_PLAYER_CLIENT,
-#      comma-separated, overrides the default list).
-#   2) Cookies — the reliable fix. Provide a Netscape cookies.txt either as a path
-#      (env YOUTUBE_COOKIEFILE) or inline content (env YOUTUBE_COOKIES); we write
-#      the inline form to a temp file at boot.
-def _resolve_cookiefile():
-    path = (os.environ.get("YOUTUBE_COOKIEFILE") or "").strip()
-    if path and os.path.exists(path):
-        return path
-    raw = os.environ.get("YOUTUBE_COOKIES")
-    if raw and raw.strip():
-        try:
-            import tempfile
-            fd, tmp = tempfile.mkstemp(prefix="ytcookies_", suffix=".txt")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                body = raw.replace("\\n", "\n")
-                if not body.startswith("# Netscape"):
-                    body = "# Netscape HTTP Cookie File\n" + body
-                f.write(body if body.endswith("\n") else body + "\n")
-            return tmp
-        except Exception as _e:
-            print(f"[Music] failed to write YOUTUBE_COOKIES: {_e!r}")
-    return None
+# ============================ Music / DJ (Lavalink) ============================
+# All audio is handled by a shared Lavalink node via wavelink — the bot forwards
+# voice state and sends control JSON; Lavalink does the streaming. Default search
+# source is SoundCloud (native, no credentials, no YouTube bot-check). Spotify /
+# Apple links resolve through LavaSrc and play via SoundCloud. Direct HTTP streams
+# (SomaFM radio) play through Lavalink's built-in http source.
 
 
-_YT_COOKIEFILE = _resolve_cookiefile()
-
-# Client selection is a moving target — YouTube changes what works weekly, and
-# yt-dlp's maintainers tune the DEFAULT client set for the current state every
-# release. So when we have cookies (which clear the bot-check), we let yt-dlp
-# pick the clients itself (empty list = no override) and only keep the two proven
-# levers: the cookies + allowing PO-token-gated formats. Without cookies we have
-# to steer toward the clients that skip the bot-check anonymously.
-# Override anytime with the YTDLP_PLAYER_CLIENT env var (comma-separated).
-_env_clients = (os.environ.get("YTDLP_PLAYER_CLIENT") or "").strip()
-if _env_clients:
-    _YT_PLAYER_CLIENTS = [c.strip() for c in _env_clients.split(",") if c.strip()]
-elif _YT_COOKIEFILE:
-    _YT_PLAYER_CLIENTS = []  # let yt-dlp choose
-else:
-    _YT_PLAYER_CLIENTS = ["default", "tv", "ios", "mweb", "android"]
-
-# --- Datacenter-IP bypass infrastructure (set via env on the host) ---
-# YouTube blocks datacenter IPs with "Sign in to confirm you're not a bot" on
-# EVERY client. The only real fixes:
-#   1) A PO-token provider (bgutil) that mints WebPO tokens proving legitimacy.
-#      Deploy the `brainicism/bgutil-ytdlp-pot-provider` server and set
-#      BGUTIL_POT_BASE_URL to its URL (e.g. http://bgutil.railway.internal:4416).
-#      The `bgutil-ytdlp-pot-provider` pip plugin (in requirements) auto-loads.
-#   2) A proxy on a non-flagged (residential) IP — set YTDLP_PROXY.
-_BGUTIL_URL = (os.environ.get("BGUTIL_POT_BASE_URL") or "").strip()
-_YT_PROXY = (os.environ.get("YTDLP_PROXY") or "").strip()
-
-# --- IPv6 /64 rotation (the way real music bots avoid the block) ---
-# On a host with a routed IPv6 /64 (e.g. a Hetzner Cloud server), set IPV6_SUBNET
-# to that block, e.g. "2a01:4f8:1c1e:abcd::/64". We then bind each YouTube request
-# to a RANDOM address inside it, so no single IP ever accumulates enough requests
-# to trip the bot-check — YouTube can't block the whole /64 (it'd hit real users).
-# Requires the OS to allow non-local bind + a local route for the block (setup.sh).
-import ipaddress as _ipaddr
-import random as _rand
-_IPV6_SUBNET = (os.environ.get("IPV6_SUBNET") or "").strip()
-_ipv6_net = None
-if _IPV6_SUBNET:
+async def _connect_lavalink():
+    """Connect this bot to the shared Lavalink node (idempotent)."""
+    global _lavalink_connected
+    if _lavalink_connected or wavelink is None:
+        return
+    if not (LAVALINK_URI and LAVALINK_PASSWORD):
+        print("[Music] Lavalink not configured (set LAVALINK_URI + LAVALINK_PASSWORD) — /play disabled")
+        return
     try:
-        _ipv6_net = _ipaddr.IPv6Network(_IPV6_SUBNET, strict=False)
-        if _ipv6_net.prefixlen > 120:  # too small to rotate meaningfully
-            print(f"[Boot] IPV6_SUBNET {_IPV6_SUBNET} is tiny (/{_ipv6_net.prefixlen}); rotation weak")
-    except Exception as _e:
-        print(f"[Boot] bad IPV6_SUBNET '{_IPV6_SUBNET}': {_e}")
-        _ipv6_net = None
+        node = wavelink.Node(uri=LAVALINK_URI, password=LAVALINK_PASSWORD)
+        await wavelink.Pool.connect(nodes=[node], client=bot, cache_capacity=100)
+        _lavalink_connected = True
+        print(f"[Music] connecting to Lavalink at {LAVALINK_URI}")
+    except Exception as e:
+        print(f"[Music] Lavalink connect failed: {e}")
 
 
-def _random_ipv6():
-    if not _ipv6_net:
-        return None
-    bits = 128 - _ipv6_net.prefixlen
-    host = _rand.getrandbits(bits)
-    return str(_ipaddr.IPv6Address(int(_ipv6_net.network_address) + host))
+# Chain our node connection into the bot's setup_hook without clobbering the
+# existing one.
+_prev_setup_hook = bot.setup_hook
 
 
-def _yt_extractor_args(clients):
-    # formats=missing_pot lets yt-dlp select formats that lack a PO token instead
-    # of discarding them (fixes "Requested format is not available" on web clients).
-    args = {"formats": ["missing_pot"]}
-    if clients:
-        args["player_client"] = list(clients)
-    ea = {"youtube": args}
-    if _BGUTIL_URL:
-        # Point the bgutil HTTP PO-token plugin at the provider server.
-        ea["youtubepot-bgutilhttp"] = {"base_url": [_BGUTIL_URL]}
-    return ea
+async def _music_setup_hook():
+    try:
+        if _prev_setup_hook:
+            await _prev_setup_hook()
+    finally:
+        await _connect_lavalink()
 
 
-_YTDL_OPTS = {
-    "format": "bestaudio/best",
-    "noplaylist": True,
-    "quiet": True,
-    "no_warnings": True,
-    "default_search": "ytsearch",
-    "source_address": "0.0.0.0",
-    "cachedir": False,
-    "skip_download": True,
-    "extractor_args": _yt_extractor_args(_YT_PLAYER_CLIENTS),
-}
-if _YT_COOKIEFILE:
-    _YTDL_OPTS["cookiefile"] = _YT_COOKIEFILE
-_FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-_FFMPEG_OPTS = "-vn"
-
-# guild_id(str) -> {"queue":[track], "current":track, "volume":0-1, "loop":bool,
-#                   "radio":bool, "text_id":int}
-_music = {}
+bot.setup_hook = _music_setup_hook
 
 
-def _music_state(guild_id):
-    gid = str(guild_id)
-    st = _music.get(gid)
-    if st is None:
-        vol = max(1, min(100, int(music_config.get("default_volume") or 50)))
-        st = _music[gid] = {"queue": [], "current": None, "volume": vol / 100.0,
-                            "loop": False, "radio": False, "text_id": None}
-    return st
+@bot.event
+async def on_wavelink_node_ready(payload):
+    try:
+        print(f"[Music] Lavalink node ready: {getattr(payload.node, 'identifier', '?')}")
+    except Exception:
+        pass
+
+
+# Per-guild extras we track alongside wavelink's own Player/Queue: the text
+# channel to announce in, and whether we're in radio mode.
+_music_home = {}   # guild_id -> text channel id
+_music_radio = {}  # guild_id -> bool
 
 
 def _music_is_dj(member):
@@ -7706,21 +7568,29 @@ def _music_is_dj(member):
     return has_any_role(member, music_config.get("dj_role_ids", []))
 
 
+def _music_node_ready():
+    try:
+        return bool(wavelink and getattr(wavelink.Pool, "nodes", None))
+    except Exception:
+        return False
+
+
 def _music_gate(interaction, need_dj=False):
-    """(ok, error_embed). Checks the addon is enabled, deps are present, and the
-    caller may control playback."""
+    """(ok, error_embed). Enabled + node reachable + (optionally) DJ."""
     if not music_config.get("enabled"):
         return False, error_embed("Music is off", "The Music Add-On isn't enabled in the dashboard.")
-    if yt_dlp is None:
-        return False, error_embed("Music unavailable", "The host is missing `yt-dlp`, add it to requirements and redeploy.")
+    if wavelink is None:
+        return False, error_embed("Music unavailable", "The host is missing the `wavelink` library.")
+    if not _music_node_ready():
+        return False, error_embed("Music offline", "The music server isn't connected right now. Try again in a moment.")
     if need_dj and not _music_is_dj(interaction.user):
         return False, error_embed("DJ only", "Only a DJ (or Manage Server) can control playback.")
     return True, None
 
 
-def _fmt_duration(sec):
+def _fmt_ms(ms):
     try:
-        sec = int(sec or 0)
+        sec = int((ms or 0) // 1000)
     except Exception:
         return ""
     if sec <= 0:
@@ -7730,280 +7600,80 @@ def _fmt_duration(sec):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
-def _ytdl_opts(clients, use_cookies):
-    """Build a yt-dlp opts dict for a specific client set, toggling cookies.
-
-    KEY (yt-dlp 2026.8 internals): sending cookies puts YouTube in authenticated
-    mode, which forces a PO-token requirement on web/app clients — without a token
-    provider it returns 'The page needs to be reloaded' and zero formats. The `tv`
-    (TVHTML5) client is the only one that needs NO PO token, and it works best
-    UNAUTHENTICATED. So we lead with tv-anonymous."""
-    opts = dict(_YTDL_OPTS)
-    opts["extractor_args"] = _yt_extractor_args(clients)
-    if use_cookies and _YT_COOKIEFILE:
-        opts["cookiefile"] = _YT_COOKIEFILE
-    else:
-        opts.pop("cookiefile", None)
-    if _YT_PROXY:
-        opts["proxy"] = _YT_PROXY
-    # Rotate to a fresh IPv6 from the /64 for this request (overrides the IPv4
-    # default). A brand-new IP per request never accumulates a bot-check.
-    ip6 = _random_ipv6()
-    if ip6:
-        opts["source_address"] = ip6
-    return opts
+def _track_requester(track):
+    """(id, name) of who queued a track, from its extras (best-effort)."""
+    try:
+        ex = track.extras
+        rid = getattr(ex, "requester_id", None)
+        rname = getattr(ex, "requester_name", None)
+        if rid or rname:
+            return (str(rid) if rid else None), (rname or "")
+    except Exception:
+        pass
+    return None, ""
 
 
-# Ordered resolution strategy. Each entry: (clients, use_cookies, label).
-# tv-anonymous first (no PO token, no auth demand), then progressively fall back.
-def _yt_attempt_plan():
-    if _env_clients:  # user override wins as the first attempt
-        return [(_YT_PLAYER_CLIENTS, bool(_YT_COOKIEFILE), "env")]
-    # With a PO-token provider, the web clients get valid tokens and clear the
-    # bot-check — lead with them (+cookies if available).
-    if _BGUTIL_URL:
-        plan = [
-            (["web_safari", "web"], bool(_YT_COOKIEFILE), "web+pot"),
-            (["tv"], bool(_YT_COOKIEFILE), "tv+pot"),
-            (["mweb"], bool(_YT_COOKIEFILE), "mweb+pot"),
-        ]
-        return plan
-    # No provider: best-effort client rotation (works only if the IP isn't flagged
-    # or a proxy is in play).
-    plan = [
-        (["tv"], False, "tv/anon"),
-        (["tv"], True, "tv/cookies"),
-    ]
-    if _YT_COOKIEFILE:
-        plan.append((["web_safari", "web"], True, "web/cookies"))
-    plan.append((["ios", "android"], False, "app/anon"))
-    return plan
-
-
-async def _yt_resolve(query):
-    """Resolve a search term / URL into a track dict via yt-dlp (off-thread).
-
-    Tries several client/cookie strategies in order and returns the first that
-    yields playable formats. tv-anonymous is first because, per yt-dlp's current
-    client table, it's the only path that needs no PO token."""
-    if yt_dlp is None:
-        return None, "yt-dlp isn't installed."
-
-    def _extract(opts):
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-            if isinstance(info, dict) and "entries" in info:
-                entries = [e for e in (info.get("entries") or []) if e]
-                info = entries[0] if entries else None
-            return info
-
-    info = None
-    last_msg = ""
-    saw_botcheck = False
-    for clients, use_cookies, label in _yt_attempt_plan():
-        try:
-            info = await asyncio.to_thread(_extract, _ytdl_opts(clients, use_cookies))
-            if info:
-                if label != "tv/anon":
-                    print(f"[Music] resolved via {label} (clients={clients})")
-                break
-        except Exception as e:
-            last_msg = str(e)
-            low = last_msg.lower()
-            if "sign in to confirm" in low or "not a bot" in low:
-                saw_botcheck = True
-            print(f"[Music] yt-dlp attempt '{label}' failed (clients={clients}): {last_msg[:220]}")
-            # keep trying the remaining strategies regardless of error type
-    if not info:
-        low = last_msg.lower()
-        if saw_botcheck or "sign in to confirm" in low or "not a bot" in low:
-            return None, ("YouTube blocked every method from this server's IP. This "
-                          "usually needs a PO-token provider or a proxy, tell me and "
-                          "I'll set one up. `/radio` still works in the meantime.")
-        if "reload" in low:
-            return None, ("YouTube wouldn't return a stream for that video. Try a "
-                          "different song, or use `/radio`.")
-        return None, (last_msg[:200] or "No results.")
-    return {
-        "title": info.get("title") or "Unknown",
-        "url": info.get("url"),
-        "webpage_url": info.get("webpage_url") or query,
-        "duration": info.get("duration") or 0,
-        "thumbnail": info.get("thumbnail") or "",
-    }, None
-
-
-def _music_np_embed(track, st):
-    e = discord.Embed(title="Now Playing",
-                      description=f"[{track.get('title', 'Unknown')}]({track.get('webpage_url') or ''})",
-                      color=ACCENT)
-    if track.get("requester_name"):
-        e.add_field(name="Requested by", value=track["requester_name"], inline=True)
-    dur = _fmt_duration(track.get("duration"))
+def _music_np_embed(track, player):
+    who = _track_requester(track)[1]
+    dur = _fmt_ms(getattr(track, "length", 0))
+    desc = f"**[{track.title}]({getattr(track, 'uri', '') or ''})**"
+    if getattr(track, "author", None):
+        desc += f"\nby {track.author}"
+    meta = []
     if dur:
-        e.add_field(name="Length", value=dur, inline=True)
-    e.add_field(name="Volume", value=f"{int(st.get('volume', 0.5) * 100)}%", inline=True)
-    if track.get("thumbnail"):
-        e.set_thumbnail(url=track["thumbnail"])
+        meta.append(dur)
+    if who:
+        meta.append(f"queued by {who}")
+    vol = int(getattr(player, "volume", 100) or 100)
+    meta.append(f"vol {vol}%")
+    if meta:
+        desc += "\n" + " · ".join(meta)
+    e = info_embed("Now Playing", desc)
+    art = getattr(track, "artwork", None)
+    if art:
+        try:
+            e.set_thumbnail(url=art)
+        except Exception:
+            pass
     return e
 
 
-async def _music_announce(guild, track=None, error=None):
-    st = _music_state(guild.id)
-    ch = guild.get_channel(int(st["text_id"])) if st.get("text_id") else None
-    if not ch:
-        return
-    try:
-        if error:
-            await ch.send(embed=error_embed("Music", error))
-        elif track:
-            await ch.send(embed=_music_np_embed(track, st))
-    except Exception:
-        pass
-
-
-_MUSIC_MAX_FAILS = 3  # consecutive rapid failures before we stop (anti-runaway)
-
-
-async def _music_play_next(guild, _depth=0):
-    """Advance the queue: pick the next track (respecting loop/radio), re-resolve a
-    fresh stream URL, and play it. Chained via the FFmpeg `after` callback.
-
-    Guarded against the runaway respawn loop: a source that dies almost instantly
-    is counted, and after a few in a row we stop instead of spawning ffmpeg forever."""
-    st = _music_state(guild.id)
-    vc = guild.voice_client
-    if not vc or not vc.is_connected():
-        st["current"] = None
-        return
-    if (st.get("loop") or st.get("radio")) and st.get("current"):
-        track = st["current"]
-    elif st["queue"]:
-        track = st["queue"].pop(0)
-    else:
-        st["current"] = None
-        return
-    st["current"] = track
-    # Direct stream (internet radio): play the URL straight through ffmpeg — no
-    # yt-dlp resolution, no YouTube, no cookies. Otherwise resolve via yt-dlp.
-    if track.get("direct_url"):
-        resolved, err = {"url": track["direct_url"]}, None
-    else:
-        resolved, err = await _yt_resolve(track.get("webpage_url") or track.get("title"))
-    if not (resolved and resolved.get("url")):
-        # Bounded skip through the queue — never recurse for radio/loop (that's an
-        # infinite loop) and cap depth so a bad queue can't blow the stack.
-        if not st.get("radio") and not st.get("loop") and st["queue"] and _depth < 5:
-            await _music_announce(guild, error=f"Skipped **{track.get('title')}**, {err or 'no stream'}")
-            return await _music_play_next(guild, _depth + 1)
-        st["current"] = None
-        await _music_announce(guild, error=f"Couldn't play **{track.get('title')}**, {err or 'no stream'}")
-        return
-    # Never stack ffmpeg processes: stop whatever is playing first.
-    try:
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-    except Exception:
-        pass
-    try:
-        vol = max(0.0, min(2.0, float(st.get("volume", 0.5))))
-        # ffmpeg applies the volume filter and encodes straight to Opus, so no
-        # libopus is needed on the host.
-        source = discord.FFmpegOpusAudio(
-            resolved["url"], executable=_FFMPEG_EXE,
-            before_options=_FFMPEG_BEFORE, options=f"-vn -af volume={vol:.2f}")
-    except Exception as e:
-        st["current"] = None
-        await _music_announce(guild, error=f"Couldn't play **{track.get('title')}**: {str(e)[:150]}")
-        return
-
-    st["play_started"] = time.monotonic()
-
-    def _after(e):
-        if e:
-            print(f"[Music] playback error: {e}")
-        # Circuit breaker: a source that errored after < 8s counts as a rapid
-        # failure. A few in a row and we stop, rather than respawning forever.
-        elapsed = time.monotonic() - st.get("play_started", 0)
-        if e and elapsed < 8:
-            st["fail_count"] = st.get("fail_count", 0) + 1
-        else:
-            st["fail_count"] = 0
-        if st.get("fail_count", 0) >= _MUSIC_MAX_FAILS:
-            st["fail_count"] = 0
-            st["radio"] = False
-            st["loop"] = False
-            st["current"] = None
-            print("[Music] too many rapid failures — stopping to avoid a respawn loop")
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    _music_announce(guild, error="This source keeps failing to play, stopped. "
-                                    "Try again, a different song, or another `/radio` genre."),
-                    bot.loop)
-            except Exception:
-                pass
-            return
-        try:
-            asyncio.run_coroutine_threadsafe(_music_play_next(guild), bot.loop)
-        except Exception as ex:
-            print(f"[Music] after-hook failed: {ex}")
-
-    try:
-        vc.play(source, after=_after)
-    except Exception as e:
-        st["current"] = None
-        await _music_announce(guild, error=f"Playback failed: {str(e)[:150]}")
-        return
-    if not st.get("radio"):
-        await _music_announce(guild, track=track)
-
-
 async def _music_connect(interaction):
-    """Join the caller's voice channel (or move to it). Returns (vc, err_embed)."""
-    member = interaction.user
-    voice = getattr(member, "voice", None)
-    if not (voice and voice.channel):
-        return None, error_embed("Join voice first", "Hop into a voice channel, then try again.")
-    guild = interaction.guild
-    vc = guild.voice_client
+    """Join the caller's voice channel, returning (player, err_embed)."""
+    user = interaction.user
+    if not (getattr(user, "voice", None) and user.voice.channel):
+        return None, error_embed("Join a voice channel", "Hop into a voice channel first, then run the command.")
+    ch = user.voice.channel
+    player = interaction.guild.voice_client
     try:
-        if vc and vc.is_connected():
-            if vc.channel != voice.channel:
-                await vc.move_to(voice.channel)
-        else:
-            vc = await voice.channel.connect()
+        if player is None:
+            player = await ch.connect(cls=wavelink.Player, self_deaf=True)
+        elif player.channel and player.channel.id != ch.id:
+            await player.move_to(ch)
     except Exception as e:
-        # Full diagnostic to the Railway log so we can see the REAL exception,
-        # not just the friendly text (has_nacl can be True at import yet the
-        # 2.7 voice handshake can still fail on encryption backend selection).
-        import traceback as _tb
-        print(f"[Music] voice connect FAILED: {type(e).__module__}.{type(e).__name__}: {e!r}")
-        try:
-            import discord.voice_client as _vc
-            print(f"[Music] voice_client.has_nacl = {getattr(_vc, 'has_nacl', '?')}")
-        except Exception as _e:
-            print(f"[Music] voice_client import check failed: {_e!r}")
-        try:
-            import discord.voice_state as _vs
-            print(f"[Music] voice_state.has_nacl = {getattr(_vs, 'has_nacl', '?')}")
-        except Exception as _e:
-            print(f"[Music] voice_state import check failed: {_e!r}")
-        try:
-            import importlib
-            _cg = importlib.import_module("cryptography")
-            print(f"[Music] cryptography present: {getattr(_cg, '__version__', '?')}")
-        except Exception as _e:
-            print(f"[Music] cryptography MISSING: {_e!r}")
-        print("[Music] traceback:\n" + _tb.format_exc())
-        return None, error_embed(
-            "Couldn't join",
-            f"Voice connect failed: `{type(e).__name__}: {str(e)[:120]}`",
-        )
-    return vc, None
+        return None, error_embed("Couldn't join", str(e)[:200])
+    try:
+        player.autoplay = wavelink.AutoPlayMode.partial  # auto-advance queue, no YT recommendations
+    except Exception:
+        pass
+    return player, None
+
+
+async def _music_search(query):
+    """Resolve a query/URL into a Playable list or Playlist. Plain text searches
+    SoundCloud; URLs (SoundCloud / Spotify / direct stream) resolve as-is."""
+    q = (query or "").strip()
+    is_url = q.lower().startswith(("http://", "https://"))
+    search = q if is_url else f"scsearch:{q}"
+    try:
+        return await wavelink.Playable.search(search)
+    except Exception as e:
+        print(f"[Music] search failed: {e}")
+        return None
 
 
 @bot.tree.command(name="play", description="Play a song in your voice channel")
-@app_commands.describe(query="A song name, or a YouTube/SoundCloud link")
+@app_commands.describe(query="A song name, or a SoundCloud / Spotify link")
 async def play_cmd(interaction: discord.Interaction, query: str):
     ok, err = _music_gate(interaction)
     if not ok:
@@ -8013,29 +7683,67 @@ async def play_cmd(interaction: discord.Interaction, query: str):
         await interaction.response.send_message(embed=error_embed("DJ only", "Only a DJ can add songs right now."), ephemeral=True)
         return
     await interaction.response.defer(thinking=True, ephemeral=True)
-    st = _music_state(interaction.guild_id)
-    if len(st["queue"]) >= int(music_config.get("max_queue_length") or 100):
-        await interaction.followup.send(embed=error_embed("Queue full", f"The queue is capped at {music_config.get('max_queue_length')} songs."), ephemeral=True)
-        return
-    vc, err = await _music_connect(interaction)
-    if not vc:
+    player, err = await _music_connect(interaction)
+    if not player:
         await interaction.followup.send(embed=err, ephemeral=True)
         return
-    st["text_id"] = interaction.channel_id
-    st["radio"] = False
-    track, terr = await _yt_resolve(query)
-    if not track:
-        await interaction.followup.send(embed=error_embed("Couldn't find it", terr or "No results."), ephemeral=True)
+    maxq = int(music_config.get("max_queue_length") or 100)
+    if len(player.queue) >= maxq:
+        await interaction.followup.send(embed=error_embed("Queue full", f"The queue is capped at {maxq} songs."), ephemeral=True)
         return
-    track["requester_id"] = str(interaction.user.id)
-    track["requester_name"] = interaction.user.display_name
-    st["queue"].append(track)
-    pos = len(st["queue"])
-    if not vc.is_playing() and not vc.is_paused() and st.get("current") is None:
-        await _music_play_next(interaction.guild)
-        await interaction.followup.send(embed=success_embed("Playing", f"**{track['title']}**"), ephemeral=True)
+    _music_home[interaction.guild_id] = interaction.channel_id
+    _music_radio[interaction.guild_id] = False
+
+    results = await _music_search(query)
+    if not results:
+        await interaction.followup.send(embed=error_embed("Couldn't find it", "No results — try a different name or a SoundCloud link."), ephemeral=True)
+        return
+
+    def _tag(tr):
+        try:
+            tr.extras = {"requester_id": str(interaction.user.id), "requester_name": interaction.user.display_name}
+        except Exception:
+            pass
+
+    if isinstance(results, wavelink.Playlist):
+        added = 0
+        for tr in results.tracks:
+            if len(player.queue) >= maxq:
+                break
+            _tag(tr)
+            player.queue.put(tr)
+            added += 1
+        label = f"**{results.name}** — {added} track(s)"
     else:
-        await interaction.followup.send(embed=success_embed("Added to queue", f"**{track['title']}**, #{pos} in queue"), ephemeral=True)
+        track = results[0]
+        _tag(track)
+        player.queue.put(track)
+        label = f"**{track.title}**"
+
+    if not player.playing:
+        nxt = player.queue.get()
+        vol = max(1, min(100, int(music_config.get("default_volume") or 50)))
+        await player.play(nxt, volume=vol)
+        await interaction.followup.send(embed=success_embed("Playing", f"**{nxt.title}**"), ephemeral=True)
+    else:
+        await interaction.followup.send(embed=success_embed("Added to queue", f"{label}, #{len(player.queue)} in queue"), ephemeral=True)
+
+
+@bot.event
+async def on_wavelink_track_start(payload):
+    """Announce the track in the channel where it was queued."""
+    try:
+        player = payload.player
+        if not (player and player.guild):
+            return
+        chan_id = _music_home.get(player.guild.id)
+        if not chan_id:
+            return
+        channel = bot.get_channel(int(chan_id))
+        if channel:
+            await channel.send(embed=_music_np_embed(payload.track, player))
+    except Exception as e:
+        print(f"[Music] track-start announce failed: {e}")
 
 
 @bot.tree.command(name="skip", description="Skip the current song")
@@ -8044,18 +7752,16 @@ async def skip_cmd(interaction: discord.Interaction):
     if not ok:
         await interaction.response.send_message(embed=err, ephemeral=True)
         return
-    st = _music_state(interaction.guild_id)
-    cur = st.get("current")
-    is_requester = cur and str(cur.get("requester_id")) == str(interaction.user.id)
+    player = interaction.guild.voice_client
+    if not (player and player.playing):
+        await interaction.response.send_message(embed=error_embed("Nothing playing", "There's nothing to skip."), ephemeral=True)
+        return
+    rid = _track_requester(player.current)[0] if player.current else None
+    is_requester = rid is not None and rid == str(interaction.user.id)
     if not (_music_is_dj(interaction.user) or is_requester):
         await interaction.response.send_message(embed=error_embed("Can't skip", "Only a DJ or the person who queued this can skip it."), ephemeral=True)
         return
-    vc = interaction.guild.voice_client
-    if not (vc and (vc.is_playing() or vc.is_paused())):
-        await interaction.response.send_message(embed=error_embed("Nothing playing", "There's nothing to skip."), ephemeral=True)
-        return
-    st["loop"] = False
-    vc.stop()  # triggers _after -> next track
+    await player.skip(force=True)
     await interaction.response.send_message(embed=success_embed("Skipped", "Playing the next song…"), ephemeral=True)
 
 
@@ -8065,16 +7771,12 @@ async def stop_cmd(interaction: discord.Interaction):
     if not ok:
         await interaction.response.send_message(embed=err, ephemeral=True)
         return
-    st = _music_state(interaction.guild_id)
-    st["queue"].clear()
-    st["current"] = None
-    st["loop"] = False
-    st["radio"] = False
-    vc = interaction.guild.voice_client
-    if vc:
+    player = interaction.guild.voice_client
+    _music_radio.pop(interaction.guild_id, None)
+    if player:
         try:
-            vc.stop()
-            await vc.disconnect()
+            player.queue.clear()
+            await player.disconnect()
         except Exception:
             pass
     await interaction.response.send_message(embed=success_embed("Stopped", "Queue cleared and left the channel."), ephemeral=True)
@@ -8086,9 +7788,9 @@ async def pause_cmd(interaction: discord.Interaction):
     if not ok:
         await interaction.response.send_message(embed=err, ephemeral=True)
         return
-    vc = interaction.guild.voice_client
-    if vc and vc.is_playing():
-        vc.pause()
+    player = interaction.guild.voice_client
+    if player and player.playing and not player.paused:
+        await player.pause(True)
         await interaction.response.send_message(embed=success_embed("Paused", "Use /resume to continue."), ephemeral=True)
     else:
         await interaction.response.send_message(embed=error_embed("Nothing playing", "There's nothing to pause."), ephemeral=True)
@@ -8100,9 +7802,9 @@ async def resume_cmd(interaction: discord.Interaction):
     if not ok:
         await interaction.response.send_message(embed=err, ephemeral=True)
         return
-    vc = interaction.guild.voice_client
-    if vc and vc.is_paused():
-        vc.resume()
+    player = interaction.guild.voice_client
+    if player and player.paused:
+        await player.pause(False)
         await interaction.response.send_message(embed=success_embed("Resumed", "Back to it."), ephemeral=True)
     else:
         await interaction.response.send_message(embed=error_embed("Not paused", "Nothing is paused."), ephemeral=True)
@@ -8115,9 +7817,13 @@ async def volume_cmd(interaction: discord.Interaction, percent: app_commands.Ran
     if not ok:
         await interaction.response.send_message(embed=err, ephemeral=True)
         return
-    st = _music_state(interaction.guild_id)
-    st["volume"] = percent / 100.0
-    await interaction.response.send_message(embed=success_embed("Volume", f"Set to **{percent}%**, applies to the next song."), ephemeral=True)
+    player = interaction.guild.voice_client
+    if player:
+        try:
+            await player.set_volume(int(percent))
+        except Exception:
+            pass
+    await interaction.response.send_message(embed=success_embed("Volume", f"Set to **{percent}%**."), ephemeral=True)
 
 
 @bot.tree.command(name="loop", description="Toggle looping the current song")
@@ -8126,9 +7832,13 @@ async def loop_cmd(interaction: discord.Interaction):
     if not ok:
         await interaction.response.send_message(embed=err, ephemeral=True)
         return
-    st = _music_state(interaction.guild_id)
-    st["loop"] = not st.get("loop")
-    await interaction.response.send_message(embed=success_embed("Loop", "Looping **on**." if st["loop"] else "Looping **off**."), ephemeral=True)
+    player = interaction.guild.voice_client
+    if not player:
+        await interaction.response.send_message(embed=error_embed("Nothing playing", "Start a song with `/play` first."), ephemeral=True)
+        return
+    now_loop = player.queue.mode != wavelink.QueueMode.loop
+    player.queue.mode = wavelink.QueueMode.loop if now_loop else wavelink.QueueMode.normal
+    await interaction.response.send_message(embed=success_embed("Loop", "Looping **on**." if now_loop else "Looping **off**."), ephemeral=True)
 
 
 @bot.tree.command(name="queue", description="Show the music queue")
@@ -8137,15 +7847,16 @@ async def queue_cmd(interaction: discord.Interaction):
     if not ok:
         await interaction.response.send_message(embed=err, ephemeral=True)
         return
-    st = _music_state(interaction.guild_id)
-    cur = st.get("current")
+    player = interaction.guild.voice_client
     lines = []
-    if cur:
-        lines.append(f"**Now:** [{cur.get('title')}]({cur.get('webpage_url') or ''}), {cur.get('requester_name', '')}")
-    if st["queue"]:
-        for i, t in enumerate(st["queue"][:15], 1):
-            lines.append(f"`{i}.` {t.get('title')}, {t.get('requester_name', '')}")
-        extra = len(st["queue"]) - 15
+    if player and player.current:
+        who = _track_requester(player.current)[1]
+        lines.append(f"**Now:** [{player.current.title}]({getattr(player.current, 'uri', '') or ''}){f', {who}' if who else ''}")
+    if player and len(player.queue):
+        for i, t in enumerate(list(player.queue)[:15], 1):
+            who = _track_requester(t)[1]
+            lines.append(f"`{i}.` {t.title}{f', {who}' if who else ''}")
+        extra = len(player.queue) - 15
         if extra > 0:
             lines.append(f"…and **{extra}** more")
     if not lines:
@@ -8159,16 +7870,16 @@ async def nowplaying_cmd(interaction: discord.Interaction):
     if not ok:
         await interaction.response.send_message(embed=err, ephemeral=True)
         return
-    st = _music_state(interaction.guild_id)
-    if not st.get("current"):
+    player = interaction.guild.voice_client
+    if not (player and player.current):
         await interaction.response.send_message(embed=error_embed("Nothing playing", "Queue a song with `/play`."), ephemeral=True)
         return
-    await interaction.response.send_message(embed=_music_np_embed(st["current"], st), ephemeral=True)
+    await interaction.response.send_message(embed=_music_np_embed(player.current, player), ephemeral=True)
 
 
 # Direct internet-radio streams (SomaFM — commercial-free, bot-friendly, no auth).
-# Each is a plain MP3 stream ffmpeg plays straight through, so radio never touches
-# YouTube/yt-dlp/cookies and just works. Genre is matched by keyword.
+# Lavalink's built-in `http` source plays these MP3 streams straight through, so
+# radio never touches YouTube. Genre is matched by keyword.
 _RADIO_STREAMS = [
     (("lofi", "lo-fi", "chill", "study", "ambient", "sleep", "relax"),
      "SomaFM Groove Salad", "https://ice1.somafm.com/groovesalad-128-mp3"),
@@ -8209,27 +7920,27 @@ async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
         await interaction.response.send_message(embed=err, ephemeral=True)
         return
     await interaction.response.defer(thinking=True, ephemeral=True)
-    vc, err = await _music_connect(interaction)
-    if not vc:
+    player, err = await _music_connect(interaction)
+    if not player:
         await interaction.followup.send(embed=err, ephemeral=True)
         return
     g = (genre or music_config.get("radio_genre") or "lofi").strip()
-    # Play a direct internet-radio stream — reliable, continuous, and completely
-    # independent of YouTube (no cookies / bot-checks / PO tokens).
     station, stream_url = _radio_stream_for(g)
-    track = {"title": f"{station} · {g} radio", "url": stream_url,
-             "direct_url": stream_url, "webpage_url": "https://somafm.com",
-             "duration": 0, "thumbnail": ""}
-    st = _music_state(interaction.guild_id)
-    st["text_id"] = interaction.channel_id
-    st["radio"] = True
-    st["loop"] = False
-    st["fail_count"] = 0
-    st["queue"].clear()
-    st["current"] = track
-    if vc.is_playing() or vc.is_paused():
-        vc.stop()
-    await _music_play_next(interaction.guild)
+    results = await _music_search(stream_url)
+    track = results[0] if (results and not isinstance(results, wavelink.Playlist)) else None
+    if not track:
+        await interaction.followup.send(embed=error_embed("Radio unavailable", "Couldn't start that stream. Try again."), ephemeral=True)
+        return
+    _music_home[interaction.guild_id] = interaction.channel_id
+    _music_radio[interaction.guild_id] = True
+    try:
+        player.queue.mode = wavelink.QueueMode.normal
+        player.queue.clear()
+        player.autoplay = wavelink.AutoPlayMode.partial
+    except Exception:
+        pass
+    vol = max(1, min(100, int(music_config.get("default_volume") or 50)))
+    await player.play(track, volume=vol)
     await interaction.followup.send(embed=success_embed("Radio on", f"Now streaming **{station}** ({g}). Use `/stop` to end it."), ephemeral=True)
 
 
@@ -8241,15 +7952,15 @@ async def on_voice_state_update(member, before, after):
         if member.bot or not music_config.get("auto_leave", True):
             return
         guild = member.guild
-        vc = guild.voice_client if guild else None
-        if not (vc and vc.channel):
+        player = guild.voice_client if guild else None
+        if not (player and player.channel):
             return
-        humans = [m for m in vc.channel.members if not m.bot]
+        humans = [m for m in player.channel.members if not m.bot]
         if not humans:
-            st = _music_state(guild.id)
-            st["queue"].clear(); st["current"] = None; st["radio"] = False; st["loop"] = False
+            _music_radio.pop(guild.id, None)
             try:
-                await vc.disconnect()
+                player.queue.clear()
+                await player.disconnect()
             except Exception:
                 pass
     except Exception as e:

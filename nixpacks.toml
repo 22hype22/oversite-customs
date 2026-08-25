@@ -1,3 +1,3 @@
-# Music add-on needs FFmpeg (yt-dlp audio) and libopus (Discord voice encoding).
-[phases.setup]
-nixPkgs = ["...", "ffmpeg", "libopus"]
+# The bot delegates all audio to a shared Lavalink node (wavelink client), so it
+# no longer needs FFmpeg / libopus / PyNaCl on the host. Nixpacks auto-detects
+# Python from requirements.txt.

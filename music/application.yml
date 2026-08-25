@@ -1,0 +1,78 @@
+# Lavalink config for the shared Oversite music node.
+#
+# Sources enabled: SoundCloud (native, no credentials, primary), direct HTTP
+# streams (for SomaFM radio), plus Spotify/Apple Music LINK resolution via the
+# LavaSrc plugin — which mirrors those links to SoundCloud audio. YouTube is
+# deliberately OFF (its datacenter-IP bot-check is the maintenance treadmill we're
+# escaping), and Deezer is OFF (its stream decryption is a ToS/DMCA risk for a
+# commercial product). SoundCloud alone needs zero upkeep.
+#
+# Everything sensitive comes from env vars so nothing secret lives in git:
+#   LAVALINK_SERVER_PASSWORD  - shared password every bot uses to connect
+#   PORT                      - injected by Railway; Lavalink binds it
+#   SPOTIFY_CLIENT_ID/SECRET  - optional; only needed if the anonymous Spotify
+#                               path stops working (SoundCloud is unaffected)
+
+server:
+  port: ${PORT:2333}
+  address: 0.0.0.0
+
+lavalink:
+  plugins:
+    - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.8.3"
+      repository: "https://maven.lavalink.dev/releases"
+      snapshot: false
+  server:
+    password: ${LAVALINK_SERVER_PASSWORD:changeme}
+    sources:
+      youtube: false      # OFF on purpose — no YouTube bot-check treadmill
+      soundcloud: true     # primary source, native, no credentials
+      bandcamp: true
+      twitch: true
+      vimeo: true
+      http: true           # SomaFM radio streams play through this
+      local: false
+    filters:
+      volume: true
+      equalizer: true
+      karaoke: true
+      timescale: true
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    opusEncodingQuality: 10
+    resamplingQuality: LOW
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+    playerUpdateInterval: 5
+    youtubeSearchEnabled: false
+    soundcloudSearchEnabled: true
+
+plugins:
+  lavasrc:
+    sources:
+      spotify: true        # resolve Spotify links/search (metadata only)
+      applemusic: true     # resolve Apple Music links (metadata only)
+      deezer: false        # OFF — stream decryption is a ToS/legal risk
+      yandexmusic: false
+      youtube: false        # OFF — never mirror to YouTube
+      soundcloud: false     # SoundCloud is handled by Lavalink core above
+    # Where a Spotify/Apple track's audio actually comes from: SoundCloud, by
+    # "Artist - Title" text search (SoundCloud has no ISRC index). No YouTube.
+    providers:
+      - "scsearch:%QUERY%"
+    spotify:
+      preferPartnerApi: true    # anonymous token path — no app clientId/secret needed
+      clientId: "${SPOTIFY_CLIENT_ID:}"
+      clientSecret: "${SPOTIFY_CLIENT_SECRET:}"
+      countryCode: "US"
+      playlistLoadLimit: 6
+      albumLoadLimit: 6
+    applemusic:
+      countryCode: "US"
+      playlistLoadLimit: 6
+      albumLoadLimit: 6
+
+logging:
+  level:
+    root: INFO
+    lavalink: INFO
