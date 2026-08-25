@@ -8080,6 +8080,82 @@ EMOJI_PAUSE = "⏸️"
 EMOJI_PLAY = "▶️"
 MUSIC_X_LABEL = "ㅤㅤㅤㅤㅤㅤ    ㅤ  ㅤ     ㅤㅤ✕ㅤㅤㅤㅤㅤㅤ   ㅤ  ㅤ     ㅤㅤ"
 
+# The Utilities bot's custom button emojis live on ITS application, so this bot
+# can't reuse their ids. Instead we pull the same images from Discord's public
+# emoji CDN and (re)upload them to THIS bot's application once, then swap the
+# unicode fallbacks above for the matching app emojis — identical look, no manual
+# uploads. Source ids are from the Utilities app.
+_SRC_EMOJIS = {
+    "music_heart": 1504992052323025056,
+    "music_heart_filled": 1505000754426024010,
+    "music_skip": 1504992134371999924,
+    "music_back": 1514072205103857778,
+    "dj": 1514737204482670662,
+    "music_pause": 1504992315029065918,
+    "music_play": 1504992503601041549,
+}
+_app_emojis = {}
+_emojis_ready = False
+
+
+async def _ensure_app_emojis():
+    """Idempotently mirror the music button emojis onto this bot's application."""
+    global _emojis_ready, EMOJI_HEART, EMOJI_HEART_RED, EMOJI_SKIP, EMOJI_BACK
+    global EMOJI_DJ_OFF, EMOJI_DJ_ON, EMOJI_PAUSE, EMOJI_PLAY
+    if _emojis_ready:
+        return
+    try:
+        app_id = bot.application_id or (bot.user.id if bot.user else None)
+        if not app_id:
+            return
+        existing = {}
+        try:
+            data = await bot.http.request(discord.http.Route("GET", "/applications/{app_id}/emojis", app_id=app_id))
+            for e in (data.get("items") if isinstance(data, dict) else data) or []:
+                existing[e["name"]] = e
+        except Exception as le:
+            print(f"[Emoji] list failed: {le}")
+        import base64 as _b64
+        for name, src_id in _SRC_EMOJIS.items():
+            e = existing.get(name)
+            if not e:
+                img = None
+                try:
+                    async with aiohttp.ClientSession() as s:
+                        for ext, mime in (("png", "image/png"), ("gif", "image/gif")):
+                            async with s.get(f"https://cdn.discordapp.com/emojis/{src_id}.{ext}?size=128") as r:
+                                if r.status == 200:
+                                    img = f"data:{mime};base64," + _b64.b64encode(await r.read()).decode()
+                                    break
+                except Exception:
+                    pass
+                if not img:
+                    continue
+                try:
+                    e = await bot.http.request(
+                        discord.http.Route("POST", "/applications/{app_id}/emojis", app_id=app_id),
+                        json={"name": name, "image": img})
+                    print(f"[Emoji] uploaded {name} -> {e.get('id')}")
+                except Exception as ce:
+                    print(f"[Emoji] create {name} failed: {ce}")
+                    continue
+            if e:
+                _app_emojis[name] = discord.PartialEmoji(name=name, id=int(e["id"]), animated=bool(e.get("animated")))
+        g = _app_emojis.get
+        EMOJI_HEART = g("music_heart", EMOJI_HEART)
+        EMOJI_HEART_RED = g("music_heart_filled", EMOJI_HEART_RED)
+        EMOJI_SKIP = g("music_skip", EMOJI_SKIP)
+        EMOJI_BACK = g("music_back", EMOJI_BACK)
+        EMOJI_DJ_OFF = g("dj", EMOJI_DJ_OFF)
+        EMOJI_DJ_ON = g("dj", EMOJI_DJ_ON)
+        EMOJI_PAUSE = g("music_pause", EMOJI_PAUSE)
+        EMOJI_PLAY = g("music_play", EMOJI_PLAY)
+        _emojis_ready = True
+        print(f"[Emoji] ready: {list(_app_emojis.keys())}")
+    except Exception as e:
+        print(f"[Emoji] ensure failed: {e}")
+
+
 PROGRESS_IMG_WIDTH = 300
 PROGRESS_FONT_SIZE = 16
 PROGRESS_BAR_THICKNESS = 5
@@ -8180,7 +8256,10 @@ def _npv2_emoji(pe):
     if isinstance(pe, str):
         return {"name": pe}
     try:
-        return {"id": str(pe.id), "name": pe.name}
+        out = {"id": str(pe.id), "name": pe.name}
+        if getattr(pe, "animated", False):
+            out["animated"] = True
+        return out
     except Exception:
         return None
 
@@ -8218,6 +8297,16 @@ class NowPlayingView(discord.ui.View):
     def __init__(self, guild_id):
         super().__init__(timeout=None)
         self.guild_id = guild_id
+        # Swap the unicode placeholders for this app's real emojis (resolved by
+        # _ensure_app_emojis before the first card renders).
+        try:
+            self.like.emoji = EMOJI_HEART
+            self.back.emoji = EMOJI_BACK
+            self.pause.emoji = EMOJI_PAUSE
+            self.skip.emoji = EMOJI_SKIP
+            self.dj_toggle.emoji = EMOJI_DJ_OFF
+        except Exception:
+            pass
 
     @discord.ui.button(emoji=EMOJI_HEART, style=discord.ButtonStyle.secondary, row=0)
     async def like(self, interaction, button):
@@ -8505,6 +8594,7 @@ async def handle_npv2_button(interaction, cid):
 
 async def send_now_playing(guild, track, channel):
     try:
+        await _ensure_app_emojis()
         artist_name = getattr(track, "author", "") or ""
         artwork = await get_spotify_artwork(track.title, artist_name)
         if not artwork:
@@ -9253,6 +9343,28 @@ async def on_wavelink_track_exception(payload):
         if not payload.player or not payload.player.guild:
             return
         guild = payload.player.guild
+        player = payload.player
+        track = getattr(payload, "track", None)
+
+        # Resilience: when YouTube chokes on a track ("The page needs to be
+        # reloaded" / all clients failed), retry the SAME song on SoundCloud
+        # instead of just erroring. If the SoundCloud version also fails it won't
+        # loop (its uri is already soundcloud). This keeps music playing through
+        # YouTube's periodic bot-check waves.
+        try:
+            uri = (getattr(track, "uri", "") or "").lower()
+            src = (getattr(track, "source", "") or "").lower()
+            if track and "soundcloud" not in uri and "soundcloud" not in src:
+                q = f"{getattr(track, 'author', '') or ''} {track.title}".strip()
+                alts = await wavelink.Playable.search(f"scsearch:{q}")
+                if alts:
+                    alt = best_track(alts, q) or alts[0]
+                    print(f"[Music] YouTube failed — SoundCloud fallback: {alt.title}")
+                    await player.play(alt)
+                    return  # recovered; don't count this as a failure
+        except Exception as fe:
+            print(f"[Music] SoundCloud fallback error: {fe}")
+
         import time as _t
         _track_last_failure_time[guild.id] = _t.time()
         _track_failure_counts[guild.id] = _track_failure_counts.get(guild.id, 0) + 1
