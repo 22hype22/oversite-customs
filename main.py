@@ -9280,6 +9280,7 @@ async def votegenre_command(interaction: discord.Interaction, genre: str):
 # ---- Wavelink events ----
 _track_failure_counts = {}
 _track_last_failure_time = {}
+_sc_fallback_counts = {}  # per-guild SoundCloud-fallback attempts (loop guard)
 
 
 @bot.event
@@ -9293,6 +9294,7 @@ async def on_wavelink_track_start(payload):
         import time as _time
         if _time.time() - _track_last_failure_time.get(guild.id, 0) > 10:
             _track_failure_counts[guild.id] = 0
+        _sc_fallback_counts[guild.id] = 0  # a track actually started — clear the loop guard
         _decay_taste(guild.id)
 
         if _is_dj_clip(track):
@@ -9346,22 +9348,30 @@ async def on_wavelink_track_exception(payload):
         player = payload.player
         track = getattr(payload, "track", None)
 
-        # Resilience: when YouTube chokes on a track ("The page needs to be
-        # reloaded" / all clients failed), retry the SAME song on SoundCloud
-        # instead of just erroring. If the SoundCloud version also fails it won't
-        # loop (its uri is already soundcloud). This keeps music playing through
-        # YouTube's periodic bot-check waves.
+        # Resilience: when YouTube chokes on a track, retry the SAME song on
+        # SoundCloud. Guarded hard against loops — we ONLY play a result that is
+        # genuinely a SoundCloud track (if the node has no working SoundCloud,
+        # scsearch just returns more YouTube, which we refuse), and cap the number
+        # of fallbacks per guild so it can never spin.
         try:
             uri = (getattr(track, "uri", "") or "").lower()
             src = (getattr(track, "source", "") or "").lower()
-            if track and "soundcloud" not in uri and "soundcloud" not in src:
+            fb_used = _sc_fallback_counts.get(guild.id, 0)
+            if track and "soundcloud" not in uri and "soundcloud" not in src and fb_used < 2:
                 q = f"{getattr(track, 'author', '') or ''} {track.title}".strip()
                 alts = await wavelink.Playable.search(f"scsearch:{q}")
-                if alts:
-                    alt = best_track(alts, q) or alts[0]
-                    print(f"[Music] YouTube failed — SoundCloud fallback: {alt.title}")
-                    await player.play(alt)
-                    return  # recovered; don't count this as a failure
+                sc_alt = None
+                for a in (alts or []):
+                    au = (getattr(a, "uri", "") or "").lower()
+                    asrc = (getattr(a, "source", "") or "").lower()
+                    if "soundcloud" in au or "soundcloud" in asrc:
+                        sc_alt = a
+                        break
+                if sc_alt is not None:
+                    _sc_fallback_counts[guild.id] = fb_used + 1
+                    print(f"[Music] YouTube failed — SoundCloud fallback: {sc_alt.title}")
+                    await player.play(sc_alt)
+                    return  # recovered with a real SoundCloud track
         except Exception as fe:
             print(f"[Music] SoundCloud fallback error: {fe}")
 
