@@ -6,11 +6,30 @@ pointing that bot at this node. No music code lives in the bots — they're thin
 clients (wavelink). The bot never touches audio, so there's **no PyNaCl / ffmpeg /
 YouTube bot-check** anywhere.
 
-**Sources:** SoundCloud (primary, native, zero credentials) + direct HTTP streams
-for radio, plus Spotify/Apple Music **link** resolution (mirrored to SoundCloud
-audio). YouTube and Deezer are intentionally off — YouTube is the maintenance
-treadmill, Deezer is a ToS/DMCA risk for a paid product. Realistic upkeep on this
-setup: **occasional**, not weekly.
+**Sources:** Deezer (optional, env-gated — the most reliable real-audio source
+from datacenter hosts as of Aug 2026), SoundCloud (native, zero credentials, but
+currently spotty: datacenter edge-blocks plus an open track-404 bug), direct HTTP
+streams for radio (never blocked), and Spotify/Apple Music **link** resolution
+(mirrored to Deezer→SoundCloud audio). YouTube is intentionally off — it is the
+maintenance treadmill.
+
+## Enabling Deezer (recommended for reliable playback)
+
+Deezer authenticates with a login cookie, not your server's IP — so it streams
+fine from Railway. Heads-up first: LavaSrc's Deezer playback decrypts Deezer's
+streams, which violates Deezer's ToS — for a commercial product that's a
+business/legal call, not just a technical one. If you enable it, use a burner
+account. Set these on the node service:
+
+| Variable | Value |
+|---|---|
+| `DEEZER_ENABLED` | `true` |
+| `DEEZER_ARL` | the `arl` cookie from deezer.com — log in (burner account), DevTools → Application → Cookies → copy `arl`. Re-paste every few months when the session dies. |
+| `DEEZER_MASTER_KEY` | Deezer's track master decryption key. Not distributed in this repo; it circulates publicly in open-source Deezer downloader projects (deemix-family repos). |
+
+With Deezer on, plain searches and Spotify/Apple links resolve by exact ISRC
+match on Deezer — i.e. the real studio recordings. A free account streams
+MP3_128 (more than enough for Discord voice).
 
 ---
 

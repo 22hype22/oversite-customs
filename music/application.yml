@@ -52,13 +52,25 @@ plugins:
     sources:
       spotify: true        # resolve Spotify links/search (metadata only)
       applemusic: true     # resolve Apple Music links (metadata only)
-      deezer: false        # OFF — stream decryption is a ToS/legal risk
+      # Deezer streams real audio and — unlike YouTube/SoundCloud — is not
+      # IP-reputation-blocked from datacenter hosts (auth is a login cookie).
+      # OFF until you supply credentials via env (see README): its stream
+      # decryption is a ToS gray area, so enabling it is a business decision.
+      deezer: ${DEEZER_ENABLED:false}
       yandexmusic: false
       youtube: false        # OFF — never mirror to YouTube
       soundcloud: false     # SoundCloud is handled by Lavalink core above
-    # Where a Spotify/Apple track's audio actually comes from: SoundCloud, by
-    # "Artist - Title" text search (SoundCloud has no ISRC index). No YouTube.
+    deezer:
+      arl: "${DEEZER_ARL:}"                        # deezer.com 'arl' cookie (burner account)
+      masterDecryptionKey: "${DEEZER_MASTER_KEY:}" # not distributed here — see README
+      formats: [ "MP3_128" ]                       # free-account tier; plenty for Discord voice
+    # Where a Spotify/Apple track's audio actually comes from, in order:
+    # Deezer by exact ISRC, then Deezer text search, then SoundCloud text search.
+    # With Deezer disabled the dz providers yield nothing and it falls through
+    # to SoundCloud automatically. No YouTube anywhere.
     providers:
+      - "dzisrc:%ISRC%"
+      - "dzsearch:%QUERY%"
       - "scsearch:%QUERY%"
     spotify:
       preferPartnerApi: true    # anonymous token path — no app clientId/secret needed

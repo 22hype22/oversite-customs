@@ -8975,7 +8975,10 @@ async def on_wavelink_node_ready(payload):
 # at startup to learn which search prefixes actually return tracks, then every
 # search cascades through the working ones in order. `/musicdebug` re-runs the
 # probe on demand so problems are diagnosable from inside Discord.
-_SOURCE_CANDIDATES = ["scsearch", "dzsearch", "ytmsearch", "ytsearch"]
+# Preference order (Aug 2026 reality): Deezer is the most reliable from
+# datacenter hosts; SoundCloud is spotty (edge blocks + an open HLS-404 bug);
+# YouTube only works on nodes whose operator actively maintains it.
+_SOURCE_CANDIDATES = ["dzsearch", "scsearch", "ytmsearch", "ytsearch"]
 _music_sources = []      # prefixes that returned results on this node, in order
 _probe_summary = "not run yet"
 _RADIO_TEST_URL = "https://ice1.somafm.com/groovesalad-128-mp3"
