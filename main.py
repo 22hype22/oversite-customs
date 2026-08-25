@@ -8074,8 +8074,10 @@ EMOJI_HEART = "🤍"
 EMOJI_HEART_RED = "❤️"
 EMOJI_SKIP = "⏭️"
 EMOJI_BACK = "⏮️"
-EMOJI_DJ_OFF = "🎧"
-EMOJI_DJ_ON = "🎧"
+# The DJ ("activate DJ") button shows the Oversite logo, not the mirrored
+# headphones emoji — same id the welcome message uses, so it always renders here.
+EMOJI_DJ_OFF = discord.PartialEmoji(name="oversite", id=WELCOME_EMOJI_ID)
+EMOJI_DJ_ON = discord.PartialEmoji(name="oversite", id=WELCOME_EMOJI_ID)
 EMOJI_PAUSE = "⏸️"
 EMOJI_PLAY = "▶️"
 MUSIC_X_LABEL = "ㅤㅤㅤㅤㅤㅤ    ㅤ  ㅤ     ㅤㅤ✕ㅤㅤㅤㅤㅤㅤ   ㅤ  ㅤ     ㅤㅤ"
@@ -8090,7 +8092,6 @@ _SRC_EMOJIS = {
     "music_heart_filled": 1505000754426024010,
     "music_skip": 1504992134371999924,
     "music_back": 1514072205103857778,
-    "dj": 1514737204482670662,
     "music_pause": 1504992315029065918,
     "music_play": 1504992503601041549,
 }
@@ -8146,8 +8147,7 @@ async def _ensure_app_emojis():
         EMOJI_HEART_RED = g("music_heart_filled", EMOJI_HEART_RED)
         EMOJI_SKIP = g("music_skip", EMOJI_SKIP)
         EMOJI_BACK = g("music_back", EMOJI_BACK)
-        EMOJI_DJ_OFF = g("dj", EMOJI_DJ_OFF)
-        EMOJI_DJ_ON = g("dj", EMOJI_DJ_ON)
+        # DJ button keeps the Oversite logo set above — not mirrored.
         EMOJI_PAUSE = g("music_pause", EMOJI_PAUSE)
         EMOJI_PLAY = g("music_play", EMOJI_PLAY)
         _emojis_ready = True
@@ -8444,7 +8444,7 @@ async def _progress_updater(guild_id: int):
             position = int(getattr(vc, "position", 0) or 0)
             artwork = _np_artwork.get(guild_id)
             try:
-                buf = _render_progress_image(position, track.length or 0)
+                buf = await asyncio.to_thread(_render_progress_image, position, track.length or 0)
                 if music_config.get("now_playing_v2"):
                     container = _build_npv2_container(track, artwork, position, with_image=buf is not None)
                     edit_payload = {"components": [container]}
@@ -8470,7 +8470,7 @@ async def _progress_updater(guild_id: int):
 
 
 async def send_now_playing_v2(guild, track, channel, artwork, position_ms: int = 0):
-    buf = _render_progress_image(position_ms, track.length or 0)
+    buf = await asyncio.to_thread(_render_progress_image, position_ms, track.length or 0)
     container = _build_npv2_container(track, artwork, position_ms, with_image=buf is not None)
     payload = {"flags": 32768, "components": [container]}
     route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
@@ -8610,7 +8610,7 @@ async def send_now_playing(guild, track, channel):
                     _pos0 = int(getattr(guild.voice_client, "position", 0) or 0)
             except Exception:
                 _pos0 = 0
-        _buf0 = _render_progress_image(_pos0, track.length or 0)
+        _buf0 = await asyncio.to_thread(_render_progress_image, _pos0, track.length or 0)
         embed = _build_np_embed(track, artwork, _pos0, with_image=_buf0 is not None)
 
         if guild.voice_client and guild.voice_client.channel:
