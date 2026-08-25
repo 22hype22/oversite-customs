@@ -8922,7 +8922,10 @@ async def setup_wavelink():
         await wavelink.Pool.connect(nodes=[node], client=bot, cache_capacity=100)
         music_available = True
         print(f"[Music] connecting to Lavalink at {LAVALINK_URI}")
-        if YOUTUBE_OAUTH_REFRESH_TOKEN:
+        # Only hand our private YouTube OAuth token to a node WE trust —
+        # never to a public/community node (its operator would receive it).
+        _trust_node = os.getenv("LAVALINK_TRUSTED", "true").lower() == "true"
+        if YOUTUBE_OAUTH_REFRESH_TOKEN and _trust_node:
             try:
                 _url = f"{LAVALINK_URI.rstrip('/')}/youtube"
                 async with aiohttp.ClientSession() as _s:
