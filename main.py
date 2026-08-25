@@ -492,6 +492,90 @@ roblox_config = {
     "button_style": "primary",
 }
 
+# Discord-role -> Roblox-group-rank sync. Owner maps role sets to rank numbers in
+# the dashboard ("Roblox Group Sync" block); the actual rank change runs in the
+# roblox-group-rank edge function (which holds ROBLOX_COOKIE), never here.
+group_sync_config = {
+    "enabled": False,
+    "group_id": "",
+    "tiers": [],  # [{"rank": int, "role_ids": {str, ...}}], sorted HIGHEST rank first
+}
+
+
+def _parse_group_sync_tiers(cfg):
+    """Read flat tierN_roles / tierN_rank keys into tiers sorted highest-first."""
+    tiers = []
+    for i in range(1, 26):
+        roles = cfg.get(f"tier{i}_roles")
+        rank = cfg.get(f"tier{i}_rank")
+        if not isinstance(roles, list) or not roles:
+            continue
+        try:
+            rank = int(rank)
+        except (TypeError, ValueError):
+            continue
+        tiers.append({"rank": rank, "role_ids": {str(r) for r in roles if r}})
+    tiers.sort(key=lambda t: t["rank"], reverse=True)
+    return tiers
+
+
+def _desired_group_rank(member):
+    """The rank number a member should hold: the highest tier whose role set the
+    member has ANY of. None means no mapped role -> leave their rank alone."""
+    have = {str(r.id) for r in member.roles}
+    for tier in group_sync_config["tiers"]:
+        if have & tier["role_ids"]:
+            return tier["rank"]
+    return None
+
+
+async def _group_sync_call(action, payload):
+    """Call the roblox-group-rank edge function (which holds ROBLOX_COOKIE)."""
+    try:
+        session = await get_poll_session()
+        async with session.post(
+            f"{SUPABASE_FN_URL}/roblox-group-rank",
+            headers=_fn_headers(),
+            json={"action": action, "bot_id": BOT_ORDER_ID,
+                  "group_id": group_sync_config["group_id"], **payload},
+        ) as r:
+            data = await r.json()
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[GroupSync] {action} call failed: {e}")
+        return {"error": str(e)[:150]}
+
+
+_group_sync_pending = {}  # member_id -> asyncio.Task (debounce rapid role edits)
+
+
+async def _group_sync_member_later(member):
+    try:
+        await asyncio.sleep(3)
+        rank = _desired_group_rank(member)
+        if rank is None:
+            return
+        res = await _group_sync_call("set", {"discord_user_id": str(member.id), "rank_number": rank})
+        if res.get("changed"):
+            print(f"[GroupSync] {member.id} -> rank {rank} (was {res.get('from')})")
+        elif res.get("error"):
+            print(f"[GroupSync] {member.id} set error: {res.get('error')}")
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"[GroupSync] member sync error: {e}")
+    finally:
+        _group_sync_pending.pop(member.id, None)
+
+
+def _schedule_group_sync(member):
+    if not (group_sync_config["enabled"] and group_sync_config["group_id"] and group_sync_config["tiers"]):
+        return
+    old = _group_sync_pending.get(member.id)
+    if old and not old.done():
+        old.cancel()
+    _group_sync_pending[member.id] = asyncio.create_task(_group_sync_member_later(member))
+
 
 def success_embed(title, description=None):
     return discord.Embed(title=title, description=description, color=0x57F287)
@@ -3499,6 +3583,8 @@ async def on_member_update(before, after):
     try:
         if before.roles == after.roles:
             return
+        # Roblox group-rank sync: any role change may change the mapped rank.
+        _schedule_group_sync(after)
         bset, aset = set(before.roles), set(after.roles)
         inf_ids = _rolelog_watched_ids("infraction")
         pro_ids = _rolelog_watched_ids("promotion")
@@ -3621,6 +3707,60 @@ async def promotionroles_cmd(interaction: discord.Interaction, min: int = 0):
     await interaction.response.send_message(
         embed=info_embed("Promotion roles", "Pick the roles to watch, adding them (that many, within a few seconds) auto-logs a promotion."),
         view=_RoleWatchView("promotion", min), ephemeral=True)
+
+
+@bot.tree.command(name="grouproleupdate", description="Sync everyone's Roblox group rank to their Discord roles (admin)")
+async def grouproleupdate_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(embed=error_embed("Admins only", "You need Manage Server."), ephemeral=True)
+        return
+    if not (group_sync_config["enabled"] and group_sync_config["group_id"] and group_sync_config["tiers"]):
+        await interaction.response.send_message(
+            embed=error_embed("Not set up", "Roblox Group Sync isn't configured yet. In the dashboard, open **Roblox Group Sync**, set the group ID, and map at least one role to a rank number."),
+            ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    # Build the desired rank for every member who holds a mapped role.
+    desired = []
+    for member in interaction.guild.members:
+        if member.bot:
+            continue
+        rank = _desired_group_rank(member)
+        if rank is not None:
+            desired.append({"discord_user_id": str(member.id), "rank_number": rank})
+    if not desired:
+        await interaction.followup.send(
+            embed=info_embed("Nobody to sync", "No members currently hold a role that's mapped to a Roblox rank."),
+            ephemeral=True)
+        return
+    # Send in batches so one call never runs too long against Roblox.
+    totals = {"changed": 0, "unchanged": 0, "skipped": 0, "failed": 0}
+    sample_errors = []
+    for i in range(0, len(desired), 40):
+        res = await _group_sync_call("sync", {"desired": desired[i:i + 40]})
+        if res.get("error"):
+            await interaction.followup.send(
+                embed=error_embed("Sync failed", f"Roblox call failed: {res['error']}"),
+                ephemeral=True)
+            return
+        for k in totals:
+            totals[k] += int(res.get(k) or 0)
+        for d in (res.get("details") or []):
+            if d.get("error") and len(sample_errors) < 3:
+                sample_errors.append(str(d["error"])[:120])
+    lines = [
+        f"**Checked:** {len(desired)} member(s) with a mapped role",
+        f"**Updated:** {totals['changed']}",
+        f"**Already correct:** {totals['unchanged']}",
+        f"**Skipped:** {totals['skipped']} (not verified / not in the group / rank not found)",
+    ]
+    if totals["failed"]:
+        lines.append(f"**Failed:** {totals['failed']}")
+        if sample_errors:
+            lines.append("\n" + "\n".join(f"• {e}" for e in sample_errors))
+    embed = success_embed("Group ranks synced", "\n".join(lines)) if not totals["failed"] \
+        else error_embed("Group ranks synced (with errors)", "\n".join(lines))
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ===================== Pricing =====================
@@ -6143,6 +6283,15 @@ async def apply_config(feature, cfg, post_panel=False):
         if post_panel:
             await post_verify_panel()
 
+    elif feature in ("roblox-group-sync", "customs-roblox-group-sync"):
+        group_sync_config["group_id"] = str(cfg.get("group_id") or "").strip()
+        group_sync_config["tiers"] = _parse_group_sync_tiers(cfg)
+        group_sync_config["enabled"] = bool(cfg.get("enabled", True)) and bool(
+            group_sync_config["group_id"]) and bool(group_sync_config["tiers"])
+        print(f"[Config] roblox-group-sync — group {group_sync_config['group_id']} "
+              f"tiers {[(t['rank'], sorted(t['role_ids'])) for t in group_sync_config['tiers']]} "
+              f"enabled {group_sync_config['enabled']}")
+
 
 def _is_tracked_giveaway_message(mid):
     """True if a message id belongs to a giveaway this process is tracking, so no
@@ -7225,7 +7374,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
