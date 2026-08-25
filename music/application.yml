@@ -22,6 +22,13 @@ lavalink:
     - dependency: "com.github.topi314.lavasrc:lavasrc-plugin:4.8.3"
       repository: "https://maven.lavalink.dev/releases"
       snapshot: false
+    # youtube-source ships installed but DISABLED (plugins.youtube.enabled below).
+    # As of Aug 2026 YouTube from datacenter IPs is "fixable but fragile" even on
+    # the newest plugin (open issue #226) — enable only as an experiment via
+    # YOUTUBE_ENABLED=true, ideally with a burner-account OAuth token.
+    - dependency: "dev.lavalink.youtube:youtube-plugin:1.18.2"
+      repository: "https://maven.lavalink.dev/releases"
+      snapshot: false
   server:
     password: ${LAVALINK_SERVER_PASSWORD:changeme}
     sources:
@@ -48,6 +55,24 @@ lavalink:
     soundcloudSearchEnabled: true
 
 plugins:
+  # Optional YouTube (OFF by default). The researched Aug-2026 recipe: modern
+  # client list (ANDROID_VR/MUSIC lead; no bare TVHTML5 — that's the client with
+  # the open "page needs to be reloaded" bot-check), burner-account OAuth, and
+  # remote cipher so YouTube's cipher churn can't break us between releases.
+  youtube:
+    enabled: ${YOUTUBE_ENABLED:false}
+    clients:
+      - MUSIC
+      - ANDROID_VR
+      - TV
+      - TVHTML5_SIMPLY
+      - WEB
+      - WEBEMBEDDED
+    oauth:
+      enabled: ${YOUTUBE_OAUTH_ENABLED:false}
+      refreshToken: "${YOUTUBE_OAUTH_REFRESH_TOKEN:}"
+    remoteCipher:
+      url: "${YOUTUBE_REMOTE_CIPHER_URL:https://cipher.kikkia.dev}"
   lavasrc:
     sources:
       spotify: true        # resolve Spotify links/search (metadata only)
