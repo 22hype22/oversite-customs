@@ -9479,12 +9479,13 @@ async def _snapshot_music_state():
 _music_state_idle = False  # True once we've written the "nothing playing" state
 
 
-@tasks.loop(seconds=15)
+@tasks.loop(seconds=45)
 async def persist_music_state():
     """Save live playback so a redeploy can resume it. Skips until the boot-time
     restore has run, so it never overwrites the snapshot with an empty state.
     While playing it writes every tick (to keep the position fresh); when idle it
-    writes the empty state just once, not on a loop."""
+    writes the empty state just once, not on a loop. Kept infrequent so it doesn't
+    add write/vacuum churn to the shared database."""
     global _music_state_idle
     if not _music_state_ready:
         return
