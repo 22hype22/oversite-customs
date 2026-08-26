@@ -918,8 +918,30 @@ _invite_uses_cache = {}     # guild_id -> {invite_code: uses}
 invite_tracker = {}         # guild_id(str) -> {"invited_by":{}, "left":{}, "fake":{}, "bonus":{}}
 # Owner settings from the dashboard "Invite Tracker" block (separate bot_config
 # feature from the tracker data below, so they never clobber each other).
-invite_tracker_config = {"enabled": True, "fake_age_days": 7, "leaderboard_channel_id": "", "board_ref": None}
+invite_tracker_config = {"enabled": True, "log_channel_id": "", "join_message": "", "leaderboard_channel_id": "", "board_ref": None}
 _invite_save_pending = None
+
+# Default log message when a tracked member joins. Tokens are substituted below.
+DEFAULT_INVITE_JOIN_MESSAGE = (
+    "📥 {user} joined — invited by {inviter}, who now has **{invites}** invites. "
+    "We're now **{member_count}** members!"
+)
+
+
+def _is_risky_join(member):
+    """Risk signals evaluated at the MOMENT of join to flag likely alt/fake accounts.
+    Not a 'days since joined the server' count — this looks at the account itself:
+    a brand-new account (created recently) is the primary alt signal, and a
+    still-default avatar on a young account is a secondary one."""
+    try:
+        age = discord.utils.utcnow() - member.created_at
+    except Exception:
+        return False
+    if age.days < 30:
+        return True
+    if getattr(member, "avatar", None) is None and age.days < 90:
+        return True
+    return False
 
 
 def _inv_data(guild_id):
@@ -976,12 +998,16 @@ async def _attribute_join(member):
     data["invited_by"].pop(mid, None)
     data["left"].pop(mid, None)
     data["fake"].pop(mid, None)
-    age_days = (discord.utils.utcnow() - member.created_at).days
-    if age_days < int(invite_tracker_config.get("fake_age_days") or 7):
+    risky = _is_risky_join(member)
+    if risky:
         data["fake"][mid] = inviter_id
     else:
         data["invited_by"][mid] = inviter_id
     _save_invite_tracker_soon()
+    try:
+        await post_invite_join_log(member, inviter_id, fake=risky)
+    except Exception as e:
+        print(f"[InviteTracker] join log failed: {e}")
 
 
 def _mark_left(member):
@@ -1025,6 +1051,57 @@ def _render_invite_list(guild, page=0, per_page=10):
         s = "invite" if score == 1 else "invites"
         lines.append(f"`{idx}.` <@{iid}> · **{score}** {s}. ({regular} regular, {left} left, {fake} fake, {bonus} bonus)")
     return "\n".join(lines), pages
+
+
+def _inviter_score(guild, inviter_id):
+    for iid, score, regular, left, fake, bonus in _invite_scoreboard(guild):
+        if iid == str(inviter_id):
+            return score
+    return 0
+
+
+def _sub_invite_join_tokens(text, member, inviter, count):
+    guild = member.guild
+    repl = {
+        "{user}": member.mention,
+        "{user_name}": member.display_name,
+        "{user_tag}": str(member),
+        "{inviter}": inviter.mention if inviter else "someone",
+        "{inviter_name}": inviter.display_name if inviter else "someone",
+        "{invites}": str(count),
+        "{server}": guild.name,
+        "{member_count}": str(guild.member_count),
+    }
+    for k, v in repl.items():
+        text = text.replace(k, v).replace(k.replace("_", " "), v)
+    return text
+
+
+async def post_invite_join_log(member, inviter_id, fake=False):
+    """Post the configured join message to the invite log channel with attribution."""
+    if not invite_tracker_config.get("enabled"):
+        return
+    ch_id = str(invite_tracker_config.get("log_channel_id") or "")
+    if not ch_id or not ch_id.isdigit():
+        return
+    channel = member.guild.get_channel(int(ch_id))
+    if channel is None:
+        return
+    inviter = None
+    if inviter_id and str(inviter_id).isdigit():
+        inviter = member.guild.get_member(int(inviter_id))
+    count = _inviter_score(member.guild, inviter_id)
+    template = invite_tracker_config.get("join_message") or DEFAULT_INVITE_JOIN_MESSAGE
+    text = _sub_invite_join_tokens(template, member, inviter, count)
+    if fake:
+        text += "\n-# ⚠️ Flagged as a possible alt (new / low-trust account) — not counted."
+    try:
+        await channel.send(
+            text,
+            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+        )
+    except Exception as e:
+        print(f"[InviteTracker] send join log failed: {e}")
 
 
 def _save_invite_tracker_soon():
@@ -6622,13 +6699,11 @@ async def apply_config(feature, cfg, post_panel=False):
             await post_saved_messages(only_channel_id=edited or None)
     elif feature in ("invite-tracker",):
         invite_tracker_config["enabled"] = bool(cfg.get("enabled", True))
-        try:
-            invite_tracker_config["fake_age_days"] = max(0, int(cfg.get("fake_age_days") or 7))
-        except Exception:
-            invite_tracker_config["fake_age_days"] = 7
+        invite_tracker_config["log_channel_id"] = str(cfg.get("log_channel_id") or "")
+        invite_tracker_config["join_message"] = str(cfg.get("join_message") or "")
         invite_tracker_config["leaderboard_channel_id"] = str(cfg.get("leaderboard_channel_id") or "")
         print(f"[Config] invite-tracker — enabled {invite_tracker_config['enabled']} "
-              f"fake_age {invite_tracker_config['fake_age_days']}d "
+              f"log {invite_tracker_config['log_channel_id'] or '(none)'} "
               f"board {invite_tracker_config['leaderboard_channel_id'] or '(none)'}")
         if post_panel and invite_tracker_config["leaderboard_channel_id"]:
             await post_invite_leaderboard()
