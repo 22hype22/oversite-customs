@@ -974,6 +974,33 @@ def _resolve_channel_mentions(text, guild):
     return _CHANNEL_TOKEN_RE.sub(repl, text)
 
 
+# A masked link whose target is a channel: [label](<#channel-name>), [label](#name)
+# or [label](<#123>). Discord masked links (in embeds / V2 text) need a real URL,
+# not a <#id> mention — so we swap the target for the channel's jump URL. This
+# must run BEFORE _resolve_channel_mentions, which would otherwise turn the inner
+# #name into <#id> and break the link.
+_CHANNEL_LINK_RE = re.compile(r"\]\(\s*<?#([a-zA-Z0-9_\-]+)>?\s*\)")
+
+
+def _resolve_channel_links(text, guild):
+    if not text or "](" not in text or not guild:
+        return text
+    by_name = {}
+    for ch in getattr(guild, "channels", []) or []:
+        nm = (getattr(ch, "name", "") or "").lower()
+        if nm:
+            by_name.setdefault(nm, ch.id)
+
+    def repl(m):
+        key = m.group(1)
+        cid = by_name.get(key.lower()) or (key if key.isdigit() else None)
+        if not cid:
+            return m.group(0)
+        return f"](https://discord.com/channels/{guild.id}/{cid})"
+
+    return _CHANNEL_LINK_RE.sub(repl, text)
+
+
 def _sub_placeholders(text, member):
     if not isinstance(text, str):
         return text
@@ -1002,7 +1029,7 @@ def _sub_placeholders(text, member):
     }
     for token, value in repl.items():
         text = text.replace(token, value)
-    return _resolve_emoji_shortcodes(_resolve_channel_mentions(_resolve_role_mentions(text, member.guild), member.guild), member.guild)
+    return _resolve_emoji_shortcodes(_resolve_channel_mentions(_resolve_channel_links(_resolve_role_mentions(text, member.guild), member.guild), member.guild), member.guild)
 
 
 def _render_guild_text(text, guild):
@@ -1034,7 +1061,7 @@ def _render_guild_text(text, guild):
             text = text.replace(token, value)
         # Custom per-service status tokens ({liveries}, {liveriesstatus}, …).
         text = _render_order_tokens(text, guild)
-    return _resolve_emoji_shortcodes(_resolve_channel_mentions(_resolve_role_mentions(text, guild), guild), guild)
+    return _resolve_emoji_shortcodes(_resolve_channel_mentions(_resolve_channel_links(_resolve_role_mentions(text, guild), guild), guild), guild)
 
 
 _INVITE_TEXT_KEYS = {"text", "content", "label", "placeholder", "title", "description", "name", "value"}
