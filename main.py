@@ -793,6 +793,8 @@ async def on_ready():
         daily_group_sync.start()
     if not persist_music_state.is_running():
         persist_music_state.start()
+    if not refresh_invite_leaderboard.is_running():
+        refresh_invite_leaderboard.start()
     await refresh_status()
 
     try:
@@ -914,7 +916,9 @@ async def on_guild_remove(guild):
 # Surfaced by /leaderboard invites and the {invite list} message token.
 _invite_uses_cache = {}     # guild_id -> {invite_code: uses}
 invite_tracker = {}         # guild_id(str) -> {"invited_by":{}, "left":{}, "fake":{}, "bonus":{}}
-_INVITE_FAKE_AGE_DAYS = 7   # accounts younger than this at join count as "fake"
+# Owner settings from the dashboard "Invite Tracker" block (separate bot_config
+# feature from the tracker data below, so they never clobber each other).
+invite_tracker_config = {"enabled": True, "fake_age_days": 7, "leaderboard_channel_id": "", "board_ref": None}
 _invite_save_pending = None
 
 
@@ -973,7 +977,7 @@ async def _attribute_join(member):
     data["left"].pop(mid, None)
     data["fake"].pop(mid, None)
     age_days = (discord.utils.utcnow() - member.created_at).days
-    if age_days < _INVITE_FAKE_AGE_DAYS:
+    if age_days < int(invite_tracker_config.get("fake_age_days") or 7):
         data["fake"][mid] = inviter_id
     else:
         data["invited_by"][mid] = inviter_id
@@ -1032,11 +1036,11 @@ def _save_invite_tracker_soon():
 
 async def _save_invite_tracker():
     await asyncio.sleep(5)  # debounce a burst of joins/leaves
-    await _bot_config_upsert("invite-tracker", {"guilds": invite_tracker})
+    await _bot_config_upsert("invite-tracker-data", {"guilds": invite_tracker})
 
 
 async def _load_invite_tracker():
-    cfg = await _bot_config_get("invite-tracker")
+    cfg = await _bot_config_get("invite-tracker-data")
     guilds = (cfg or {}).get("guilds")
     if isinstance(guilds, dict):
         for gid, d in guilds.items():
@@ -1133,6 +1137,51 @@ async def invitebonus_cmd(interaction: discord.Interaction, user: discord.Member
 
 
 bot.tree.add_command(leaderboard_group)
+
+
+async def post_invite_leaderboard():
+    """Post or refresh the standing invites leaderboard in the configured channel."""
+    if not invite_tracker_config.get("enabled"):
+        return
+    ch_id = str(invite_tracker_config.get("leaderboard_channel_id") or "")
+    if not ch_id:
+        return
+    channel = bot.get_channel(int(ch_id)) if ch_id.isdigit() else None
+    if channel is None:
+        return
+    guild = channel.guild
+    text, pages = _render_invite_list(guild, 0)
+    embed = discord.Embed(title="Invites Leaderboard", description=text, color=ACCENT)
+    embed.set_footer(text=f"Invite Tracker · Page 1/{pages}")
+    ref = invite_tracker_config.get("board_ref")
+    msg = None
+    if isinstance(ref, dict) and str(ref.get("channel_id")) == ch_id and ref.get("message_id"):
+        try:
+            msg = await channel.fetch_message(int(ref["message_id"]))
+        except Exception:
+            msg = None
+    try:
+        if msg is not None:
+            await msg.edit(embed=embed)
+        else:
+            msg = await channel.send(embed=embed)
+            invite_tracker_config["board_ref"] = {"channel_id": ch_id, "message_id": str(msg.id)}
+    except Exception as e:
+        print(f"[InviteTracker] post_invite_leaderboard failed: {e}")
+
+
+@tasks.loop(minutes=10)
+async def refresh_invite_leaderboard():
+    if invite_tracker_config.get("enabled") and invite_tracker_config.get("leaderboard_channel_id"):
+        try:
+            await post_invite_leaderboard()
+        except Exception as e:
+            print(f"[InviteTracker] refresh loop error: {e}")
+
+
+@refresh_invite_leaderboard.before_loop
+async def _before_refresh_invite_leaderboard():
+    await bot.wait_until_ready()
 
 
 @bot.event
@@ -6571,6 +6620,18 @@ async def apply_config(feature, cfg, post_panel=False):
         # Only (re)post on a deliberate save, never on boot — like ticket panels.
         if post_panel:
             await post_saved_messages(only_channel_id=edited or None)
+    elif feature in ("invite-tracker",):
+        invite_tracker_config["enabled"] = bool(cfg.get("enabled", True))
+        try:
+            invite_tracker_config["fake_age_days"] = max(0, int(cfg.get("fake_age_days") or 7))
+        except Exception:
+            invite_tracker_config["fake_age_days"] = 7
+        invite_tracker_config["leaderboard_channel_id"] = str(cfg.get("leaderboard_channel_id") or "")
+        print(f"[Config] invite-tracker — enabled {invite_tracker_config['enabled']} "
+              f"fake_age {invite_tracker_config['fake_age_days']}d "
+              f"board {invite_tracker_config['leaderboard_channel_id'] or '(none)'}")
+        if post_panel and invite_tracker_config["leaderboard_channel_id"]:
+            await post_invite_leaderboard()
     elif feature in ("music-addon", "customs-music-addon"):
         music_config["enabled"] = True
         music_config["dj_role_ids"] = [str(x) for x in (cfg.get("dj_role_ids") or []) if x]
@@ -7866,7 +7927,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "invite-tracker"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
