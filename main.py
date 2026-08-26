@@ -763,6 +763,11 @@ async def on_ready():
     except Exception as e:
         print(f"[Startup] config load failed: {e}")
 
+    try:
+        await seed_secret_slots()
+    except Exception as e:
+        print(f"[Startup] secret-slot seed failed: {e}")
+
     # Restore every saved giveaway (entrants + timers) so redeploys never drop them.
     try:
         await _gw_restore_all()
@@ -7576,6 +7581,28 @@ async def mark_config_applied(feature):
         )
     except Exception as e:
         print(f"[Config] mark applied {feature} failed: {e}")
+
+
+async def seed_secret_slots():
+    """Register this bot's credential slots so the dashboard's 'API keys &
+    credentials' card shows them. Worker-token authed; ON CONFLICT DO NOTHING,
+    so it's safe to run every boot. Currently: the group's Roblox cookie."""
+    if not WORKER_TOKEN:
+        return
+    slots = [{
+        "addon_id": "customs",
+        "key": "ROBLOX_COOKIE",
+        "label": "Roblox account cookie",
+        "description": ("The .ROBLOSECURITY cookie of your group's Roblox bot account. Powers "
+                        "payments, gamepasses, the Robux Locker, and Roblox group-rank sync. "
+                        "Encrypted, and only ever read by your bot — never shown back. Use a "
+                        "dedicated account."),
+        "placeholder": "_|WARNING:-DO-NOT-SHARE...  (paste the full .ROBLOSECURITY value)",
+        "required": False,
+        "sort_order": 0,
+    }]
+    res = await runtime_rpc("runtime_seed_secret_slots", {"_token": WORKER_TOKEN, "_slots": slots})
+    print(f"[Startup] secret slots seeded: {bool(res)}")
 
 
 async def load_all_configs():
