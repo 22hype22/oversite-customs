@@ -918,7 +918,7 @@ _invite_uses_cache = {}     # guild_id -> {invite_code: uses}
 invite_tracker = {}         # guild_id(str) -> {"invited_by":{}, "left":{}, "fake":{}, "bonus":{}}
 # Owner settings from the dashboard "Invite Tracker" block (separate bot_config
 # feature from the tracker data below, so they never clobber each other).
-invite_tracker_config = {"enabled": True, "log_channel_id": "", "join_message": "", "leaderboard_channel_id": "", "board_ref": None}
+invite_tracker_config = {"enabled": True, "log_channel_id": "", "join_components": [], "leaderboard_channel_id": "", "board_ref": None}
 _invite_save_pending = None
 
 # Default log message when a tracked member joins. Tokens are substituted below.
@@ -1060,25 +1060,48 @@ def _inviter_score(guild, inviter_id):
     return 0
 
 
-def _sub_invite_join_tokens(text, member, inviter, count):
-    guild = member.guild
-    repl = {
+def _invite_join_token_map(member, inviter, count):
+    return {
         "{user}": member.mention,
         "{user_name}": member.display_name,
+        "{user name}": member.display_name,
         "{user_tag}": str(member),
         "{inviter}": inviter.mention if inviter else "someone",
         "{inviter_name}": inviter.display_name if inviter else "someone",
+        "{inviter name}": inviter.display_name if inviter else "someone",
         "{invites}": str(count),
-        "{server}": guild.name,
-        "{member_count}": str(guild.member_count),
     }
-    for k, v in repl.items():
-        text = text.replace(k, v).replace(k.replace("_", " "), v)
+
+
+def _sub_invite_join_tokens(text, member, inviter, count):
+    for k, v in _invite_join_token_map(member, inviter, count).items():
+        text = text.replace(k, v)
     return text
 
 
+def _sub_invite_tokens_tree(items, member, inviter, count):
+    """Deep-substitute the member/inviter-specific tokens in a V2 components tree.
+    Guild-level tokens ({server}, {member_count}, {invite list}, mentions, emoji)
+    are left for _render_guild_text to resolve at send time."""
+    repl = _invite_join_token_map(member, inviter, count)
+
+    def _walk(node):
+        if isinstance(node, dict):
+            return {k: _walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [_walk(x) for x in node]
+        if isinstance(node, str):
+            for k, v in repl.items():
+                node = node.replace(k, v)
+            return node
+        return node
+
+    return [_walk(c) for c in items]
+
+
 async def post_invite_join_log(member, inviter_id, fake=False):
-    """Post the configured join message to the invite log channel with attribution."""
+    """Post the configured join message (a V2 message builder design) to the
+    invite log channel, with attribution tokens filled in."""
     if not invite_tracker_config.get("enabled"):
         return
     ch_id = str(invite_tracker_config.get("log_channel_id") or "")
@@ -1091,15 +1114,25 @@ async def post_invite_join_log(member, inviter_id, fake=False):
     if inviter_id and str(inviter_id).isdigit():
         inviter = member.guild.get_member(int(inviter_id))
     count = _inviter_score(member.guild, inviter_id)
-    template = invite_tracker_config.get("join_message") or DEFAULT_INVITE_JOIN_MESSAGE
-    text = _sub_invite_join_tokens(template, member, inviter, count)
+    fake_note = {"type": "text", "text": "-# ⚠️ Flagged as a possible alt (new / low-trust account) — not counted."}
+    mentions = discord.AllowedMentions(users=True, roles=False, everyone=False)
+    comps = invite_tracker_config.get("join_components") or []
+    if comps:
+        tree = _sub_invite_tokens_tree(comps, member, inviter, count)
+        if fake:
+            tree = tree + [fake_note]
+        try:
+            await send_v2_message(channel, tree, allowed_mentions=mentions)
+        except Exception as e:
+            print(f"[InviteTracker] send join log failed: {e}")
+        return
+    # No custom design — fall back to the default one-line message.
+    text = _sub_invite_join_tokens(DEFAULT_INVITE_JOIN_MESSAGE, member, inviter, count)
+    text = _render_guild_text(text, member.guild)
     if fake:
-        text += "\n-# ⚠️ Flagged as a possible alt (new / low-trust account) — not counted."
+        text += "\n" + fake_note["text"]
     try:
-        await channel.send(
-            text,
-            allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
-        )
+        await channel.send(text, allowed_mentions=mentions)
     except Exception as e:
         print(f"[InviteTracker] send join log failed: {e}")
 
@@ -6700,10 +6733,13 @@ async def apply_config(feature, cfg, post_panel=False):
     elif feature in ("invite-tracker",):
         invite_tracker_config["enabled"] = bool(cfg.get("enabled", True))
         invite_tracker_config["log_channel_id"] = str(cfg.get("log_channel_id") or "")
-        invite_tracker_config["join_message"] = str(cfg.get("join_message") or "")
+        comps = cfg.get("join_components")
+        invite_tracker_config["join_components"] = comps if isinstance(comps, list) else []
+        _register_eph_from_tree(invite_tracker_config["join_components"])
         invite_tracker_config["leaderboard_channel_id"] = str(cfg.get("leaderboard_channel_id") or "")
         print(f"[Config] invite-tracker — enabled {invite_tracker_config['enabled']} "
               f"log {invite_tracker_config['log_channel_id'] or '(none)'} "
+              f"design {len(invite_tracker_config['join_components'])} "
               f"board {invite_tracker_config['leaderboard_channel_id'] or '(none)'}")
         if post_panel and invite_tracker_config["leaderboard_channel_id"]:
             await post_invite_leaderboard()
