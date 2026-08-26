@@ -779,6 +779,8 @@ async def on_ready():
         poll_stripe_sales.start()
     if not daily_group_sync.is_running():
         daily_group_sync.start()
+    if not persist_music_state.is_running():
+        persist_music_state.start()
     await refresh_status()
 
     try:
@@ -8424,6 +8426,12 @@ _np_artwork = {}
 _progress_tasks = {}
 _np_swept_channels = set()
 _resume_card_pos = {}
+# Resume-after-redeploy: snapshot live playback to bot_config every few seconds
+# and restore it when the node comes back, so a redeploy rejoins, re-posts the
+# card, and picks up mid-song. _music_state_ready gates persistence so the empty
+# boot state can't clobber the snapshot before it's restored.
+_music_state_ready = False
+_music_restore_done = False
 
 # Portable unicode button icons (this is a different Discord app than Utilities).
 EMOJI_HEART = "🤍"
@@ -9323,6 +9331,10 @@ async def on_wavelink_node_ready(payload):
     except Exception:
         pass
     asyncio.create_task(_probe_music_sources())
+    global _music_restore_done
+    if not _music_restore_done:
+        _music_restore_done = True
+        asyncio.create_task(_restore_music_state())
 
 
 # ---- Source probe + cascade ----
@@ -9409,6 +9421,149 @@ def _track_source_prefix(track) -> str:
     if "youtube" in u or "youtu.be" in u:
         return "ytsearch"
     return ""
+
+
+# ---- Resume after redeploy ----------------------------------------------------
+async def _resolve_one_track(uri):
+    """Re-resolve a saved track URI back to a playable, best-effort."""
+    try:
+        res, _ = await search_any(uri)
+    except Exception:
+        return None
+    if not res:
+        return None
+    if isinstance(res, wavelink.Playlist):
+        return res.tracks[0] if res.tracks else None
+    if isinstance(res, list):
+        return res[0] if res else None
+    return res
+
+
+async def _snapshot_music_state():
+    """Current playback for every guild that's actually playing, as plain JSON."""
+    guilds = {}
+    for guild in bot.guilds:
+        vc = guild.voice_client
+        if not vc or not getattr(vc, "channel", None) or not getattr(vc, "current", None):
+            continue
+        track = vc.current
+        if _is_dj_clip(track):
+            continue  # don't resume mid-DJ-voice-clip
+        uri = getattr(track, "uri", None) or getattr(track, "identifier", None)
+        if not uri:
+            continue
+        queue = []
+        try:
+            for t in list(vc.queue)[:20]:
+                tu = getattr(t, "uri", None) or getattr(t, "identifier", None)
+                if tu:
+                    queue.append(tu)
+        except Exception:
+            pass
+        session = auto_music_sessions.get(guild.id) or {}
+        guilds[str(guild.id)] = {
+            "voice_channel_id": str(vc.channel.id),
+            "text_channel_id": str(play_channels.get(guild.id) or ""),
+            "track_uri": uri,
+            "track_title": getattr(track, "title", "") or "",
+            "position_ms": int(getattr(vc, "position", 0) or 0),
+            "paused": bool(getattr(vc, "paused", False)),
+            "volume": int(getattr(vc, "volume", 50) or 50),
+            "queue": queue,
+            "genre": session.get("genre") if session else None,
+            "dj_mode": guild.id in _dj_mode,
+        }
+    return guilds
+
+
+_music_state_idle = False  # True once we've written the "nothing playing" state
+
+
+@tasks.loop(seconds=15)
+async def persist_music_state():
+    """Save live playback so a redeploy can resume it. Skips until the boot-time
+    restore has run, so it never overwrites the snapshot with an empty state.
+    While playing it writes every tick (to keep the position fresh); when idle it
+    writes the empty state just once, not on a loop."""
+    global _music_state_idle
+    if not _music_state_ready:
+        return
+    try:
+        state = await _snapshot_music_state()
+        if not state:
+            if _music_state_idle:
+                return
+            _music_state_idle = True
+        else:
+            _music_state_idle = False
+        await _bot_config_upsert("runtime-music-state", {"guilds": state})
+    except Exception as e:
+        print(f"[Music] persist state error: {e}")
+
+
+async def _resume_one_guild(gid, st):
+    guild = bot.get_guild(gid)
+    if not guild:
+        return
+    vch = guild.get_channel(int(st.get("voice_channel_id") or 0))
+    if not isinstance(vch, (discord.VoiceChannel, discord.StageChannel)):
+        return
+    track = await _resolve_one_track(st.get("track_uri"))
+    if not track:
+        print(f"[Music] resume: couldn't re-resolve '{st.get('track_title','?')}' in {gid}")
+        return
+    vc = guild.voice_client
+    if not vc:
+        vc = await vch.connect(cls=wavelink.Player)
+    tch_id = st.get("text_channel_id")
+    if tch_id:
+        try:
+            play_channels[gid] = int(tch_id)
+        except Exception:
+            pass
+    # Tell the Now Playing card to render from the resumed position.
+    _resume_card_pos[gid] = int(st.get("position_ms") or 0)
+    try:
+        await vc.set_volume(int(st.get("volume") or 50))
+    except Exception:
+        pass
+    if st.get("genre"):
+        auto_music_sessions[gid] = {"genre": st["genre"]}
+    if st.get("dj_mode"):
+        _dj_mode.add(gid)
+    # Restore the queue (best-effort) before playing so /skip has somewhere to go.
+    for qu in (st.get("queue") or [])[:20]:
+        qt = await _resolve_one_track(qu)
+        if qt:
+            try:
+                await vc.queue.put_wait(qt)
+            except Exception:
+                pass
+    await vc.play(track, start=int(st.get("position_ms") or 0))
+    if st.get("paused"):
+        try:
+            await vc.pause(True)
+        except Exception:
+            pass
+    print(f"[Music] resumed '{st.get('track_title','?')}' in guild {gid} @ {st.get('position_ms')}ms")
+
+
+async def _restore_music_state():
+    """On boot (node ready), rejoin and resume whatever was playing before."""
+    global _music_state_ready
+    try:
+        await asyncio.sleep(4)  # let guild/channel cache + voice settle
+        cfg = await _bot_config_get("runtime-music-state")
+        guilds = (cfg or {}).get("guilds") or {}
+        for gid, st in guilds.items():
+            try:
+                await _resume_one_guild(int(gid), st)
+            except Exception as e:
+                print(f"[Music] resume guild {gid} failed: {e}")
+    except Exception as e:
+        print(f"[Music] restore error: {e}")
+    finally:
+        _music_state_ready = True  # persistence may begin now
 
 
 @bot.tree.command(name="musicdebug", description="Test which music sources work right now (admin)")
