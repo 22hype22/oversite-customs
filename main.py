@@ -9211,7 +9211,7 @@ async def _dj_start_set(guild, first_activation: bool = False):
         clip = await _dj_make_clip(line)
         if clip:
             import wavelink as _wl
-            clips = await _wl.Playable.search(clip)
+            clips = await _wl.Playable.search(clip, source=None)
             if clips:
                 try:
                     vc.queue.clear()
@@ -9350,7 +9350,7 @@ async def _probe_music_sources():
     working = []
     for prefix in _SOURCE_CANDIDATES:
         try:
-            res = await wavelink.Playable.search(f"{prefix}:counting stars onerepublic")
+            res = await wavelink.Playable.search(f"{prefix}:counting stars onerepublic", source=None)
             n = len(res.tracks) if isinstance(res, wavelink.Playlist) else len(res or [])
             results.append(f"{prefix}={n}")
             if n > 0:
@@ -9358,7 +9358,7 @@ async def _probe_music_sources():
         except Exception as e:
             results.append(f"{prefix}=ERR({str(e)[:40]})")
     try:
-        r = await wavelink.Playable.search(_RADIO_TEST_URL)
+        r = await wavelink.Playable.search(_RADIO_TEST_URL, source=None)
         _http_source_ok = bool(r)
     except Exception:
         _http_source_ok = False
@@ -9376,7 +9376,9 @@ async def search_any(query: str, exclude=None):
     q = (query or "").strip()
     if q.lower().startswith(("http://", "https://")):
         try:
-            return await wavelink.Playable.search(q), "direct"
+            # source=None -> use the query as-is (don't let wavelink prepend a
+            # default ytmsearch: prefix).
+            return await wavelink.Playable.search(q, source=None), "direct"
         except Exception as e:
             print(f"[Music] direct load failed: {e}")
             return None, None
@@ -9385,7 +9387,11 @@ async def search_any(query: str, exclude=None):
         if exclude and prefix in exclude:
             continue
         try:
-            res = await wavelink.Playable.search(f"{prefix}:{q}")
+            # source=None is critical: our query already carries its own
+            # "<prefix>:" (dzsearch:/scsearch:/…), and without this wavelink
+            # prepends "ytmsearch:" on top ("ytmsearch:dzsearch:…"), forcing
+            # everything to YouTube Music and ignoring the source we picked.
+            res = await wavelink.Playable.search(f"{prefix}:{q}", source=None)
             if res:
                 return res, prefix
         except Exception as e:
@@ -9762,7 +9768,7 @@ async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
     station, stream_url = _radio_stream_for(genre or auto_radio_config.get("genre") or "lofi")
     results = None
     try:
-        results = await wavelink.Playable.search(stream_url)
+        results = await wavelink.Playable.search(stream_url, source=None)
     except Exception as e:
         print(f"[Radio] stream load failed: {e}")
     track = results[0] if (results and not isinstance(results, wavelink.Playlist)) else None
