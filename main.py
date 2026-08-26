@@ -916,7 +916,7 @@ _invite_uses_cache = {}     # guild_id -> {invite_code: uses}
 invite_tracker = {}         # guild_id(str) -> {"invited_by":{}, "left":{}, "fake":{}, "bonus":{}}
 # Owner settings from the dashboard "Invite Tracker" block (separate bot_config
 # feature from the tracker data below, so they never clobber each other).
-invite_tracker_config = {"enabled": True}
+invite_tracker_config = {"enabled": True, "board_components": []}
 _invite_save_pending = None
 
 
@@ -1130,6 +1130,17 @@ leaderboard_group = app_commands.Group(name="leaderboard", description="Server l
 
 @leaderboard_group.command(name="invites", description="Show the server's invites leaderboard")
 async def leaderboard_invites(interaction: discord.Interaction):
+    # If a message design is set up in the dashboard, post THAT (its {invite list}
+    # token expands to the leaderboard). Otherwise fall back to the built-in
+    # paged embed.
+    comps = invite_tracker_config.get("board_components") or []
+    if comps:
+        await interaction.response.defer()
+        ok = await send_v2_message(interaction.channel, comps, interaction=interaction)
+        if not ok:
+            await interaction.followup.send(
+                embed=info_embed("Note", "Couldn't render the leaderboard message."), ephemeral=True)
+        return
     view = InviteLeaderboardView(interaction.guild, 0)
     await interaction.response.send_message(embed=view.build_embed(), view=view)
 
@@ -6593,7 +6604,11 @@ async def apply_config(feature, cfg, post_panel=False):
             await post_saved_messages(only_channel_id=edited or None)
     elif feature in ("invite-tracker",):
         invite_tracker_config["enabled"] = bool(cfg.get("enabled", True))
-        print(f"[Config] invite-tracker — enabled {invite_tracker_config['enabled']}")
+        comps = cfg.get("board_components")
+        invite_tracker_config["board_components"] = comps if isinstance(comps, list) else []
+        _register_eph_from_tree(invite_tracker_config["board_components"])
+        print(f"[Config] invite-tracker — enabled {invite_tracker_config['enabled']} "
+              f"design {len(invite_tracker_config['board_components'])}")
     elif feature in ("music-addon", "customs-music-addon"):
         music_config["enabled"] = True
         music_config["dj_role_ids"] = [str(x) for x in (cfg.get("dj_role_ids") or []) if x]
