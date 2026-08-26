@@ -913,6 +913,7 @@ async def on_guild_remove(guild):
 #   bonus   = manual adjustments by staff.
 # Surfaced by /leaderboard invites and the {invite list} message token.
 _invite_uses_cache = {}     # guild_id -> {invite_code: uses}
+_invite_inviter_uses = {}   # guild_id -> {inviter_id(str): total live uses across their links}
 invite_tracker = {}         # guild_id(str) -> {"invited_by":{}, "left":{}, "fake":{}, "bonus":{}}
 # Owner settings from the dashboard "Invite Tracker" block (separate bot_config
 # feature from the tracker data below, so they never clobber each other).
@@ -945,6 +946,13 @@ async def _cache_guild_invites(guild):
     try:
         invites = await guild.invites()
         cache = {i.code: (i.uses or 0) for i in invites}
+        # Per-inviter LIVE totals straight from Discord (what any invite tracker
+        # reads). Includes links with 0 uses, so their owners still show up.
+        inviter_uses = {}
+        for i in invites:
+            if i.inviter:
+                iid = str(i.inviter.id)
+                inviter_uses[iid] = inviter_uses.get(iid, 0) + (i.uses or 0)
         try:
             if "VANITY_URL" in getattr(guild, "features", []):
                 v = await guild.vanity_invite()
@@ -953,6 +961,7 @@ async def _cache_guild_invites(guild):
         except Exception:
             pass
         _invite_uses_cache[guild.id] = cache
+        _invite_inviter_uses[guild.id] = inviter_uses
     except discord.Forbidden:
         print(f"[Invites] no Manage Server permission in guild {guild.id} — tracking off")
     except Exception as e:
@@ -1014,12 +1023,20 @@ def _mark_left(member):
 
 
 def _invite_scoreboard(guild):
-    """[(inviter_id, score, regular, left, fake, bonus)] sorted by score desc."""
+    """[(inviter_id, score, regular, left, fake, bonus)] sorted by score desc.
+    'regular' comes from Discord's own invite-use totals when available (so the
+    board matches what an invite tracker already shows), falling back to the
+    joins we've recorded ourselves. Everyone who owns an invite link is listed,
+    even with 0 uses."""
     data = invite_tracker.get(str(guild.id)) or {"invited_by": {}, "left": {}, "fake": {}, "bonus": {}}
-    ids = set(data["invited_by"].values()) | set(data["left"].values()) | set(data["fake"].values()) | set(data["bonus"].keys())
+    live = _invite_inviter_uses.get(guild.id, {})
+    ids = (set(live) | set(data["invited_by"].values()) | set(data["left"].values())
+           | set(data["fake"].values()) | set(data["bonus"].keys()))
+    ids.discard(None)
     rows = []
     for iid in ids:
-        regular = sum(1 for v in data["invited_by"].values() if v == iid)
+        tracked_regular = sum(1 for v in data["invited_by"].values() if v == iid)
+        regular = int(live[iid]) if iid in live else tracked_regular
         left = sum(1 for v in data["left"].values() if v == iid)
         fake = sum(1 for v in data["fake"].values() if v == iid)
         bonus = int(data["bonus"].get(iid, 0))
@@ -1130,6 +1147,12 @@ leaderboard_group = app_commands.Group(name="leaderboard", description="Server l
 
 @leaderboard_group.command(name="invites", description="Show the server's invites leaderboard")
 async def leaderboard_invites(interaction: discord.Interaction):
+    # Refresh from Discord's live invite data first so the board matches reality
+    # even before we've tracked any joins ourselves.
+    try:
+        await _cache_guild_invites(interaction.guild)
+    except Exception:
+        pass
     # If a message design is set up in the dashboard, post THAT (its {invite list}
     # token expands to the leaderboard). Otherwise fall back to the built-in
     # paged embed.
