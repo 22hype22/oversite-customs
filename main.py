@@ -124,6 +124,12 @@ portfolio_config = {"channel_id": "", "components": [], "allowed_role_ids": []}
 # as Messages). Running /package channel:#x posts that design to the channel.
 packages_config = {"panel_components": [], "allowed_role_ids": []}
 
+# Saved messages built in the dashboard "Messages" block. Works like ticket
+# panels: a library of messages, one per channel, each re-posted (replacing the
+# previous one in that channel) when saved. `refs` tracks the live message id per
+# channel so a re-save edits in place instead of stacking duplicates.
+saved_messages_config = {"messages": [], "refs": {}}  # messages: [{channel_id, components}]
+
 # ---- Music / DJ (dashboard "Music Add-On" + "Auto Radio" blocks) ----
 # Voice playback is delegated to a shared Lavalink node (see /music) via wavelink.
 # The bot never touches audio — no PyNaCl/ffmpeg/yt-dlp — so there's no YouTube
@@ -6245,6 +6251,20 @@ async def apply_config(feature, cfg, post_panel=False):
         packages_config["panel_components"] = comps if isinstance(comps, list) else []
         packages_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
         print(f"[Config] packages — design {len(packages_config['panel_components'])} roles {packages_config['allowed_role_ids']}")
+    elif feature in ("customs-messages", "messages"):
+        raw = cfg.get("messages")
+        msgs = []
+        if isinstance(raw, list):
+            for m in raw:
+                if isinstance(m, dict) and m.get("channel_id"):
+                    msgs.append({"channel_id": str(m["channel_id"]),
+                                 "components": m.get("components") if isinstance(m.get("components"), list) else []})
+        saved_messages_config["messages"] = msgs
+        edited = str(cfg.get("edited_channel_id") or "")
+        print(f"[Config] customs-messages — {len(msgs)} saved message(s), edited {edited or '(none)'}")
+        # Only (re)post on a deliberate save, never on boot — like ticket panels.
+        if post_panel:
+            await post_saved_messages(only_channel_id=edited or None)
     elif feature in ("music-addon", "customs-music-addon"):
         music_config["enabled"] = True
         music_config["dj_role_ids"] = [str(x) for x in (cfg.get("dj_role_ids") or []) if x]
@@ -6722,6 +6742,61 @@ async def _post_one_panel(ch, comps):
         await _replace_ticket_panel(ch.id, msg.id)
     except Exception as e:
         print(f"[Tickets] panel post failed: {e}")
+
+
+async def _replace_saved_message(channel_id, message_id):
+    """Track the live saved-message per channel and delete the previous one, so
+    re-saving a message edits it in place (no duplicate stacking) — same idea as
+    ticket panels."""
+    refs = saved_messages_config.get("refs")
+    if not isinstance(refs, dict):
+        refs = {}
+        saved_messages_config["refs"] = refs
+    ch_key = str(channel_id)
+    old_mid = refs.get(ch_key)
+    if message_id and message_id is not True:
+        refs[ch_key] = str(message_id)
+    if old_mid and not _is_tracked_giveaway_message(old_mid):
+        try:
+            ch = await resolve_channel(ch_key)
+            if ch:
+                msg = await ch.fetch_message(int(old_mid))
+                await msg.delete()
+        except Exception:
+            pass
+
+
+async def post_saved_messages(only_channel_id=None):
+    """(Re)post saved messages. With only_channel_id set (a save while editing one
+    message), post JUST that one and leave the others alone; without it, post
+    every saved message."""
+    target = str(only_channel_id) if only_channel_id else None
+    for m in saved_messages_config.get("messages") or []:
+        if target and str(m.get("channel_id")) != target:
+            continue
+        ch = await resolve_channel(m.get("channel_id"))
+        if not ch:
+            continue
+        comps = m.get("components") or []
+        if not comps:
+            continue
+        try:
+            mid = await send_v2_message(ch, comps)
+            if mid:
+                print("[Messages] saved message posted")
+                await _replace_saved_message(ch.id, mid)
+                continue
+        except Exception as e:
+            print(f"[Messages] post error: {e}")
+        stripped = _strip_galleries(comps)
+        if stripped != comps:
+            try:
+                mid = await send_v2_message(ch, stripped)
+                if mid:
+                    print("[Messages] saved message posted (images dropped)")
+                    await _replace_saved_message(ch.id, mid)
+            except Exception as e:
+                print(f"[Messages] stripped post error: {e}")
 
 
 async def _pkg_lookup_roblox(discord_id):
@@ -7463,7 +7538,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
