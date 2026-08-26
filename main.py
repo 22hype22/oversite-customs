@@ -1035,6 +1035,13 @@ def _invite_scoreboard(guild):
     ids.discard(None)
     rows = []
     for iid in ids:
+        # Only rank people who are still in the server (skip left/deleted
+        # accounts that would render as "unknown-user").
+        try:
+            if guild.get_member(int(iid)) is None:
+                continue
+        except (TypeError, ValueError):
+            continue
         tracked_regular = sum(1 for v in data["invited_by"].values() if v == iid)
         regular = int(live[iid]) if iid in live else tracked_regular
         left = sum(1 for v in data["left"].values() if v == iid)
@@ -1159,7 +1166,9 @@ async def leaderboard_invites(interaction: discord.Interaction):
     comps = invite_tracker_config.get("board_components") or []
     if comps:
         await interaction.response.defer()
-        ok = await send_v2_message(interaction.channel, comps, interaction=interaction)
+        # Mentions render (@name, clickable) but never notify — like a silent ping.
+        ok = await send_v2_message(interaction.channel, comps, interaction=interaction,
+                                   allowed_mentions={"parse": []})
         if not ok:
             await interaction.followup.send(
                 embed=info_embed("Note", "Couldn't render the leaderboard message."), ephemeral=True)
