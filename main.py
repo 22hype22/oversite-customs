@@ -9762,6 +9762,11 @@ async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
     if not interaction.user.voice:
         await interaction.followup.send(embed=error_embed("Not in voice", "Join a voice channel first."))
         return
+    if not _http_source_ok:
+        await interaction.followup.send(embed=error_embed(
+            "Radio not supported here",
+            "The music node this bot is connected to has direct radio streams turned off, so `/radio` can't run. `/play` and the DJ still work. To get radio back, point the bot at a node with the HTTP source enabled (your own node has it on)."))
+        return
     vc = get_player(interaction.guild)
     if not vc:
         vc = await interaction.user.voice.channel.connect(cls=wavelink.Player)
