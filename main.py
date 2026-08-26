@@ -499,6 +499,7 @@ group_sync_config = {
     "enabled": False,
     "group_id": "",
     "tiers": [],  # [{"rank": int, "role_ids": {str, ...}}], sorted HIGHEST rank first
+    "demote_rank": None,  # rank for members holding NO mapped role (None = leave them)
 }
 
 
@@ -521,12 +522,13 @@ def _parse_group_sync_tiers(cfg):
 
 def _desired_group_rank(member):
     """The rank number a member should hold: the highest tier whose role set the
-    member has ANY of. None means no mapped role -> leave their rank alone."""
+    member has ANY of. With no mapped role, fall back to the configured demote
+    rank (so they're deranked), or None to leave them alone if none is set."""
     have = {str(r.id) for r in member.roles}
     for tier in group_sync_config["tiers"]:
         if have & tier["role_ids"]:
             return tier["rank"]
-    return None
+    return group_sync_config["demote_rank"]
 
 
 async def _group_sync_call(action, payload):
@@ -575,6 +577,57 @@ def _schedule_group_sync(member):
     if old and not old.done():
         old.cancel()
     _group_sync_pending[member.id] = asyncio.create_task(_group_sync_member_later(member))
+
+
+async def _group_sync_scan(guild):
+    """Rank every member of `guild` to match their Discord roles. Returns
+    (result, error): result is a totals/breakdown dict, error a string on a
+    hard failure. Shared by /grouproleupdate and the daily auto-check."""
+    desired = []
+    for member in guild.members:
+        if member.bot:
+            continue
+        rank = _desired_group_rank(member)  # tier rank, demote rank, or None
+        if rank is not None:
+            desired.append({"discord_user_id": str(member.id), "rank_number": rank})
+    totals = {"changed": 0, "unchanged": 0, "skipped": 0, "failed": 0}
+    skip_reasons, no_perm, other_fails = {}, [], []
+    for i in range(0, len(desired), 40):
+        res = await _group_sync_call("sync", {"desired": desired[i:i + 40]})
+        if res.get("error"):
+            return None, res["error"]
+        for k in totals:
+            totals[k] += int(res.get(k) or 0)
+        for d in (res.get("details") or []):
+            err = d.get("error")
+            if err:
+                if "permission to manage" in str(err).lower():
+                    no_perm.append(d.get("discordId"))
+                elif len(other_fails) < 5:
+                    other_fails.append((d.get("discordId"), str(err)[:100]))
+            elif d.get("reason"):
+                skip_reasons[d["reason"]] = skip_reasons.get(d["reason"], 0) + 1
+    return {"checked": len(desired), "totals": totals, "skip_reasons": skip_reasons,
+            "no_perm": no_perm, "other_fails": other_fails}, None
+
+
+@tasks.loop(hours=24)
+async def daily_group_sync():
+    """Once a day, re-rank everyone to match their Discord roles (and derank
+    anyone with no mapped role, if a demote rank is set)."""
+    if not (group_sync_config["enabled"] and group_sync_config["group_id"] and group_sync_config["tiers"]):
+        return
+    for guild in bot.guilds:
+        try:
+            result, err = await _group_sync_scan(guild)
+            if err:
+                print(f"[GroupSync] daily scan {guild.id} failed: {err}")
+            elif result:
+                t = result["totals"]
+                print(f"[GroupSync] daily {guild.id}: checked {result['checked']} "
+                      f"updated {t['changed']} same {t['unchanged']} skipped {t['skipped']} failed {t['failed']}")
+        except Exception as e:
+            print(f"[GroupSync] daily scan error {guild.id}: {e}")
 
 
 def success_embed(title, description=None):
@@ -682,6 +735,8 @@ async def on_ready():
         poll_group_sales.start()
     if not poll_stripe_sales.is_running():
         poll_stripe_sales.start()
+    if not daily_group_sync.is_running():
+        daily_group_sync.start()
     await refresh_status()
 
     try:
@@ -3720,42 +3775,20 @@ async def grouproleupdate_cmd(interaction: discord.Interaction):
             ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
-    # Build the desired rank for every member who holds a mapped role.
-    desired = []
-    for member in interaction.guild.members:
-        if member.bot:
-            continue
-        rank = _desired_group_rank(member)
-        if rank is not None:
-            desired.append({"discord_user_id": str(member.id), "rank_number": rank})
-    if not desired:
+    result, err = await _group_sync_scan(interaction.guild)
+    if err:
+        await interaction.followup.send(
+            embed=error_embed("Sync failed", f"Roblox call failed: {err}"), ephemeral=True)
+        return
+    if result["checked"] == 0:
         await interaction.followup.send(
             embed=info_embed("Nobody to sync", "No members currently hold a role that's mapped to a Roblox rank."),
             ephemeral=True)
         return
-    # Send in batches so one call never runs too long against Roblox.
-    totals = {"changed": 0, "unchanged": 0, "skipped": 0, "failed": 0}
-    skip_reasons = {}          # reason code -> count
-    no_perm = []               # discord ids Roblox refused (owner / bot ranked too low)
-    other_fails = []           # (discord id, short error) for anything else
-    for i in range(0, len(desired), 40):
-        res = await _group_sync_call("sync", {"desired": desired[i:i + 40]})
-        if res.get("error"):
-            await interaction.followup.send(
-                embed=error_embed("Sync failed", f"Roblox call failed: {res['error']}"),
-                ephemeral=True)
-            return
-        for k in totals:
-            totals[k] += int(res.get(k) or 0)
-        for d in (res.get("details") or []):
-            err = d.get("error")
-            if err:
-                if "permission to manage" in str(err).lower():
-                    no_perm.append(d.get("discordId"))
-                elif len(other_fails) < 5:
-                    other_fails.append((d.get("discordId"), str(err)[:100]))
-            elif d.get("reason"):
-                skip_reasons[d["reason"]] = skip_reasons.get(d["reason"], 0) + 1
+    totals = result["totals"]
+    skip_reasons = result["skip_reasons"]
+    no_perm = result["no_perm"]
+    other_fails = result["other_fails"]
 
     def _mentions(ids, cap=10):
         picked = [f"<@{i}>" for i in ids if i][:cap]
@@ -3768,7 +3801,7 @@ async def grouproleupdate_cmd(interaction: discord.Interaction):
         "no_such_rank": "mapped to a rank number that doesn't exist in the group",
     }
     lines = [
-        f"**Checked:** {len(desired)} member(s) with a mapped role",
+        f"**Checked:** {result['checked']} member(s)",
         f"**Updated:** {totals['changed']}",
         f"**Already correct:** {totals['unchanged']}",
         f"**Skipped:** {totals['skipped']}",
@@ -6310,11 +6343,16 @@ async def apply_config(feature, cfg, post_panel=False):
     elif feature in ("roblox-group-sync", "customs-roblox-group-sync"):
         group_sync_config["group_id"] = str(cfg.get("group_id") or "").strip()
         group_sync_config["tiers"] = _parse_group_sync_tiers(cfg)
+        try:
+            dr = cfg.get("demote_rank")
+            group_sync_config["demote_rank"] = int(dr) if dr not in (None, "") else None
+        except (TypeError, ValueError):
+            group_sync_config["demote_rank"] = None
         group_sync_config["enabled"] = bool(cfg.get("enabled", True)) and bool(
             group_sync_config["group_id"]) and bool(group_sync_config["tiers"])
         print(f"[Config] roblox-group-sync — group {group_sync_config['group_id']} "
               f"tiers {[(t['rank'], sorted(t['role_ids'])) for t in group_sync_config['tiers']]} "
-              f"enabled {group_sync_config['enabled']}")
+              f"demote {group_sync_config['demote_rank']} enabled {group_sync_config['enabled']}")
 
 
 def _is_tracked_giveaway_message(mid):
