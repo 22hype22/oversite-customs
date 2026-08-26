@@ -938,7 +938,9 @@ def _is_risky_join(member):
 
 
 def _inv_data(guild_id):
-    return invite_tracker.setdefault(str(guild_id), {"invited_by": {}, "left": {}, "fake": {}, "bonus": {}})
+    d = invite_tracker.setdefault(str(guild_id), {"invited_by": {}, "left": {}, "fake": {}, "bonus": {}})
+    d.setdefault("baseline", {})  # inviter_id -> live uses at last /resetinvites
+    return d
 
 
 async def _cache_guild_invites(guild):
@@ -1030,6 +1032,7 @@ def _invite_scoreboard(guild):
     even with 0 uses."""
     data = invite_tracker.get(str(guild.id)) or {"invited_by": {}, "left": {}, "fake": {}, "bonus": {}}
     live = _invite_inviter_uses.get(guild.id, {})
+    baseline = data.get("baseline") or {}
     ids = (set(live) | set(data["invited_by"].values()) | set(data["left"].values())
            | set(data["fake"].values()) | set(data["bonus"].keys()))
     ids.discard(None)
@@ -1043,7 +1046,10 @@ def _invite_scoreboard(guild):
         except (TypeError, ValueError):
             continue
         tracked_regular = sum(1 for v in data["invited_by"].values() if v == iid)
-        regular = int(live[iid]) if iid in live else tracked_regular
+        if iid in live:
+            regular = max(0, int(live[iid]) - int(baseline.get(iid, 0)))
+        else:
+            regular = tracked_regular
         left = sum(1 for v in data["left"].values() if v == iid)
         fake = sum(1 for v in data["fake"].values() if v == iid)
         bonus = int(data["bonus"].get(iid, 0))
@@ -1193,6 +1199,46 @@ async def invitebonus_cmd(interaction: discord.Interaction, user: discord.Member
     await interaction.response.send_message(
         embed=success_embed("Bonus invites updated", f"{user.mention} now has **{cur}** bonus invite(s)."),
         ephemeral=True)
+
+
+async def _reset_invites(guild, user=None):
+    """Zero the invite leaderboard. Because 'regular' is read from Discord's own
+    invite-use totals (which we can't clear), we snapshot the current uses as a
+    baseline and subtract it going forward — so everyone starts at 0 and new
+    invites from now on count. With a user, reset only that member."""
+    await _cache_guild_invites(guild)  # refresh live uses first
+    live = _invite_inviter_uses.get(guild.id, {})
+    data = _inv_data(guild.id)
+    if user is None:
+        data["invited_by"] = {}
+        data["left"] = {}
+        data["fake"] = {}
+        data["bonus"] = {}
+        data["baseline"] = dict(live)
+    else:
+        uid = str(user.id)
+        data["invited_by"] = {k: v for k, v in data["invited_by"].items() if v != uid}
+        data["left"] = {k: v for k, v in data["left"].items() if v != uid}
+        data["fake"] = {k: v for k, v in data["fake"].items() if v != uid}
+        data["bonus"].pop(uid, None)
+        data["baseline"][uid] = int(live.get(uid, 0))
+    _save_invite_tracker_soon()
+
+
+@bot.tree.command(name="resetinvites", description="Reset the invite leaderboard to zero (admin)")
+@app_commands.describe(user="Optional — reset only this member instead of everyone")
+async def resetinvites_cmd(interaction: discord.Interaction, user: discord.Member = None):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            embed=error_embed("Admins only", "You need Manage Server."), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await _reset_invites(interaction.guild, user)
+    if user is None:
+        msg = "Everyone's invite counts are back to **0**. New invites from now on will count."
+    else:
+        msg = f"{user.mention}'s invite count is back to **0**. Their new invites from now on will count."
+    await interaction.followup.send(embed=success_embed("Invites reset", msg), ephemeral=True)
 
 
 bot.tree.add_command(leaderboard_group)
