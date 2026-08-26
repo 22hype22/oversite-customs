@@ -768,6 +768,13 @@ async def on_ready():
     except Exception as e:
         print(f"[Startup] secret-slot seed failed: {e}")
 
+    try:
+        await _load_invite_tracker()
+        for g in bot.guilds:
+            await _cache_guild_invites(g)
+    except Exception as e:
+        print(f"[Startup] invite tracker init failed: {e}")
+
     # Restore every saved giveaway (entrants + timers) so redeploys never drop them.
     try:
         await _gw_restore_all()
@@ -897,9 +904,244 @@ async def on_guild_remove(guild):
         print(f"[Guild] guild-leave report failed: {e}")
 
 
+# ======================= Invite Tracker =======================
+# Attribute each join to the invite (and inviter) that was used, then keep a
+# leaderboard: score = regular + bonus - left - fake, where
+#   regular = people they invited who are still here (and not fake),
+#   left    = people they invited who left,
+#   fake    = joins from very new accounts (likely alts),
+#   bonus   = manual adjustments by staff.
+# Surfaced by /leaderboard invites and the {invite list} message token.
+_invite_uses_cache = {}     # guild_id -> {invite_code: uses}
+invite_tracker = {}         # guild_id(str) -> {"invited_by":{}, "left":{}, "fake":{}, "bonus":{}}
+_INVITE_FAKE_AGE_DAYS = 7   # accounts younger than this at join count as "fake"
+_invite_save_pending = None
+
+
+def _inv_data(guild_id):
+    return invite_tracker.setdefault(str(guild_id), {"invited_by": {}, "left": {}, "fake": {}, "bonus": {}})
+
+
+async def _cache_guild_invites(guild):
+    """Snapshot every invite's use count so the next join can be attributed."""
+    try:
+        invites = await guild.invites()
+        cache = {i.code: (i.uses or 0) for i in invites}
+        try:
+            if "VANITY_URL" in getattr(guild, "features", []):
+                v = await guild.vanity_invite()
+                if v and v.code:
+                    cache[v.code] = v.uses or 0
+        except Exception:
+            pass
+        _invite_uses_cache[guild.id] = cache
+    except discord.Forbidden:
+        print(f"[Invites] no Manage Server permission in guild {guild.id} — tracking off")
+    except Exception as e:
+        print(f"[Invites] cache failed for {guild.id}: {e}")
+
+
+async def _attribute_join(member):
+    """Find which invite the member used (its use count went up) and record it."""
+    guild = member.guild
+    before = _invite_uses_cache.get(guild.id, {})
+    inviter_id = None
+    try:
+        invites = await guild.invites()
+    except Exception:
+        invites = []
+    after = {}
+    for i in invites:
+        after[i.code] = i.uses or 0
+        if (i.uses or 0) > before.get(i.code, 0) and inviter_id is None:
+            inviter_id = str(i.inviter.id) if i.inviter else None
+    # Vanity URL (no inviter attribution possible).
+    try:
+        if "VANITY_URL" in getattr(guild, "features", []):
+            v = await guild.vanity_invite()
+            if v and v.code:
+                after[v.code] = v.uses or 0
+    except Exception:
+        pass
+    _invite_uses_cache[guild.id] = after
+    if not inviter_id:
+        return  # couldn't determine (vanity, or bot lacks permission)
+    data = _inv_data(guild.id)
+    mid = str(member.id)
+    # Wipe any stale record of this member from a previous stint.
+    data["invited_by"].pop(mid, None)
+    data["left"].pop(mid, None)
+    data["fake"].pop(mid, None)
+    age_days = (discord.utils.utcnow() - member.created_at).days
+    if age_days < _INVITE_FAKE_AGE_DAYS:
+        data["fake"][mid] = inviter_id
+    else:
+        data["invited_by"][mid] = inviter_id
+    _save_invite_tracker_soon()
+
+
+def _mark_left(member):
+    data = invite_tracker.get(str(member.guild.id))
+    if not data:
+        return
+    mid = str(member.id)
+    if mid in data["invited_by"]:
+        data["left"][mid] = data["invited_by"].pop(mid)
+        _save_invite_tracker_soon()
+    elif mid in data["fake"]:
+        data["fake"].pop(mid, None)
+        _save_invite_tracker_soon()
+
+
+def _invite_scoreboard(guild):
+    """[(inviter_id, score, regular, left, fake, bonus)] sorted by score desc."""
+    data = invite_tracker.get(str(guild.id)) or {"invited_by": {}, "left": {}, "fake": {}, "bonus": {}}
+    ids = set(data["invited_by"].values()) | set(data["left"].values()) | set(data["fake"].values()) | set(data["bonus"].keys())
+    rows = []
+    for iid in ids:
+        regular = sum(1 for v in data["invited_by"].values() if v == iid)
+        left = sum(1 for v in data["left"].values() if v == iid)
+        fake = sum(1 for v in data["fake"].values() if v == iid)
+        bonus = int(data["bonus"].get(iid, 0))
+        score = regular + bonus - left - fake
+        rows.append((iid, score, regular, left, fake, bonus))
+    rows.sort(key=lambda r: (-r[1], -r[2]))
+    return rows
+
+
+def _render_invite_list(guild, page=0, per_page=10):
+    """The numbered leaderboard text (also what the {invite list} token becomes)."""
+    rows = _invite_scoreboard(guild)
+    if not rows:
+        return "No invites tracked yet.", 1
+    pages = max(1, (len(rows) + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    lines = []
+    for idx, (iid, score, regular, left, fake, bonus) in enumerate(rows[page * per_page:(page + 1) * per_page], start=page * per_page + 1):
+        s = "invite" if score == 1 else "invites"
+        lines.append(f"`{idx}.` <@{iid}> · **{score}** {s}. ({regular} regular, {left} left, {fake} fake, {bonus} bonus)")
+    return "\n".join(lines), pages
+
+
+def _save_invite_tracker_soon():
+    global _invite_save_pending
+    if _invite_save_pending and not _invite_save_pending.done():
+        return
+    _invite_save_pending = asyncio.create_task(_save_invite_tracker())
+
+
+async def _save_invite_tracker():
+    await asyncio.sleep(5)  # debounce a burst of joins/leaves
+    await _bot_config_upsert("invite-tracker", {"guilds": invite_tracker})
+
+
+async def _load_invite_tracker():
+    cfg = await _bot_config_get("invite-tracker")
+    guilds = (cfg or {}).get("guilds")
+    if isinstance(guilds, dict):
+        for gid, d in guilds.items():
+            if isinstance(d, dict):
+                invite_tracker[gid] = {
+                    "invited_by": dict(d.get("invited_by") or {}),
+                    "left": dict(d.get("left") or {}),
+                    "fake": dict(d.get("fake") or {}),
+                    "bonus": {k: int(v) for k, v in (d.get("bonus") or {}).items()},
+                }
+    print(f"[Invites] tracker loaded for {len(invite_tracker)} guild(s)")
+
+
+@bot.event
+async def on_invite_create(invite):
+    try:
+        _invite_uses_cache.setdefault(invite.guild.id, {})[invite.code] = invite.uses or 0
+    except Exception:
+        pass
+
+
+@bot.event
+async def on_invite_delete(invite):
+    try:
+        _invite_uses_cache.get(invite.guild.id, {}).pop(invite.code, None)
+    except Exception:
+        pass
+
+
+class InviteLeaderboardView(discord.ui.View):
+    def __init__(self, guild, page=0):
+        super().__init__(timeout=180)
+        self.guild = guild
+        self.page = page
+
+    def build_embed(self):
+        text, pages = _render_invite_list(self.guild, self.page)
+        embed = discord.Embed(title="Invites Leaderboard", description=text, color=ACCENT)
+        embed.set_footer(text=f"Invite Tracker · Page {min(self.page + 1, pages)}/{pages}")
+        return embed
+
+    async def _refresh(self, interaction):
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(emoji="⏮️", style=discord.ButtonStyle.secondary)
+    async def first(self, interaction, button):
+        self.page = 0
+        await self._refresh(interaction)
+
+    @discord.ui.button(emoji="◀️", style=discord.ButtonStyle.secondary)
+    async def prev(self, interaction, button):
+        self.page = max(0, self.page - 1)
+        await self._refresh(interaction)
+
+    @discord.ui.button(emoji="⏹️", style=discord.ButtonStyle.secondary)
+    async def stop_btn(self, interaction, button):
+        for c in self.children:
+            c.disabled = True
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+    @discord.ui.button(emoji="▶️", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction, button):
+        _, pages = _render_invite_list(self.guild, self.page)
+        self.page = min(pages - 1, self.page + 1)
+        await self._refresh(interaction)
+
+
+leaderboard_group = app_commands.Group(name="leaderboard", description="Server leaderboards")
+
+
+@leaderboard_group.command(name="invites", description="Show the server's invites leaderboard")
+async def leaderboard_invites(interaction: discord.Interaction):
+    view = InviteLeaderboardView(interaction.guild, 0)
+    await interaction.response.send_message(embed=view.build_embed(), view=view)
+
+
+@bot.tree.command(name="invitebonus", description="Add or remove bonus invites for a member (admin)")
+@app_commands.describe(user="Member to adjust", amount="Bonus invites to add (use a negative number to remove)")
+async def invitebonus_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(embed=error_embed("Admins only", "You need Manage Server."), ephemeral=True)
+        return
+    data = _inv_data(interaction.guild.id)
+    cur = int(data["bonus"].get(str(user.id), 0)) + amount
+    if cur:
+        data["bonus"][str(user.id)] = cur
+    else:
+        data["bonus"].pop(str(user.id), None)
+    _save_invite_tracker_soon()
+    await interaction.response.send_message(
+        embed=success_embed("Bonus invites updated", f"{user.mention} now has **{cur}** bonus invite(s)."),
+        ephemeral=True)
+
+
+bot.tree.add_command(leaderboard_group)
+
+
 @bot.event
 async def on_member_join(member):
     await refresh_status()
+    try:
+        await _attribute_join(member)
+    except Exception as e:
+        print(f"[Invites] attribute join failed: {e}")
     components = invite_config.get("components") or []
     embeds_data = invite_config.get("embeds") or []
     if components or embeds_data:
@@ -935,6 +1177,10 @@ async def on_member_join(member):
 @bot.event
 async def on_member_remove(member):
     await refresh_status()
+    try:
+        _mark_left(member)
+    except Exception as e:
+        print(f"[Invites] mark-left failed: {e}")
     # Drop a designer's saved pricing when they leave, so /pricing never shows
     # prices for people who aren't in the server anymore.
     try:
@@ -1078,7 +1324,16 @@ def _sub_placeholders(text, member):
     }
     for token, value in repl.items():
         text = text.replace(token, value)
+    text = _sub_invite_list(text, member.guild)
     return _resolve_emoji_shortcodes(_resolve_channel_mentions(_resolve_channel_links(_resolve_role_mentions(text, member.guild), member.guild), member.guild), member.guild)
+
+
+def _sub_invite_list(text, guild):
+    """Replace the {invite list} / {invite_list} token with the invite leaderboard."""
+    if not text or guild is None or "{invite" not in text:
+        return text
+    lst, _ = _render_invite_list(guild)
+    return text.replace("{invite list}", lst).replace("{invite_list}", lst)
 
 
 def _render_guild_text(text, guild):
@@ -1110,6 +1365,7 @@ def _render_guild_text(text, guild):
             text = text.replace(token, value)
         # Custom per-service status tokens ({liveries}, {liveriesstatus}, …).
         text = _render_order_tokens(text, guild)
+    text = _sub_invite_list(text, guild)
     return _resolve_emoji_shortcodes(_resolve_channel_mentions(_resolve_channel_links(_resolve_role_mentions(text, guild), guild), guild), guild)
 
 
