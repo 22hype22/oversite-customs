@@ -793,8 +793,6 @@ async def on_ready():
         daily_group_sync.start()
     if not persist_music_state.is_running():
         persist_music_state.start()
-    if not refresh_invite_leaderboard.is_running():
-        refresh_invite_leaderboard.start()
     await refresh_status()
 
     try:
@@ -918,14 +916,8 @@ _invite_uses_cache = {}     # guild_id -> {invite_code: uses}
 invite_tracker = {}         # guild_id(str) -> {"invited_by":{}, "left":{}, "fake":{}, "bonus":{}}
 # Owner settings from the dashboard "Invite Tracker" block (separate bot_config
 # feature from the tracker data below, so they never clobber each other).
-invite_tracker_config = {"enabled": True, "log_channel_id": "", "join_components": [], "leaderboard_channel_id": "", "board_ref": None}
+invite_tracker_config = {"enabled": True}
 _invite_save_pending = None
-
-# Default log message when a tracked member joins. Tokens are substituted below.
-DEFAULT_INVITE_JOIN_MESSAGE = (
-    "📥 {user} joined — invited by {inviter}, who now has **{invites}** invites. "
-    "We're now **{member_count}** members!"
-)
 
 
 def _is_risky_join(member):
@@ -969,6 +961,8 @@ async def _cache_guild_invites(guild):
 
 async def _attribute_join(member):
     """Find which invite the member used (its use count went up) and record it."""
+    if not invite_tracker_config.get("enabled", True):
+        return
     guild = member.guild
     before = _invite_uses_cache.get(guild.id, {})
     inviter_id = None
@@ -1004,10 +998,6 @@ async def _attribute_join(member):
     else:
         data["invited_by"][mid] = inviter_id
     _save_invite_tracker_soon()
-    try:
-        await post_invite_join_log(member, inviter_id, fake=risky)
-    except Exception as e:
-        print(f"[InviteTracker] join log failed: {e}")
 
 
 def _mark_left(member):
@@ -1051,90 +1041,6 @@ def _render_invite_list(guild, page=0, per_page=10):
         s = "invite" if score == 1 else "invites"
         lines.append(f"`{idx}.` <@{iid}> · **{score}** {s}. ({regular} regular, {left} left, {fake} fake, {bonus} bonus)")
     return "\n".join(lines), pages
-
-
-def _inviter_score(guild, inviter_id):
-    for iid, score, regular, left, fake, bonus in _invite_scoreboard(guild):
-        if iid == str(inviter_id):
-            return score
-    return 0
-
-
-def _invite_join_token_map(member, inviter, count):
-    return {
-        "{user}": member.mention,
-        "{user_name}": member.display_name,
-        "{user name}": member.display_name,
-        "{user_tag}": str(member),
-        "{inviter}": inviter.mention if inviter else "someone",
-        "{inviter_name}": inviter.display_name if inviter else "someone",
-        "{inviter name}": inviter.display_name if inviter else "someone",
-        "{invites}": str(count),
-    }
-
-
-def _sub_invite_join_tokens(text, member, inviter, count):
-    for k, v in _invite_join_token_map(member, inviter, count).items():
-        text = text.replace(k, v)
-    return text
-
-
-def _sub_invite_tokens_tree(items, member, inviter, count):
-    """Deep-substitute the member/inviter-specific tokens in a V2 components tree.
-    Guild-level tokens ({server}, {member_count}, {invite list}, mentions, emoji)
-    are left for _render_guild_text to resolve at send time."""
-    repl = _invite_join_token_map(member, inviter, count)
-
-    def _walk(node):
-        if isinstance(node, dict):
-            return {k: _walk(v) for k, v in node.items()}
-        if isinstance(node, list):
-            return [_walk(x) for x in node]
-        if isinstance(node, str):
-            for k, v in repl.items():
-                node = node.replace(k, v)
-            return node
-        return node
-
-    return [_walk(c) for c in items]
-
-
-async def post_invite_join_log(member, inviter_id, fake=False):
-    """Post the configured join message (a V2 message builder design) to the
-    invite log channel, with attribution tokens filled in."""
-    if not invite_tracker_config.get("enabled"):
-        return
-    ch_id = str(invite_tracker_config.get("log_channel_id") or "")
-    if not ch_id or not ch_id.isdigit():
-        return
-    channel = member.guild.get_channel(int(ch_id))
-    if channel is None:
-        return
-    inviter = None
-    if inviter_id and str(inviter_id).isdigit():
-        inviter = member.guild.get_member(int(inviter_id))
-    count = _inviter_score(member.guild, inviter_id)
-    fake_note = {"type": "text", "text": "-# ⚠️ Flagged as a possible alt (new / low-trust account) — not counted."}
-    mentions = discord.AllowedMentions(users=True, roles=False, everyone=False)
-    comps = invite_tracker_config.get("join_components") or []
-    if comps:
-        tree = _sub_invite_tokens_tree(comps, member, inviter, count)
-        if fake:
-            tree = tree + [fake_note]
-        try:
-            await send_v2_message(channel, tree, allowed_mentions=mentions)
-        except Exception as e:
-            print(f"[InviteTracker] send join log failed: {e}")
-        return
-    # No custom design — fall back to the default one-line message.
-    text = _sub_invite_join_tokens(DEFAULT_INVITE_JOIN_MESSAGE, member, inviter, count)
-    text = _render_guild_text(text, member.guild)
-    if fake:
-        text += "\n" + fake_note["text"]
-    try:
-        await channel.send(text, allowed_mentions=mentions)
-    except Exception as e:
-        print(f"[InviteTracker] send join log failed: {e}")
 
 
 def _save_invite_tracker_soon():
@@ -1247,51 +1153,6 @@ async def invitebonus_cmd(interaction: discord.Interaction, user: discord.Member
 
 
 bot.tree.add_command(leaderboard_group)
-
-
-async def post_invite_leaderboard():
-    """Post or refresh the standing invites leaderboard in the configured channel."""
-    if not invite_tracker_config.get("enabled"):
-        return
-    ch_id = str(invite_tracker_config.get("leaderboard_channel_id") or "")
-    if not ch_id:
-        return
-    channel = bot.get_channel(int(ch_id)) if ch_id.isdigit() else None
-    if channel is None:
-        return
-    guild = channel.guild
-    text, pages = _render_invite_list(guild, 0)
-    embed = discord.Embed(title="Invites Leaderboard", description=text, color=ACCENT)
-    embed.set_footer(text=f"Invite Tracker · Page 1/{pages}")
-    ref = invite_tracker_config.get("board_ref")
-    msg = None
-    if isinstance(ref, dict) and str(ref.get("channel_id")) == ch_id and ref.get("message_id"):
-        try:
-            msg = await channel.fetch_message(int(ref["message_id"]))
-        except Exception:
-            msg = None
-    try:
-        if msg is not None:
-            await msg.edit(embed=embed)
-        else:
-            msg = await channel.send(embed=embed)
-            invite_tracker_config["board_ref"] = {"channel_id": ch_id, "message_id": str(msg.id)}
-    except Exception as e:
-        print(f"[InviteTracker] post_invite_leaderboard failed: {e}")
-
-
-@tasks.loop(minutes=10)
-async def refresh_invite_leaderboard():
-    if invite_tracker_config.get("enabled") and invite_tracker_config.get("leaderboard_channel_id"):
-        try:
-            await post_invite_leaderboard()
-        except Exception as e:
-            print(f"[InviteTracker] refresh loop error: {e}")
-
-
-@refresh_invite_leaderboard.before_loop
-async def _before_refresh_invite_leaderboard():
-    await bot.wait_until_ready()
 
 
 @bot.event
@@ -6732,17 +6593,7 @@ async def apply_config(feature, cfg, post_panel=False):
             await post_saved_messages(only_channel_id=edited or None)
     elif feature in ("invite-tracker",):
         invite_tracker_config["enabled"] = bool(cfg.get("enabled", True))
-        invite_tracker_config["log_channel_id"] = str(cfg.get("log_channel_id") or "")
-        comps = cfg.get("join_components")
-        invite_tracker_config["join_components"] = comps if isinstance(comps, list) else []
-        _register_eph_from_tree(invite_tracker_config["join_components"])
-        invite_tracker_config["leaderboard_channel_id"] = str(cfg.get("leaderboard_channel_id") or "")
-        print(f"[Config] invite-tracker — enabled {invite_tracker_config['enabled']} "
-              f"log {invite_tracker_config['log_channel_id'] or '(none)'} "
-              f"design {len(invite_tracker_config['join_components'])} "
-              f"board {invite_tracker_config['leaderboard_channel_id'] or '(none)'}")
-        if post_panel and invite_tracker_config["leaderboard_channel_id"]:
-            await post_invite_leaderboard()
+        print(f"[Config] invite-tracker — enabled {invite_tracker_config['enabled']}")
     elif feature in ("music-addon", "customs-music-addon"):
         music_config["enabled"] = True
         music_config["dj_role_ids"] = [str(x) for x in (cfg.get("dj_role_ids") or []) if x]
