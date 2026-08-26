@@ -344,7 +344,11 @@ def _register_ticket_components(panels):
     panel so all posted panels keep working — not just the most recent one.
     `panels` is a list of component-trees (one per panel). A single tree is also
     accepted for backward compatibility."""
-    ticket_msgs.clear(); eph_msgs.clear(); form_msgs.clear(); form_titles.clear(); ticket_categories.clear(); ticket_access.clear()
+    # NOTE: eph_msgs is intentionally NOT cleared here — ephemeral messages live on
+    # many surfaces (saved messages, packages, …), not just ticket panels, so
+    # wiping it on a ticket save used to break their buttons ("Nothing here").
+    # Keys are stable, so stale entries are harmless.
+    ticket_msgs.clear(); form_msgs.clear(); form_titles.clear(); ticket_categories.clear(); ticket_access.clear()
 
     def _reg(x):
         oc = x.get("open_components") or []
@@ -397,6 +401,38 @@ def _register_ticket_components(panels):
             walk(tree, 0)
     print(f"[Tickets] registry: {len(ticket_msgs)} ticket + {len(form_msgs)} form + {len(eph_msgs)} ephemeral messages")
     print(f"[Tickets] registry built: tickets={{{', '.join(f'{k}:{len(v)}' for k,v in ticket_msgs.items())}}} eph={{{', '.join(f'{k}:{len(v)}' for k,v in eph_msgs.items())}}}")
+
+
+def _register_eph_from_tree(tree):
+    """Additively register Ephemeral-message buttons/options found anywhere in a
+    V2 component tree, so they work after a restart on surfaces that aren't
+    reposted on boot (e.g. saved messages, package/portfolio panels). Idempotent."""
+    def _reg(x):
+        if isinstance(x, dict) and "ephemeral" in x:
+            eph_msgs[_comp_key(x)] = x.get("open_components") or []
+        oc = x.get("open_components") if isinstance(x, dict) else None
+        if oc:
+            _walk(oc, 0)
+
+    def _walk(items, depth):
+        if depth > 8:
+            return
+        for c in (items or []):
+            if not isinstance(c, dict):
+                continue
+            t = c.get("type")
+            if t == "container":
+                _walk(c.get("children") or c.get("components") or [], depth + 1)
+            elif t in ("buttonRow", "button_row", "buttons", "action_row"):
+                for b in (c.get("buttons") or []):
+                    _reg(b)
+            elif t in ("select_menu", "select"):
+                for o in (c.get("options") or []):
+                    _reg(o)
+            elif t == "section":
+                _reg(c.get("button") or {})
+
+    _walk(tree if isinstance(tree, list) else [], 0)
 
 
 # Ticket panels can come from more than one dashboard block — the main "Tickets"
@@ -5844,7 +5880,9 @@ def _build_v2(comp, guild):
                 value = f"ticket_form:{_comp_key(opt)}"
             elif "ephemeral" in opt:
                 has_category = True
-                value = f"eph:{_comp_key(opt)}"
+                _ek = _comp_key(opt)
+                eph_msgs[_ek] = opt.get("open_components") or []  # register on any surface
+                value = f"eph:{_ek}"
             elif category:
                 has_category = True
                 value = category
@@ -6066,6 +6104,7 @@ def build_button(btn, guild):
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_form:{key}"})
     if "ephemeral" in btn:
         key = _comp_key(btn)
+        eph_msgs[key] = btn.get("open_components") or []  # works on ANY surface, not just ticket panels
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"eph:{key}"})
     if category:
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_cat:{category[:80]}"})
@@ -6244,12 +6283,14 @@ async def apply_config(feature, cfg, post_panel=False):
             portfolio_config["channel_id"] = str(cfg["channel_id"])
         comps = cfg.get("components")
         portfolio_config["components"] = comps if isinstance(comps, list) else []
+        _register_eph_from_tree(portfolio_config["components"])
         portfolio_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
         print(f"[Config] portfolio — channel {portfolio_config['channel_id']} design {len(portfolio_config['components'])} roles {portfolio_config['allowed_role_ids']}")
     elif feature in ("packages", "customs-packages"):
         comps = cfg.get("panel_components")
         packages_config["panel_components"] = comps if isinstance(comps, list) else []
         packages_config["allowed_role_ids"] = [str(x) for x in (cfg.get("allowed_role_ids") or []) if x]
+        _register_eph_from_tree(packages_config["panel_components"])
         print(f"[Config] packages — design {len(packages_config['panel_components'])} roles {packages_config['allowed_role_ids']}")
     elif feature in ("customs-messages", "messages"):
         raw = cfg.get("messages")
@@ -6260,6 +6301,8 @@ async def apply_config(feature, cfg, post_panel=False):
                     msgs.append({"channel_id": str(m["channel_id"]),
                                  "components": m.get("components") if isinstance(m.get("components"), list) else []})
         saved_messages_config["messages"] = msgs
+        for _m in msgs:
+            _register_eph_from_tree(_m.get("components") or [])
         edited = str(cfg.get("edited_channel_id") or "")
         print(f"[Config] customs-messages — {len(msgs)} saved message(s), edited {edited or '(none)'}")
         # Only (re)post on a deliberate save, never on boot — like ticket panels.
