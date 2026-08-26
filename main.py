@@ -10012,6 +10012,12 @@ async def on_voice_state_update(member, before, after):
     """Auto-leave + cleanup when the bot is alone or gets disconnected."""
     try:
         if member.bot and member.id == bot.user.id and before.channel and not after.channel:
+            # A quick reconnect (or a redeploy's phantom leave) can fire this right
+            # as a new session starts. Wait a beat and bail if the bot is already
+            # back in voice, so we don't delete the fresh card / clear its status.
+            await asyncio.sleep(1.5)
+            if member.guild.voice_client:
+                return
             _cancel_progress(member.guild.id)
             try:
                 await set_vc_status(before.channel, None)
@@ -10023,6 +10029,13 @@ async def on_voice_state_update(member, before, after):
                     await old.delete()
                 except Exception:
                     pass
+            # Clear the status-throttle timestamp + sweep guard so the NEXT /play
+            # always re-shows the card and re-sets the channel status.
+            try:
+                getattr(bot, "_last_vc_status", {}).pop(member.guild.id, None)
+            except Exception:
+                pass
+            _np_swept_channels.discard(before.channel.id)
             auto_music_sessions.pop(member.guild.id, None)
             _dj_mode.discard(member.guild.id)
             _dj_set.pop(member.guild.id, None)
