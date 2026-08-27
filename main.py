@@ -2396,6 +2396,7 @@ def _giveaway_tokens(g, ended, winner_ids):
         "{winners}": str(int(g["winners"])),
         "{length}": str(g.get("length") or ""),
         "{entries}": str(len(g["entrants"])),
+        "{reactions}": str(len(g["entrants"])),
         "{participants}": participants,
         "{end}": f"<t:{end_ts}:R>",
         "{end_full}": f"<t:{end_ts}:F>",
