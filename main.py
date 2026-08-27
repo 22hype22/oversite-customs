@@ -162,6 +162,7 @@ ads_config = {
 }
 ads_data = {}  # guild_id(str) -> {"inventory": {uid: {perk: n}}, "queue": [ad], "bypass": [ad], "last_drip": 0}
 _ads_save_pending = None
+_pending_perk_grant = {}  # (pkg_msg_id, buyer_id) -> (guild_id, deliver_to, perk_key)
 _ads_pending = {}  # ad_id -> ad dict awaiting approval (also mirrored in ads_data)
 
 
@@ -7842,12 +7843,21 @@ async def _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, product
     image = (rec.get("image") if rec else "") or ""
     thread_url = (rec.get("thread_url") if rec else "") or ""
     files = (rec.get("files") if rec else []) or []
-    # Advertising perk? If the purchased item's name maps to an ad perk, drop it
-    # into the buyer's (or gift target's) ad inventory.
+    # Advertising perk? Grant from the stashed intent first (robust even if the
+    # record store failed), else fall back to matching the receipt's product name.
     try:
-        perk = _ads_perk_for_name(product)
-        if perk and interaction.guild:
-            _ads_grant(interaction.guild.id, deliver_to or interaction.user.id, perk)
+        stash = _pending_perk_grant.pop((str(pkg_msg_id), str(interaction.user.id)), None)
+        if stash:
+            g_id, to_id, perk = stash
+            g_id = g_id or (str(interaction.guild.id) if interaction.guild else "")
+            if g_id and perk:
+                _ads_grant(g_id, to_id or interaction.user.id, perk)
+                print(f"[Ads] granted {perk} to {to_id} (from stash)")
+        else:
+            perk = _ads_perk_for_name(product)
+            if perk and interaction.guild:
+                _ads_grant(interaction.guild.id, deliver_to or interaction.user.id, perk)
+                print(f"[Ads] granted {perk} to {deliver_to or interaction.user.id} (from receipt)")
     except Exception as e:
         print(f"[Ads] grant on receipt failed: {e}")
     embed = _pkg_receipt_embed(acct["roblox_username"], acct.get("roblox_id"), price_str, product, product_url or thread_url, image)
@@ -8203,6 +8213,27 @@ async def ads_cmd(interaction: discord.Interaction):
     await _ads_open_claim(interaction)
 
 
+@bot.tree.command(name="adsgrant", description="Give a member an ad perk (staff)")
+@app_commands.describe(user="Member to give the perk to", perk="Which perk", amount="How many (default 1)")
+@app_commands.choices(perk=[
+    app_commands.Choice(name="Everyone Ping", value="ping_everyone"),
+    app_commands.Choice(name="Here Ping", value="ping_here"),
+    app_commands.Choice(name="No Ping", value="ping_none"),
+    app_commands.Choice(name="Instant Post", value="instant"),
+    app_commands.Choice(name="Bypass Queue", value="bypass"),
+])
+async def adsgrant_cmd(interaction: discord.Interaction, user: discord.Member, perk: app_commands.Choice[str], amount: int = 1):
+    if not _is_ads_staff(interaction.user):
+        await interaction.response.send_message(embed=error_embed("Staff only", "You need to be ad staff (or Manage Server)."), ephemeral=True)
+        return
+    amount = max(1, min(100, amount))
+    _ads_grant(interaction.guild.id, user.id, perk.value, amount)
+    inv = _ads_inventory(interaction.guild.id, user.id)
+    await interaction.response.send_message(
+        embed=success_embed("Perk granted", f"Gave {user.mention} **{amount}× {_ads_perk_label(perk.value)}**.\n\n**Their inventory:**\n{_ads_inventory_text(inv)}"),
+        ephemeral=True)
+
+
 async def _pkg_review_submit(interaction, pkg_msg_id):
     """Review modal submitted — post it to a #reviews-style channel in the origin
     guild (if one exists) and thank the reviewer."""
@@ -8400,6 +8431,13 @@ async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to, title=None, p
                 await _pkg_files_set(str(pkg_msg_id), {"product": title, "price_field": price_field})
             except Exception:
                 pass
+        # Stash any ad-perk grant in memory keyed by (message, buyer) so it lands
+        # on claim even if the record store above failed.
+        perk = _ads_perk_for_name(title)
+        if perk:
+            _pending_perk_grant[(str(pkg_msg_id), str(interaction.user.id))] = (
+                str(interaction.guild.id) if interaction.guild else "",
+                str(deliver_to or interaction.user.id), perk)
     else:
         rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
         title = ((rec.get("product") if rec else "") or "").strip()
