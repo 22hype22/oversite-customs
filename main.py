@@ -6885,6 +6885,14 @@ async def apply_config(feature, cfg, post_panel=False):
         edited_panel = next((p for p in panels if p["channel_id"] == edited_ch), (panels[0] if panels else {"components": []}))
         marketplace_config["panel_channel_id"] = edited_ch
         marketplace_config["panel_components"] = edited_panel.get("components", [])
+        # The ad post channel + interval are configured here (in Marketplace).
+        if "ad_post_channel_id" in cfg:
+            ads_config["post_channel_id"] = str(cfg.get("ad_post_channel_id") or "")
+        if cfg.get("ad_interval_minutes"):
+            try:
+                ads_config["interval_minutes"] = max(1, int(cfg["ad_interval_minutes"]))
+            except Exception:
+                pass
         _ticket_sources["marketplace"] = {"panels": panels, "types": _parse_ticket_types(cfg)}
         _rebuild_ticket_registry()
         print(f"[Config] marketplace — category {marketplace_config['category_id']} roles {marketplace_config['support_role_ids']} panel_ch {edited_ch} panels {len(panels)} types {len(_ticket_sources['marketplace']['types'])}")
@@ -6982,13 +6990,9 @@ async def apply_config(feature, cfg, post_panel=False):
               f"design {len(invite_tracker_config['board_components'])}")
     elif feature in ("ads", "advertisements"):
         ads_config["enabled"] = bool(cfg.get("enabled", True))
-        ads_config["post_channel_id"] = str(cfg.get("post_channel_id") or "")
         ads_config["approval_channel_id"] = str(cfg.get("approval_channel_id") or "")
         ads_config["staff_role_ids"] = [str(x) for x in (cfg.get("staff_role_ids") or []) if x]
-        try:
-            ads_config["interval_minutes"] = max(1, int(cfg.get("interval_minutes") or 60))
-        except Exception:
-            ads_config["interval_minutes"] = 60
+        # NOTE: post channel + interval are set in the Marketplace block.
         perks = cfg.get("perks")
         if isinstance(perks, dict):
             for k in ADS_PERK_KEYS:
@@ -7002,8 +7006,8 @@ async def apply_config(feature, cfg, post_panel=False):
         _register_eph_from_tree(ads_config["giveaway_design"])
         if cfg.get("claim_button_label"):
             ads_config["claim_button_label"] = str(cfg["claim_button_label"])
-        print(f"[Config] ads — enabled {ads_config['enabled']} post {ads_config['post_channel_id'] or '(none)'} "
-              f"approval {ads_config['approval_channel_id'] or '(none)'} interval {ads_config['interval_minutes']}m")
+        print(f"[Config] ads — enabled {ads_config['enabled']} "
+              f"approval {ads_config['approval_channel_id'] or '(none)'}")
     elif feature in ("music-addon", "customs-music-addon"):
         music_config["enabled"] = True
         music_config["dj_role_ids"] = [str(x) for x in (cfg.get("dj_role_ids") or []) if x]
