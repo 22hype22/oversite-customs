@@ -91,21 +91,26 @@ ticket_access = {}      # key -> comma-separated role names that can see a Ticke
 # purchase flow (payment picker + gift/recipient + MSA agreement).
 purchase_msgs = {}
 
-_PURCHASE_METHOD_LABELS = {"gamepass": "Gamepass", "select": "Roblox Select", "stripe": "Stripe"}
+_PURCHASE_METHOD_LABELS = {"devproduct": "Dev Product", "select": "Roblox Select", "stripe": "Stripe"}
 
 
 def _purchase_cfg_from(comp):
     """Normalize a Purchase component / button into its stored config."""
     methods = comp.get("methods")
     if not isinstance(methods, list) or not methods:
-        methods = ["gamepass", "select", "stripe"]
-    methods = [m for m in methods if m in _PURCHASE_METHOD_LABELS] or ["stripe"]
+        methods = ["devproduct", "select", "stripe"]
+    # Legacy configs stored "gamepass" — that method is now Roblox dev products.
+    methods = ["devproduct" if m == "gamepass" else m for m in methods]
+    seen = set()
+    methods = [m for m in methods if m in _PURCHASE_METHOD_LABELS and not (m in seen or seen.add(m))] or ["stripe"]
     return {
         "title": str(comp.get("title") or comp.get("product") or comp.get("label") or "Purchase").strip(),
         "price": str(comp.get("price") or comp.get("price_line") or "").strip(),
         "methods": methods,
         "msa_url": str(comp.get("msa_url") or "").strip(),
         "button_label": str(comp.get("button_label") or comp.get("label") or "Purchase").strip() or "Purchase",
+        # Donation mode: the buyer chooses USD or Robux and types the amount.
+        "donation": bool(comp.get("donation")),
     }
 
 
@@ -3394,7 +3399,7 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
     # Every package card gets the three purchase buttons. Each one gates the
     # buyer behind Roblox verification, then runs its flow (built in phases).
     view = discord.ui.View(timeout=None)
-    view.add_item(discord.ui.Button(label="Gamepass", style=discord.ButtonStyle.secondary, custom_id="pkg_buy:gamepass"))
+    view.add_item(discord.ui.Button(label="Dev Product", style=discord.ButtonStyle.secondary, custom_id="pkg_buy:gamepass"))
     view.add_item(discord.ui.Button(label="Roblox Select", style=discord.ButtonStyle.secondary, custom_id="pkg_buy:select"))
     view.add_item(discord.ui.Button(label="Stripe", style=discord.ButtonStyle.secondary, custom_id="pkg_buy:stripe"))
 
@@ -5173,6 +5178,9 @@ async def on_interaction(interaction: discord.Interaction):
     elif cid.startswith("pkg_claim:stripe"):
         parts = cid.split(":")  # pkg_claim:stripe:{pkgmsg}:{deliverto}
         await _pkg_claim_stripe(interaction, parts[2] if len(parts) > 2 else "", parts[3] if len(parts) > 3 else "")
+    elif cid.startswith("pkg_claim:dp:"):
+        parts = cid.split(":")  # pkg_claim:dp:{pkgmsg}:{deliverto}
+        await _pkg_claim_devproduct(interaction, parts[2] if len(parts) > 2 else "", parts[3] if len(parts) > 3 else "")
     elif cid.startswith("pkg_dl:"):
         await _pkg_download(interaction, cid.split(":", 1)[1])
     elif cid.startswith("pkg_review:"):
@@ -7194,6 +7202,27 @@ async def _robux_locker_call(action, amount=0, time_frame=None, **extra):
         return {"error": str(e)[:200]}
 
 
+async def _devproduct_call(action, **extra):
+    """POST to the roblox-devproduct edge function (find-or-create a Roblox
+    developer product by name; the cookie lives server-side)."""
+    payload = {"action": action}
+    payload.update(extra)
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{SUPABASE_FN_URL}/roblox-devproduct",
+                headers=_fn_headers(),
+                json=payload,
+                timeout=25,
+            )
+            data = r.json() if r.content else {}
+            if r.status_code == 200:
+                return data
+            return {"error": data.get("error") or f"HTTP {r.status_code}"}
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
 async def _payments_call(action, **extra):
     """POST an action to the payments-create edge function (Stripe purchase-log
     poller: stripe_recent / stripe_state_get / stripe_state_set)."""
@@ -7737,21 +7766,35 @@ class _PkgBuyModal(discord.ui.Modal):
 
 
 class _PurchaseModal(discord.ui.Modal):
-    """A designed Purchase button's form: pick the payment method, buy for
-    yourself or gift it, and agree to the Master Service Agreement — all in one."""
+    """A designed Purchase button's form: pick how to pay, buy for yourself or
+    gift it, and agree to the Master Service Agreement — all in one. In donation
+    mode the buyer chooses USD or Robux and types the amount instead."""
     def __init__(self, pkg_id, cfg):
         prod = cfg.get("title") or "Purchase"
-        super().__init__(title=f"Purchase {prod}"[:45], timeout=600)
+        self._donation = bool(cfg.get("donation"))
+        super().__init__(title=(f"Donate to {prod}" if self._donation else f"Purchase {prod}")[:45], timeout=600)
         self._pkg_id = str(pkg_id)
         self._cfg = cfg
-        methods = cfg.get("methods") or ["gamepass", "select", "stripe"]
-        opts = []
-        for m in methods:
-            if m in _PURCHASE_METHOD_LABELS:
-                opts.append(discord.SelectOption(label=_PURCHASE_METHOD_LABELS[m], value=m, default=not opts))
-        if not opts:
-            opts = [discord.SelectOption(label="Stripe", value="stripe", default=True)]
-        self.method = discord.ui.Select(custom_id="method", min_values=1, max_values=1, options=opts)
+
+        if self._donation:
+            self.method = discord.ui.Select(custom_id="method", min_values=1, max_values=1, options=[
+                discord.SelectOption(label="USD (Stripe)", value="stripe", default=True),
+                discord.SelectOption(label="Robux (dev product)", value="devproduct"),
+            ])
+            self.amount = discord.ui.TextInput(custom_id="amount", style=discord.TextStyle.short,
+                                               placeholder="e.g. 500", max_length=12, required=True)
+        else:
+            methods = cfg.get("methods") or ["devproduct", "select", "stripe"]
+            opts = []
+            for m in methods:
+                m = "devproduct" if m == "gamepass" else m
+                if m in _PURCHASE_METHOD_LABELS and m not in [o.value for o in opts]:
+                    opts.append(discord.SelectOption(label=_PURCHASE_METHOD_LABELS[m], value=m, default=not opts))
+            if not opts:
+                opts = [discord.SelectOption(label="Stripe", value="stripe", default=True)]
+            self.method = discord.ui.Select(custom_id="method", min_values=1, max_values=1, options=opts)
+            self.amount = None
+
         self.recipient = discord.ui.Select(custom_id="recipient", min_values=1, max_values=1, options=[
             discord.SelectOption(label="Personal", value="personal", default=True),
             discord.SelectOption(label="Gift", value="gift"),
@@ -7760,7 +7803,12 @@ class _PurchaseModal(discord.ui.Modal):
         self.agree = discord.ui.Checkbox(custom_id="agree")
         msa = cfg.get("msa_url") or ""
         msa_desc = "Check to agree — required to continue." + (f" Read it: {msa}" if msa else "")
-        self.add_item(discord.ui.Label(text="Payment method", description="How you'd like to pay.", component=self.method))
+
+        if self._donation:
+            self.add_item(discord.ui.Label(text="Currency", description="Donate in USD or Robux.", component=self.method))
+            self.add_item(discord.ui.Label(text="Amount", description="How much you'd like to give.", component=self.amount))
+        else:
+            self.add_item(discord.ui.Label(text="Payment method", description="How you'd like to pay.", component=self.method))
         self.add_item(discord.ui.Label(text="Recipient", description="Buy for yourself, or gift it to someone.", component=self.recipient))
         self.add_item(discord.ui.Label(text="Gift Recipient (required if gifting)", component=self.ruser))
         self.add_item(discord.ui.Label(text="Master Service Agreement", description=msa_desc[:100], component=self.agree))
@@ -7771,6 +7819,25 @@ class _PurchaseModal(discord.ui.Modal):
                 embed=error_embed("Agreement required", "You must agree to the **Master Service Agreement** to continue."), ephemeral=True)
             return
         kind = self.method.values[0] if self.method.values else "stripe"
+        title = self._cfg.get("title")
+        price_field = self._cfg.get("price")
+        if self._donation:
+            raw = (self.amount.value or "").strip().replace("$", "").replace("R$", "").replace(",", "")
+            try:
+                amt = float(raw)
+            except ValueError:
+                amt = 0
+            if amt <= 0:
+                await interaction.response.send_message(
+                    embed=error_embed("Enter an amount", "Type how much you'd like to donate (a number)."), ephemeral=True)
+                return
+            if kind == "devproduct":
+                amt = int(round(amt))
+                price_field = f"R${amt}"
+                title = f"{title} Donation R${amt}"
+            else:
+                price_field = f"${amt:.2f}"
+                title = f"{title} Donation"
         mode = self.recipient.values[0] if self.recipient.values else "personal"
         if mode == "gift":
             picks = self.ruser.values
@@ -7783,7 +7850,7 @@ class _PurchaseModal(discord.ui.Modal):
             deliver_to = str(interaction.user.id)
         await interaction.response.defer(ephemeral=True, thinking=True)
         await _pkg_run_flow(interaction, kind, self._pkg_id, deliver_to,
-                            title=self._cfg.get("title"), price_field=self._cfg.get("price"))
+                            title=title, price_field=price_field)
 
 
 async def _pkg_handle_buy(interaction, kind):
@@ -7829,8 +7896,8 @@ async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to, title=None, p
         rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
         title = ((rec.get("product") if rec else "") or "").strip()
         price_field = (rec.get("price_field") if rec else "") or ""
-    if kind == "gamepass":
-        await _pkg_flow_gamepass(interaction, title, pkg_msg_id, deliver_to)
+    if kind in ("devproduct", "gamepass"):
+        await _pkg_flow_devproduct(interaction, title, price_field, pkg_msg_id, deliver_to)
     elif kind == "select":
         await _pkg_flow_select(interaction, price_field, pkg_msg_id, deliver_to)
     elif kind == "stripe":
@@ -7841,6 +7908,49 @@ async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to, title=None, p
 
 def _pkg_gift_note(deliver_to, buyer_id):
     return "" if str(deliver_to) == str(buyer_id) else f"\n\n🎁 This is a gift, the receipt goes to <@{deliver_to}>."
+
+
+async def _pkg_flow_devproduct(interaction, title, price_field, pkg_msg_id, deliver_to):
+    """Find (or create) a Roblox developer product named after the item, then
+    hand over the web Store buy link + a Claim button. Dev products are bought on
+    the experience's Store tab (no in-game visit needed)."""
+    help_to = _pkg_help_mention(interaction.guild)
+    if not title:
+        await interaction.followup.send(embed=error_embed(
+            "No product name", f"This purchase has no title to match a dev product. Open a ticket in {help_to}."), ephemeral=True)
+        return
+    robux = _pkg_parse_robux(price_field)
+    res = await _devproduct_call("find_or_create", name=title, priceRobux=int(robux or 0))
+    if not (isinstance(res, dict) and res.get("ok") and res.get("productId")):
+        err = (res or {}).get("error") if isinstance(res, dict) else None
+        await interaction.followup.send(embed=error_embed(
+            "Couldn't set up the product", f"{err or 'Roblox did not respond.'} Open a ticket in {help_to}."), ephemeral=True)
+        return
+    buy = res.get("buyUrl") or ""
+    price_note = f" (R$ {robux})" if robux else ""
+    view = discord.ui.View(timeout=None)
+    if buy:
+        view.add_item(discord.ui.Button(label="Buy on Roblox", style=discord.ButtonStyle.link, url=buy))
+    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:dp:{pkg_msg_id}:{deliver_to}"))
+    await interaction.followup.send(embed=info_embed(
+        "Your Dev Product",
+        f"Buy **{title}**{price_note} with the button below — open the **Store** tab and purchase it.\n"
+        f"After buying, click **Claim Package**."
+        + _pkg_gift_note(deliver_to, interaction.user.id)),
+        view=view, ephemeral=True)
+
+
+async def _pkg_claim_devproduct(interaction, pkg_msg_id="", deliver_to=""):
+    """Claim for a dev-product purchase. Dev products can't be ownership-checked
+    from outside the game, so this is trust-based (like Stripe): DM the receipt;
+    the sale shows in the group's Robux transaction history for auditing."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    acct = await _pkg_lookup_roblox(interaction.user.id) or {"roblox_username": interaction.user.display_name, "roblox_id": ""}
+    rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
+    robux = _pkg_parse_robux((rec or {}).get("price_field") or "")
+    price_str = f"R$ {robux}" if robux else ""
+    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, None, deliver_to)
+    await interaction.followup.send(embed=success_embed("Claimed", _pkg_claimed_msg(dm_ok, target, interaction.user)), ephemeral=True)
 
 
 async def _pkg_flow_gamepass(interaction, title, pkg_msg_id, deliver_to):
