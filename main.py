@@ -87,6 +87,33 @@ form_titles = {}   # key -> modal title (the button/option label)
 ticket_categories = {}  # key -> category name a Ticket/Form drops its channels into
 ticket_access = {}      # key -> comma-separated role names that can see a Ticket/Form's channels
 
+# Marketplace = a second, independent ticket system (its own category, support
+# roles, log, and panels). Same open/claim/close flow as Tickets; which settings
+# apply is chosen per button by the source its panel came from (see _key_source).
+marketplace_config = {
+    "category_id": "",
+    "support_role_ids": [],
+    "log_channel_id": "",
+    "open_message": "",
+    "ping_support": True,
+    "one_per_user": True,
+    "panel_channel_id": "",
+    "panel_components": [],
+    "panels": [],
+    "types": [],
+    "panel_refs": {},
+}
+# Which settings block a given Ticket/Form button uses, keyed by its message key.
+_source_settings = {"tickets": ticket_config, "marketplace": marketplace_config}
+_key_source = {}  # message key -> source feature ("tickets" | "marketplace")
+
+
+def _settings_for_category(category):
+    """Pick the settings block (Tickets vs Marketplace) for a clicked button.
+    `category` is the custom_id path (e.g. 'ticket_msg:<key>')."""
+    mk = category.split(":", 1)[1] if category and ":" in str(category) else category
+    return _source_settings.get(_key_source.get(mk, "tickets"), ticket_config)
+
 # ---- Giveaways ----
 # Look designed in the dashboard "Giveaway" block (feature "customs-giveaway").
 # Every field is optional — the bot has sensible defaults so /giveaway works with
@@ -342,35 +369,38 @@ def _comp_key(x):
 def _register_ticket_components(panels):
     """Register the interactive components (Ticket/Form/Ephemeral) from EVERY
     panel so all posted panels keep working — not just the most recent one.
-    `panels` is a list of component-trees (one per panel). A single tree is also
-    accepted for backward compatibility."""
+    `panels` accepts a list of (source, tree) pairs (source = the feature the
+    panel came from, e.g. 'tickets' or 'marketplace'), or a plain list of trees /
+    a single tree (treated as source 'tickets') for backward compatibility."""
     # NOTE: eph_msgs is intentionally NOT cleared here — ephemeral messages live on
     # many surfaces (saved messages, packages, …), not just ticket panels, so
     # wiping it on a ticket save used to break their buttons ("Nothing here").
     # Keys are stable, so stale entries are harmless.
-    ticket_msgs.clear(); form_msgs.clear(); form_titles.clear(); ticket_categories.clear(); ticket_access.clear()
+    ticket_msgs.clear(); form_msgs.clear(); form_titles.clear(); ticket_categories.clear(); ticket_access.clear(); _key_source.clear()
 
-    def _reg(x):
+    def _reg(x, source):
         oc = x.get("open_components") or []
         if "ticket" in x:
             k = _comp_key(x)
             ticket_msgs[k] = oc
             ticket_categories[k] = (x.get("category_name") or "").strip()
             ticket_access[k] = (x.get("access_roles") or "").strip()
+            _key_source[k] = source
         elif "form" in x:
             k = _comp_key(x)
             form_msgs[k] = oc
             form_titles[k] = x.get("label") or "Application"
             ticket_categories[k] = (x.get("category_name") or "").strip()
             ticket_access[k] = (x.get("access_roles") or "").strip()
+            _key_source[k] = source
         elif "ephemeral" in x:
             eph_msgs[_comp_key(x)] = oc
         # A Ticket/Ephemeral message can itself contain more Ticket/Ephemeral
         # buttons, so register the ones nested inside it too.
         if oc:
-            walk(oc, 0)
+            walk(oc, 0, source)
 
-    def walk(items, depth):
+    def walk(items, depth, source):
         if depth > 8:
             return
         for c in (items or []):
@@ -378,27 +408,35 @@ def _register_ticket_components(panels):
                 continue
             t = c.get("type")
             if t == "container":
-                walk(c.get("children") or c.get("components") or [], depth + 1)
+                walk(c.get("children") or c.get("components") or [], depth + 1, source)
             elif t in ("buttonRow", "button_row", "buttons", "action_row"):
                 for b in (c.get("buttons") or []):
                     if isinstance(b, dict):
-                        _reg(b)
+                        _reg(b, source)
             elif t in ("select_menu", "select"):
                 for o in (c.get("options") or []):
                     if isinstance(o, dict):
-                        _reg(o)
+                        _reg(o, source)
             elif t == "section":
                 b = c.get("button")
                 if isinstance(b, dict):
-                    _reg(b)
+                    _reg(b, source)
 
-    # Accept a single tree (list of items) or a list of trees (one per panel).
-    trees = panels or []
-    if trees and isinstance(trees[0], dict):
-        trees = [trees]
-    for tree in trees:
+    # Normalize into a list of (source, tree). Accept (source, tree) pairs, a
+    # single tree, or a plain list of trees.
+    sourced = []
+    for entry in (panels or []):
+        if isinstance(entry, tuple) and len(entry) == 2:
+            sourced.append(entry)
+        elif isinstance(entry, list):
+            sourced.append(("tickets", entry))
+        elif isinstance(entry, dict):
+            # a bare tree passed as a single list of dict items
+            sourced = [("tickets", panels)]
+            break
+    for source, tree in sourced:
         if isinstance(tree, list):
-            walk(tree, 0)
+            walk(tree, 0, source)
     print(f"[Tickets] registry: {len(ticket_msgs)} ticket + {len(form_msgs)} form + {len(eph_msgs)} ephemeral messages")
     print(f"[Tickets] registry built: tickets={{{', '.join(f'{k}:{len(v)}' for k,v in ticket_msgs.items())}}} eph={{{', '.join(f'{k}:{len(v)}' for k,v in eph_msgs.items())}}}")
 
@@ -493,11 +531,11 @@ def _rebuild_ticket_registry():
     """Rebuild the interactive-component registry AND the union panel/type lists
     from every registered ticket source (main Tickets + Order Log)."""
     trees = []
-    for src in _ticket_sources.values():
+    for feature, src in _ticket_sources.items():
         for p in src.get("panels", []):
             comps = p.get("components")
             if isinstance(comps, list):
-                trees.append(comps)
+                trees.append((feature, comps))
     _register_ticket_components(trees)
     ticket_config["panels"] = [p for src in _ticket_sources.values() for p in src.get("panels", [])]
     ticket_config["types"] = [t for src in _ticket_sources.values() for t in src.get("types", [])]
@@ -5455,11 +5493,12 @@ async def open_ticket_form(interaction, key):
         return
 
     guild = interaction.guild
-    if guild and ticket_config.get("one_per_user", True):
+    st = _source_settings.get(_key_source.get(key, "tickets"), ticket_config)
+    if guild and st.get("one_per_user", True):
         cat_name = ticket_categories.get(key)
         fb = None
         if not cat_name:
-            cid = ticket_config.get("category_id") or ""
+            cid = st.get("category_id") or ""
             if cid:
                 fb = guild.get_channel(int(cid))
         if _user_ticket_count_for(guild, interaction.user.id, cat_name, fb) >= MAX_TICKETS_PER_SECTION:
@@ -5619,25 +5658,29 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
     if not already_responded:
         await interaction.response.defer(ephemeral=True)
 
+    # Tickets vs Marketplace: use the settings block for whichever panel this
+    # button came from.
+    st = _settings_for_category(category)
+
     # Per-Ticket/Form category (by name, created on demand) wins; otherwise fall
-    # back to the globally configured category id.
+    # back to the configured category id for this source.
     category_channel = None
     if category_name_override:
         category_channel = await _get_or_create_category(guild, category_name_override)
     if category_channel is None:
-        cat_id = ticket_config.get("category_id") or ""
+        cat_id = st.get("category_id") or ""
         if cat_id:
             category_channel = guild.get_channel(int(cat_id))
 
     # Limit: up to MAX_TICKETS_PER_SECTION open tickets per section (category).
-    if ticket_config.get("one_per_user", True):
+    if st.get("one_per_user", True):
         open_count = _user_ticket_count_for(guild, interaction.user.id, category_name_override, category_channel)
         if open_count >= MAX_TICKETS_PER_SECTION:
             await interaction.followup.send(embed=error_embed("Limit reached", f"You already have {MAX_TICKETS_PER_SECTION} open tickets in this section. Please close one before opening another."), ephemeral=True)
             return
 
     support_roles = []
-    for rid in ticket_config.get("support_role_ids", []):
+    for rid in st.get("support_role_ids", []):
         role = guild.get_role(int(rid))
         if role:
             support_roles.append(role)
@@ -5721,7 +5764,7 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
             sent_rich = False
 
     if not sent_rich:
-        open_msg = ticket_config.get("open_message") or f"Thanks {interaction.user.mention}, a member of the team will be with you shortly."
+        open_msg = st.get("open_message") or f"Thanks {interaction.user.mention}, a member of the team will be with you shortly."
         open_msg = open_msg.replace("{user}", interaction.user.mention)
         embed = info_embed(f"{type_name} ticket", open_msg)
         embed.set_footer(text=f"Opened by {interaction.user}")
@@ -5775,7 +5818,7 @@ async def _do_close(channel, guild, closer, reason=""):
     opener_id = parts[1] if len(parts) > 1 else ""
     category = parts[2] if len(parts) > 2 else "support"
     transcript = await build_transcript(channel)
-    log_id = ticket_config.get("log_channel_id") or ""
+    log_id = _settings_for_category(category).get("log_channel_id") or ""
     opener = guild.get_member(int(opener_id)) if opener_id.isdigit() else None
     if log_id:
         log_channel = guild.get_channel(int(log_id))
@@ -6595,6 +6638,30 @@ async def apply_config(feature, cfg, post_panel=False):
         print(f"[Config] tickets — category {ticket_config['category_id']} roles {ticket_config['support_role_ids']} panel_ch {ticket_config['panel_channel_id']} panel {len(ticket_config['panel_components'])} types {len(ticket_config['types'])}")
         # Post/refresh ONLY the panel being edited on a save (not on boot, and
         # not the other panels — those stay put).
+        if post_panel:
+            await post_ticket_panel(only_channel_id=edited_ch or None)
+    elif feature in ("marketplace", "customs-marketplace"):
+        # An independent second ticket system with its own category/roles/log.
+        if cfg.get("category_id"):
+            marketplace_config["category_id"] = str(cfg["category_id"])
+        if cfg.get("support_role_ids") is not None:
+            marketplace_config["support_role_ids"] = [str(x) for x in cfg["support_role_ids"] if x]
+        if cfg.get("log_channel_id"):
+            marketplace_config["log_channel_id"] = str(cfg["log_channel_id"])
+        if cfg.get("open_message") is not None:
+            marketplace_config["open_message"] = cfg.get("open_message") or ""
+        if "ping_support" in cfg:
+            marketplace_config["ping_support"] = bool(cfg["ping_support"])
+        if "one_per_user" in cfg:
+            marketplace_config["one_per_user"] = bool(cfg["one_per_user"])
+        panels = _parse_ticket_panels(cfg)
+        edited_ch = str(cfg.get("panel_channel_id") or (panels[0]["channel_id"] if panels else ""))
+        edited_panel = next((p for p in panels if p["channel_id"] == edited_ch), (panels[0] if panels else {"components": []}))
+        marketplace_config["panel_channel_id"] = edited_ch
+        marketplace_config["panel_components"] = edited_panel.get("components", [])
+        _ticket_sources["marketplace"] = {"panels": panels, "types": _parse_ticket_types(cfg)}
+        _rebuild_ticket_registry()
+        print(f"[Config] marketplace — category {marketplace_config['category_id']} roles {marketplace_config['support_role_ids']} panel_ch {edited_ch} panels {len(panels)} types {len(_ticket_sources['marketplace']['types'])}")
         if post_panel:
             await post_ticket_panel(only_channel_id=edited_ch or None)
     elif feature == "credits":
@@ -7982,7 +8049,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "invite-tracker"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "invite-tracker", "marketplace"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
