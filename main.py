@@ -131,6 +131,108 @@ def _register_purchase_from_tree(tree):
                 _walk(c.get("children") or c.get("components") or [], depth + 1)
     _walk(tree if isinstance(tree, list) else [], 0)
 
+
+# ===================== Advertisement system =====================
+# Users buy ad perks (via Purchase components) -> they land in a per-user
+# inventory. To post, they spend one PING credit (Everyone/Here/No Ping) and may
+# apply Instant Post or Bypass Queue add-ons. Every ad is staff-approved, then
+# posted now (Instant), via a priority Bypass lane, or via the normal queue.
+ADS_PERK_KEYS = ["ping_everyone", "ping_here", "ping_none", "instant", "bypass"]
+ADS_PING_KEYS = ["ping_everyone", "ping_here", "ping_none"]
+_ADS_PING_CONTENT = {"ping_everyone": "@everyone", "ping_here": "@here", "ping_none": ""}
+
+ads_config = {
+    "enabled": False,
+    "post_channel_id": "",
+    "approval_channel_id": "",
+    "staff_role_ids": [],
+    "interval_minutes": 60,
+    # Purchasable item name for each perk (owner matches these to the Purchase
+    # cards). Matching a claimed purchase by name grants that perk.
+    "perks": {
+        "ping_everyone": "Everyone Ping",
+        "ping_here": "Here Ping",
+        "ping_none": "No Ping",
+        "instant": "Instant Post",
+        "bypass": "Bypass Queue",
+    },
+    "regular_design": [],    # V2 tree; tokens {advertiser} {server_link} {ping}
+    "giveaway_design": [],   # V2 tree; tokens {advertiser} {prize} {winners} {duration} {ping}
+    "claim_button_label": "📢 Post an Ad",
+}
+ads_data = {}  # guild_id(str) -> {"inventory": {uid: {perk: n}}, "queue": [ad], "bypass": [ad], "last_drip": 0}
+_ads_save_pending = None
+_ads_pending = {}  # ad_id -> ad dict awaiting approval (also mirrored in ads_data)
+
+
+def _ads_g(guild_id):
+    return ads_data.setdefault(str(guild_id), {"inventory": {}, "queue": [], "bypass": [], "last_drip": 0})
+
+
+def _ads_inventory(guild_id, user_id):
+    return _ads_g(guild_id)["inventory"].get(str(user_id), {})
+
+
+def _ads_perk_for_name(name):
+    """Match a purchased product name to a perk key (case-insensitive, ignoring a
+    trailing 'Donation …' suffix)."""
+    n = str(name or "").strip().lower()
+    if not n:
+        return None
+    n = re.sub(r"\s+donation.*$", "", n).strip()
+    for key, label in (ads_config.get("perks") or {}).items():
+        if str(label or "").strip().lower() == n and key in ADS_PERK_KEYS:
+            return key
+    return None
+
+
+def _ads_grant(guild_id, user_id, perk_key, n=1):
+    if perk_key not in ADS_PERK_KEYS:
+        return
+    inv = _ads_g(guild_id)["inventory"].setdefault(str(user_id), {})
+    inv[perk_key] = int(inv.get(perk_key, 0)) + n
+    _save_ads_soon()
+
+
+def _ads_consume(guild_id, user_id, perk_key, n=1):
+    inv = _ads_g(guild_id)["inventory"].get(str(user_id), {})
+    if int(inv.get(perk_key, 0)) < n:
+        return False
+    inv[perk_key] = int(inv.get(perk_key, 0)) - n
+    if inv[perk_key] <= 0:
+        inv.pop(perk_key, None)
+    _save_ads_soon()
+    return True
+
+
+def _ads_perk_label(perk_key):
+    return (ads_config.get("perks") or {}).get(perk_key) or perk_key
+
+
+def _save_ads_soon():
+    global _ads_save_pending
+    if _ads_save_pending and not _ads_save_pending.done():
+        return
+    _ads_save_pending = asyncio.create_task(_save_ads())
+
+
+async def _save_ads():
+    await asyncio.sleep(4)
+    await _bot_config_upsert("ads-data", {"guilds": ads_data})
+
+
+async def _load_ads():
+    cfg = await _bot_config_get("ads-data")
+    guilds = (cfg or {}).get("guilds")
+    if isinstance(guilds, dict):
+        ads_data.clear()
+        ads_data.update(guilds)
+        # Rehydrate pending approvals so their buttons work after a restart.
+        for gd in ads_data.values():
+            for ad in (gd.get("queue", []) + gd.get("bypass", [])):
+                pass
+
+
 # Marketplace = a second, independent ticket system (its own category, support
 # roles, log, and panels). Same open/claim/close flow as Tickets; which settings
 # apply is chosen per button by the source its panel came from (see _key_source).
@@ -855,6 +957,10 @@ async def on_ready():
         print(f"[Startup] secret-slot seed failed: {e}")
 
     try:
+        await _load_ads()
+    except Exception as e:
+        print(f"[Ads] load failed: {e}")
+    try:
         await _load_invite_tracker()
         for g in bot.guilds:
             await _cache_guild_invites(g)
@@ -879,6 +985,8 @@ async def on_ready():
         daily_group_sync.start()
     if not persist_music_state.is_running():
         persist_music_state.start()
+    if not ads_drip.is_running():
+        ads_drip.start()
     await refresh_status()
 
     try:
@@ -5152,6 +5260,12 @@ async def on_interaction(interaction: discord.Interaction):
         await _qc_open_deny(interaction, cid.split(":", 1)[1])
     elif cid.startswith("pkg_buy:"):
         await _pkg_handle_buy(interaction, cid.split(":", 1)[1])
+    elif cid == "ad_claim":
+        await _ads_open_claim(interaction)
+    elif cid.startswith("ad_ok:"):
+        await _ads_decide(interaction, cid.split(":", 1)[1], True)
+    elif cid.startswith("ad_no:"):
+        await _ads_decide(interaction, cid.split(":", 1)[1], False)
     elif cid.startswith("purchase:"):
         key = cid.split(":", 1)[1]
         cfg = purchase_msgs.get(key)
@@ -6575,6 +6689,9 @@ def build_button(btn, guild):
     if btn.get("orderstatus"):
         # Order Status button — shows a live per-service open/limited/closed embed.
         return _btn({"type": 2, "label": (label[:80] or "Order Status"), "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": "orderstatus"})
+    if btn.get("adclaim"):
+        # Advertising "Post an Ad" button — opens the buyer's ad inventory + post flow.
+        return _btn({"type": 2, "label": (label[:80] or ads_config.get("claim_button_label") or "Post an Ad"), "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": "ad_claim"})
     if btn.get("__verify"):
         return _btn({"type": 2, "label": (label[:80] or "Verify"), "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": "roblox_verify"})
     if btn.get("__ticket_open"):
@@ -6832,6 +6949,30 @@ async def apply_config(feature, cfg, post_panel=False):
         _register_eph_from_tree(invite_tracker_config["board_components"])
         print(f"[Config] invite-tracker — enabled {invite_tracker_config['enabled']} "
               f"design {len(invite_tracker_config['board_components'])}")
+    elif feature in ("ads", "advertisements"):
+        ads_config["enabled"] = bool(cfg.get("enabled", True))
+        ads_config["post_channel_id"] = str(cfg.get("post_channel_id") or "")
+        ads_config["approval_channel_id"] = str(cfg.get("approval_channel_id") or "")
+        ads_config["staff_role_ids"] = [str(x) for x in (cfg.get("staff_role_ids") or []) if x]
+        try:
+            ads_config["interval_minutes"] = max(1, int(cfg.get("interval_minutes") or 60))
+        except Exception:
+            ads_config["interval_minutes"] = 60
+        perks = cfg.get("perks")
+        if isinstance(perks, dict):
+            for k in ADS_PERK_KEYS:
+                if perks.get(k):
+                    ads_config["perks"][k] = str(perks[k])
+        rd = cfg.get("regular_design")
+        ads_config["regular_design"] = rd if isinstance(rd, list) else []
+        gd = cfg.get("giveaway_design")
+        ads_config["giveaway_design"] = gd if isinstance(gd, list) else []
+        _register_eph_from_tree(ads_config["regular_design"])
+        _register_eph_from_tree(ads_config["giveaway_design"])
+        if cfg.get("claim_button_label"):
+            ads_config["claim_button_label"] = str(cfg["claim_button_label"])
+        print(f"[Config] ads — enabled {ads_config['enabled']} post {ads_config['post_channel_id'] or '(none)'} "
+              f"approval {ads_config['approval_channel_id'] or '(none)'} interval {ads_config['interval_minutes']}m")
     elif feature in ("music-addon", "customs-music-addon"):
         music_config["enabled"] = True
         music_config["dj_role_ids"] = [str(x) for x in (cfg.get("dj_role_ids") or []) if x]
@@ -7654,6 +7795,14 @@ async def _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, product
     image = (rec.get("image") if rec else "") or ""
     thread_url = (rec.get("thread_url") if rec else "") or ""
     files = (rec.get("files") if rec else []) or []
+    # Advertising perk? If the purchased item's name maps to an ad perk, drop it
+    # into the buyer's (or gift target's) ad inventory.
+    try:
+        perk = _ads_perk_for_name(product)
+        if perk and interaction.guild:
+            _ads_grant(interaction.guild.id, deliver_to or interaction.user.id, perk)
+    except Exception as e:
+        print(f"[Ads] grant on receipt failed: {e}")
     embed = _pkg_receipt_embed(acct["roblox_username"], acct.get("roblox_id"), price_str, product, product_url or thread_url, image)
     view = discord.ui.View(timeout=None)
     if files:
@@ -7693,6 +7842,318 @@ async def _pkg_review(interaction, pkg_msg_id):
         await interaction.response.send_modal(_PkgReviewModal(pkg_msg_id))
     except Exception as e:
         print(f"[Package] review modal failed: {e}")
+
+
+# ---------------- Advertisement claim -> approval -> posting ----------------
+
+def _is_ads_staff(member):
+    try:
+        if member.guild_permissions.manage_guild:
+            return True
+    except Exception:
+        pass
+    return has_any_role(member, ads_config.get("staff_role_ids", []))
+
+
+def _ads_inventory_text(inv):
+    owned = [f"• **{_ads_perk_label(k)}** × {inv[k]}" for k in ADS_PERK_KEYS if inv.get(k)]
+    return "\n".join(owned) if owned else "Empty — buy a ping credit from the ad shop to post."
+
+
+def _ads_summary(ad):
+    lines = [f"**By:** <@{ad.get('user_id')}>", f"**Ping:** {_ads_perk_label(ad.get('ping'))}"]
+    if ad.get("addon"):
+        lines.append(f"**Add-on:** {_ads_perk_label(ad.get('addon'))}")
+    if ad.get("type") == "giveaway":
+        lines.append(f"**Type:** Sponsored Giveaway\n**Prize:** {ad.get('prize')}\n"
+                     f"**Winners:** {ad.get('winners')}\n**Length:** {ad.get('length')}")
+    else:
+        lines.append(f"**Type:** Regular Post\n**Link:** {ad.get('server_link')}")
+    return "\n".join(lines)
+
+
+def _ads_render(design, tokens):
+    """Deep-fill {tokens} in a V2 design tree so it's ready for send_v2_message."""
+    if not design:
+        return []
+    raw = json.dumps(design)
+    for k, v in tokens.items():
+        raw = raw.replace("{" + k + "}", json.dumps(str(v))[1:-1])
+    try:
+        return json.loads(raw)
+    except Exception:
+        return design
+
+
+async def _ads_post(guild, ad):
+    """Post an approved ad to the configured ad channel."""
+    ch = await resolve_channel(ads_config.get("post_channel_id"))
+    if not ch:
+        print("[Ads] no post channel configured")
+        return False
+    ping = _ADS_PING_CONTENT.get(ad.get("ping"), "")
+    advertiser = f"<@{ad.get('user_id')}>"
+    mentions = {"parse": ["everyone", "users", "roles"]}
+    if ad.get("type") == "giveaway":
+        prize = ad.get("prize") or "a prize"
+        winners = int(ad.get("winners") or 1)
+        seconds = int(ad.get("seconds") or 86400)
+        length = ad.get("length") or ""
+        design = _ads_render(ads_config.get("giveaway_design") or [],
+                             {"advertiser": advertiser, "prize": prize, "winners": winners,
+                              "duration": length, "ping": ping}) or None
+        if ping:
+            try:
+                await ch.send(ping, allowed_mentions=discord.AllowedMentions(everyone=True, users=True, roles=True))
+            except Exception:
+                pass
+        await start_giveaway(ch, prize, winners, seconds, ad.get("user_id"), guild.id, design=design, length=length)
+        return True
+    design = _ads_render(ads_config.get("regular_design") or [],
+                         {"advertiser": advertiser, "server_link": ad.get("server_link") or "", "ping": ping})
+    if design:
+        try:
+            await send_v2_message(ch, design, content=(ping or None), allowed_mentions=mentions)
+            return True
+        except Exception as e:
+            print(f"[Ads] regular post failed: {e}")
+    embed = discord.Embed(title="New Advertisement",
+                          description=f"{advertiser} shared:\n{ad.get('server_link') or ''}", color=ACCENT)
+    try:
+        await ch.send(content=(ping or None), embed=embed,
+                      allowed_mentions=discord.AllowedMentions(everyone=True, users=True, roles=True))
+        return True
+    except Exception as e:
+        print(f"[Ads] fallback post failed: {e}")
+        return False
+
+
+async def _ads_submit(interaction, ad):
+    """Spend the ping (+ optional add-on), then send the ad for staff approval."""
+    gid = interaction.guild.id
+    uid = interaction.user.id
+    if not _ads_consume(gid, uid, ad["ping"]):
+        await interaction.response.send_message(embed=error_embed("Out of stock", "You no longer have that ping credit."), ephemeral=True)
+        return
+    if ad.get("addon"):
+        if not _ads_consume(gid, uid, ad["addon"]):
+            _ads_grant(gid, uid, ad["ping"])
+            await interaction.response.send_message(embed=error_embed("Out of stock", "You no longer have that add-on."), ephemeral=True)
+            return
+    ad_id = secrets.token_hex(6)
+    ad["id"] = ad_id
+    ad["guild_id"] = str(gid)
+    ad["user_id"] = str(uid)
+    _ads_g(gid).setdefault("pending", {})[ad_id] = ad
+    _save_ads_soon()
+    appr = await resolve_channel(ads_config.get("approval_channel_id"))
+    if appr:
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(label="Approve", style=discord.ButtonStyle.success, custom_id=f"ad_ok:{ad_id}"))
+        view.add_item(discord.ui.Button(label="Deny", style=discord.ButtonStyle.danger, custom_id=f"ad_no:{ad_id}"))
+        try:
+            await appr.send(embed=info_embed("Ad awaiting approval", _ads_summary(ad)), view=view)
+        except Exception as e:
+            print(f"[Ads] approval send failed: {e}")
+    await interaction.response.send_message(
+        embed=success_embed("Submitted!", "Your ad was sent for staff approval — you'll see it posted once approved."), ephemeral=True)
+
+
+async def _ads_decide(interaction, ad_id, approve):
+    gid = str(interaction.guild.id)
+    gd = _ads_g(gid)
+    if not _is_ads_staff(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "Only ad staff can do that."), ephemeral=True)
+        return
+    ad = (gd.get("pending") or {}).pop(ad_id, None)
+    if not ad:
+        await interaction.response.send_message(embed=error_embed("Already handled", "This ad was already approved or denied."), ephemeral=True)
+        return
+    _save_ads_soon()
+    if not approve:
+        _ads_grant(gid, ad["user_id"], ad["ping"])
+        if ad.get("addon"):
+            _ads_grant(gid, ad["user_id"], ad["addon"])
+        try:
+            await interaction.response.edit_message(embed=info_embed("Ad denied", _ads_summary(ad) + "\n\n❌ **Denied** — perks refunded."), view=None)
+        except Exception:
+            pass
+        return
+    addon = ad.get("addon")
+    if addon == "instant":
+        try:
+            await interaction.response.edit_message(embed=info_embed("Ad approved", _ads_summary(ad) + "\n\n⚡ **Posted instantly.**"), view=None)
+        except Exception:
+            pass
+        await _ads_post(interaction.guild, ad)
+    elif addon == "bypass":
+        gd.setdefault("bypass", []).append(ad)
+        _save_ads_soon()
+        try:
+            await interaction.response.edit_message(embed=info_embed("Ad approved", _ads_summary(ad) + "\n\n🚀 **Queued — Bypass lane** (posts before the regular queue)."), view=None)
+        except Exception:
+            pass
+    else:
+        gd.setdefault("queue", []).append(ad)
+        _save_ads_soon()
+        try:
+            await interaction.response.edit_message(embed=info_embed("Ad approved", _ads_summary(ad) + "\n\n🕒 **Queued.**"), view=None)
+        except Exception:
+            pass
+
+
+class AdRegularModal(discord.ui.Modal):
+    def __init__(self, state):
+        super().__init__(title="Regular Post", timeout=600)
+        self._state = state
+        self.link = discord.ui.TextInput(label="Server invite link", placeholder="https://discord.gg/…", required=True, max_length=200)
+        self.add_item(self.link)
+
+    async def on_submit(self, interaction):
+        ad = dict(self._state)
+        ad["type"] = "regular"
+        ad["server_link"] = (self.link.value or "").strip()
+        await _ads_submit(interaction, ad)
+
+
+class AdGiveawayModal(discord.ui.Modal):
+    def __init__(self, state):
+        super().__init__(title="Sponsored Giveaway", timeout=600)
+        self._state = state
+        self.prize = discord.ui.TextInput(label="Prize", required=True, max_length=200)
+        self.winners = discord.ui.TextInput(label="Winners", placeholder="1", required=True, max_length=3)
+        self.length = discord.ui.TextInput(label="Length", placeholder="1d, 12h, 30m", required=True, max_length=20)
+        self.add_item(self.prize)
+        self.add_item(self.winners)
+        self.add_item(self.length)
+
+    async def on_submit(self, interaction):
+        try:
+            winners = max(1, int((self.winners.value or "1").strip()))
+        except ValueError:
+            winners = 1
+        seconds = _parse_duration_seconds((self.length.value or "").strip()) or 86400
+        ad = dict(self._state)
+        ad["type"] = "giveaway"
+        ad["prize"] = (self.prize.value or "").strip()
+        ad["winners"] = winners
+        ad["seconds"] = seconds
+        ad["length"] = (self.length.value or "").strip()
+        await _ads_submit(interaction, ad)
+
+
+class AdClaimView(discord.ui.View):
+    """Ephemeral inventory + post builder: pick a ping credit, the post type, and
+    an optional add-on, then Continue opens the right details form."""
+    def __init__(self, guild_id, user_id):
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.sel_ping = None
+        self.sel_type = "regular"
+        self.sel_addon = None
+        inv = _ads_inventory(guild_id, user_id)
+
+        ping_opts = [discord.SelectOption(label=f"{_ads_perk_label(k)} ({inv[k]})", value=k)
+                     for k in ADS_PING_KEYS if inv.get(k)]
+        self.ping_select = discord.ui.Select(placeholder="Which ping credit to use", options=ping_opts or [discord.SelectOption(label="None", value="_none")], min_values=1, max_values=1)
+        self.ping_select.callback = self._on_ping
+        self.add_item(self.ping_select)
+
+        self.type_select = discord.ui.Select(placeholder="Post type", min_values=1, max_values=1, options=[
+            discord.SelectOption(label="Regular Post", value="regular", default=True),
+            discord.SelectOption(label="Sponsored Giveaway", value="giveaway"),
+        ])
+        self.type_select.callback = self._on_type
+        self.add_item(self.type_select)
+
+        addon_opts = [discord.SelectOption(label="No add-on", value="none", default=True)]
+        for k in ("instant", "bypass"):
+            if inv.get(k):
+                addon_opts.append(discord.SelectOption(label=f"{_ads_perk_label(k)} ({inv[k]})", value=k))
+        if len(addon_opts) > 1:
+            self.addon_select = discord.ui.Select(placeholder="Apply an add-on (optional)", min_values=1, max_values=1, options=addon_opts)
+            self.addon_select.callback = self._on_addon
+            self.add_item(self.addon_select)
+
+        cont = discord.ui.Button(label="Continue", style=discord.ButtonStyle.success)
+        cont.callback = self._continue
+        self.add_item(cont)
+
+    async def _on_ping(self, interaction):
+        v = self.ping_select.values[0]
+        self.sel_ping = None if v == "_none" else v
+        await interaction.response.defer()
+
+    async def _on_type(self, interaction):
+        self.sel_type = self.type_select.values[0]
+        await interaction.response.defer()
+
+    async def _on_addon(self, interaction):
+        v = self.addon_select.values[0]
+        self.sel_addon = None if v == "none" else v
+        await interaction.response.defer()
+
+    async def _continue(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(embed=error_embed("Not yours", "This isn't your inventory."), ephemeral=True)
+            return
+        if not self.sel_ping:
+            await interaction.response.send_message(embed=error_embed("Pick a ping", "Select which ping credit to use first."), ephemeral=True)
+            return
+        state = {"ping": self.sel_ping, "type": self.sel_type, "addon": self.sel_addon}
+        if self.sel_type == "giveaway":
+            await interaction.response.send_modal(AdGiveawayModal(state))
+        else:
+            await interaction.response.send_modal(AdRegularModal(state))
+
+
+async def _ads_open_claim(interaction):
+    if not ads_config.get("enabled"):
+        await interaction.response.send_message(embed=error_embed("Ads are off", "The advertisement system isn't set up yet."), ephemeral=True)
+        return
+    inv = _ads_inventory(interaction.guild.id, interaction.user.id)
+    if not any(inv.get(k) for k in ADS_PING_KEYS):
+        await interaction.response.send_message(
+            embed=info_embed("Your Ad Inventory", _ads_inventory_text(inv) + "\n\nYou need a ping credit (Everyone / Here / No Ping) to post."), ephemeral=True)
+        return
+    await interaction.response.send_message(
+        embed=info_embed("Your Ad Inventory", _ads_inventory_text(inv)),
+        view=AdClaimView(interaction.guild.id, interaction.user.id), ephemeral=True)
+
+
+@tasks.loop(seconds=60)
+async def ads_drip():
+    if not ads_config.get("enabled"):
+        return
+    interval = max(1, int(ads_config.get("interval_minutes") or 60)) * 60
+    now = int(time.time())
+    for gid, gd in list(ads_data.items()):
+        if not (gd.get("queue") or gd.get("bypass")):
+            continue
+        if now - int(gd.get("last_drip", 0)) < interval:
+            continue
+        guild = bot.get_guild(int(gid)) if str(gid).isdigit() else None
+        if not guild:
+            continue
+        ad = gd["bypass"].pop(0) if gd.get("bypass") else (gd["queue"].pop(0) if gd.get("queue") else None)
+        if ad:
+            gd["last_drip"] = now
+            try:
+                await _ads_post(guild, ad)
+            except Exception as e:
+                print(f"[Ads] drip post failed: {e}")
+            _save_ads_soon()
+
+
+@ads_drip.before_loop
+async def _before_ads_drip():
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(name="ads", description="Open your advertising inventory and post an ad")
+async def ads_cmd(interaction: discord.Interaction):
+    await _ads_open_claim(interaction)
 
 
 async def _pkg_review_submit(interaction, pkg_msg_id):
@@ -8292,7 +8753,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "invite-tracker", "marketplace"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "invite-tracker", "marketplace", "ads"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
