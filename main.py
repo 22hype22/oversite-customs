@@ -1613,7 +1613,7 @@ def _sub_placeholders(text, member):
     repl = {
         "{user}": member.mention,
         "{username}": member.display_name,
-        "{server}": g.name,
+        "{server}": g.name, "{server_name}": g.name, "{server name}": g.name,
         "{member_count}": count, "{members}": count, "{count}": count,
         "{player count}": count, "{player_count}": count,
         "{human_count}": human_count, "{humans}": human_count,
@@ -1629,6 +1629,7 @@ def _sub_placeholders(text, member):
         text = text.replace(token, value)
     text = _sub_invite_list(text, member.guild)
     text = _sub_queue_list(text, member.guild)
+    text = _sub_server_name(text, member.guild)
     return _resolve_emoji_shortcodes(_resolve_channel_mentions(_resolve_channel_links(_resolve_role_mentions(text, member.guild), member.guild), member.guild), member.guild)
 
 
@@ -1641,6 +1642,15 @@ def _sub_invite_list(text, guild):
 
 
 _QUEUE_LIST_RE = re.compile(r"\{queue[ _]list\}", re.IGNORECASE)
+_SERVER_NAME_RE = re.compile(r"\{server[ _]?name\}", re.IGNORECASE)
+
+
+def _sub_server_name(text, guild):
+    """Replace {server name} / {Server Name} / {server_name} (any case) with the
+    server's name. ({server} still works via the plain token maps.)"""
+    if not text or guild is None or "{server" not in text.lower():
+        return text
+    return _SERVER_NAME_RE.sub(lambda _m: getattr(guild, "name", "") or "", text)
 
 
 def _ads_queue_text(guild):
@@ -1683,7 +1693,7 @@ def _render_guild_text(text, guild):
         boosts = str(getattr(guild, "premium_subscription_count", 0) or 0)
         boost_level = str(getattr(guild, "premium_tier", 0) or 0)
         repl = {
-            "{server}": guild.name,
+            "{server}": guild.name, "{server_name}": guild.name, "{server name}": guild.name,
             "{member_count}": count, "{members}": count, "{count}": count,
             "{player count}": count, "{player_count}": count,
             "{human_count}": human_count, "{humans}": human_count,
@@ -1700,6 +1710,7 @@ def _render_guild_text(text, guild):
         text = _render_order_tokens(text, guild)
     text = _sub_invite_list(text, guild)
     text = _sub_queue_list(text, guild)
+    text = _sub_server_name(text, guild)
     return _resolve_emoji_shortcodes(_resolve_channel_mentions(_resolve_channel_links(_resolve_role_mentions(text, guild), guild), guild), guild)
 
 
