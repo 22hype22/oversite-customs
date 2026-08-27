@@ -86,6 +86,45 @@ form_msgs = {}     # key -> open_components (Form buttons/options — collect {Q
 form_titles = {}   # key -> modal title (the button/option label)
 ticket_categories = {}  # key -> category name a Ticket/Form drops its channels into
 ticket_access = {}      # key -> comma-separated role names that can see a Ticket/Form's channels
+# Purchase buttons designed in a message (a "Purchase" component / a button set to
+# Purchase). key -> {title, price, methods, msa_url}. Clicking runs the package
+# purchase flow (payment picker + gift/recipient + MSA agreement).
+purchase_msgs = {}
+
+_PURCHASE_METHOD_LABELS = {"gamepass": "Gamepass", "select": "Roblox Select", "stripe": "Stripe"}
+
+
+def _purchase_cfg_from(comp):
+    """Normalize a Purchase component / button into its stored config."""
+    methods = comp.get("methods")
+    if not isinstance(methods, list) or not methods:
+        methods = ["gamepass", "select", "stripe"]
+    methods = [m for m in methods if m in _PURCHASE_METHOD_LABELS] or ["stripe"]
+    return {
+        "title": str(comp.get("title") or comp.get("product") or comp.get("label") or "Purchase").strip(),
+        "price": str(comp.get("price") or comp.get("price_line") or "").strip(),
+        "methods": methods,
+        "msa_url": str(comp.get("msa_url") or "").strip(),
+        "button_label": str(comp.get("button_label") or comp.get("label") or "Purchase").strip() or "Purchase",
+    }
+
+
+def _register_purchase_from_tree(tree):
+    """Additively register any Purchase components found in a V2 tree, so their
+    buttons keep working after a restart on any surface (panels, saved messages,
+    portfolio, packages, …). Idempotent — keys are stable."""
+    def _walk(items, depth):
+        if depth > 8:
+            return
+        for c in (items or []):
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "purchase":
+                purchase_msgs[_comp_key(c)] = _purchase_cfg_from(c)
+            t = c.get("type")
+            if t == "container":
+                _walk(c.get("children") or c.get("components") or [], depth + 1)
+    _walk(tree if isinstance(tree, list) else [], 0)
 
 # Marketplace = a second, independent ticket system (its own category, support
 # roles, log, and panels). Same open/claim/close flow as Tickets; which settings
@@ -407,6 +446,8 @@ def _register_ticket_components(panels):
             if not isinstance(c, dict):
                 continue
             t = c.get("type")
+            if t == "purchase":
+                purchase_msgs[_comp_key(c)] = _purchase_cfg_from(c)
             if t == "container":
                 walk(c.get("children") or c.get("components") or [], depth + 1, source)
             elif t in ("buttonRow", "button_row", "buttons", "action_row"):
@@ -459,6 +500,8 @@ def _register_eph_from_tree(tree):
             if not isinstance(c, dict):
                 continue
             t = c.get("type")
+            if t == "purchase":
+                purchase_msgs[_comp_key(c)] = _purchase_cfg_from(c)
             if t == "container":
                 _walk(c.get("children") or c.get("components") or [], depth + 1)
             elif t in ("buttonRow", "button_row", "buttons", "action_row"):
@@ -5104,6 +5147,23 @@ async def on_interaction(interaction: discord.Interaction):
         await _qc_open_deny(interaction, cid.split(":", 1)[1])
     elif cid.startswith("pkg_buy:"):
         await _pkg_handle_buy(interaction, cid.split(":", 1)[1])
+    elif cid.startswith("purchase:"):
+        key = cid.split(":", 1)[1]
+        cfg = purchase_msgs.get(key)
+        if not cfg:
+            await interaction.response.send_message(
+                embed=error_embed("Unavailable", "This purchase button isn't set up yet."), ephemeral=True)
+        else:
+            pkg_id = interaction.message.id if interaction.message else 0
+            try:
+                await interaction.response.send_modal(_PurchaseModal(pkg_id, cfg))
+            except Exception as e:
+                print(f"[Purchase] modal failed: {e}")
+                try:
+                    await interaction.response.send_message(
+                        embed=error_embed("Couldn't open the form", "Please try again."), ephemeral=True)
+                except Exception:
+                    pass
     elif cid.startswith("pkg_claim:gp:"):
         parts = cid.split(":")  # pkg_claim:gp:{gpid}:{pkgmsg}:{deliverto}
         await _pkg_claim_gamepass(interaction, parts[2], parts[3] if len(parts) > 3 else "", parts[4] if len(parts) > 4 else "")
@@ -6274,6 +6334,16 @@ def _build_v2(comp, guild):
         if accessory is None:
             return {"type": 10, "content": text}
         return {"type": 9, "components": [{"type": 10, "content": text}], "accessory": accessory}
+    if ctype == "purchase":
+        cfg = _purchase_cfg_from(comp)
+        key = _comp_key(comp)
+        purchase_msgs[key] = cfg
+        title = cfg["title"]
+        price = cfg["price"]
+        text = f"**{title}**" + (f"\n{price}" if price else "")
+        text = _render_guild_text(text, guild)
+        btn = {"type": 2, "style": 2, "label": (cfg["button_label"] or "Purchase")[:80], "custom_id": f"purchase:{key}"}
+        return {"type": 9, "components": [{"type": 10, "content": text}], "accessory": btn}
     if ctype in ("buttonRow", "button_row", "buttons", "action_row"):
         buttons = [build_button(b, guild) for b in comp.get("buttons", [])]
         buttons = [b for b in buttons if b]
@@ -7666,6 +7736,56 @@ class _PkgBuyModal(discord.ui.Modal):
         await _pkg_run_flow(interaction, self._kind, self._pkg_id, deliver_to)
 
 
+class _PurchaseModal(discord.ui.Modal):
+    """A designed Purchase button's form: pick the payment method, buy for
+    yourself or gift it, and agree to the Master Service Agreement — all in one."""
+    def __init__(self, pkg_id, cfg):
+        prod = cfg.get("title") or "Purchase"
+        super().__init__(title=f"Purchase {prod}"[:45], timeout=600)
+        self._pkg_id = str(pkg_id)
+        self._cfg = cfg
+        methods = cfg.get("methods") or ["gamepass", "select", "stripe"]
+        opts = []
+        for m in methods:
+            if m in _PURCHASE_METHOD_LABELS:
+                opts.append(discord.SelectOption(label=_PURCHASE_METHOD_LABELS[m], value=m, default=not opts))
+        if not opts:
+            opts = [discord.SelectOption(label="Stripe", value="stripe", default=True)]
+        self.method = discord.ui.Select(custom_id="method", min_values=1, max_values=1, options=opts)
+        self.recipient = discord.ui.Select(custom_id="recipient", min_values=1, max_values=1, options=[
+            discord.SelectOption(label="Personal", value="personal", default=True),
+            discord.SelectOption(label="Gift", value="gift"),
+        ])
+        self.ruser = discord.ui.UserSelect(custom_id="ruser", min_values=0, max_values=1, required=False)
+        self.agree = discord.ui.Checkbox(custom_id="agree")
+        msa = cfg.get("msa_url") or ""
+        msa_desc = "Check to agree — required to continue." + (f" Read it: {msa}" if msa else "")
+        self.add_item(discord.ui.Label(text="Payment method", description="How you'd like to pay.", component=self.method))
+        self.add_item(discord.ui.Label(text="Recipient", description="Buy for yourself, or gift it to someone.", component=self.recipient))
+        self.add_item(discord.ui.Label(text="Gift Recipient (required if gifting)", component=self.ruser))
+        self.add_item(discord.ui.Label(text="Master Service Agreement", description=msa_desc[:100], component=self.agree))
+
+    async def on_submit(self, interaction):
+        if not self.agree.value:
+            await interaction.response.send_message(
+                embed=error_embed("Agreement required", "You must agree to the **Master Service Agreement** to continue."), ephemeral=True)
+            return
+        kind = self.method.values[0] if self.method.values else "stripe"
+        mode = self.recipient.values[0] if self.recipient.values else "personal"
+        if mode == "gift":
+            picks = self.ruser.values
+            if not picks:
+                await interaction.response.send_message(
+                    embed=error_embed("Pick a recipient", "Choose who receives this gift, then submit again."), ephemeral=True)
+                return
+            deliver_to = str(picks[0].id)
+        else:
+            deliver_to = str(interaction.user.id)
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await _pkg_run_flow(interaction, kind, self._pkg_id, deliver_to,
+                            title=self._cfg.get("title"), price_field=self._cfg.get("price"))
+
+
 async def _pkg_handle_buy(interaction, kind):
     """A buyer clicked Gamepass / Roblox Select / Stripe — pop the purchase form.
     Verification and checkout happen on submit."""
@@ -7681,10 +7801,12 @@ async def _pkg_handle_buy(interaction, kind):
             pass
 
 
-async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to):
+async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to, title=None, price_field=None):
     """Verify the buyer, then dispatch to the right purchase flow. `deliver_to`
     is the Discord user id the receipt/product goes to (buyer, or gift target).
-    Assumes the interaction is already deferred (ephemeral)."""
+    `title`/`price_field` override the stored package record (used by designed
+    Purchase buttons, which carry their own title + price). Assumes the
+    interaction is already deferred (ephemeral)."""
     acct = await _pkg_lookup_roblox(interaction.user.id)
     if not acct:
         vch = str(roblox_config.get("channel_id") or "").strip()
@@ -7693,9 +7815,20 @@ async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to):
             embed=error_embed("Verify first", f"Link your Roblox account before buying, head to {where}, verify, then try again."),
             ephemeral=True)
         return
-    rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
-    title = ((rec.get("product") if rec else "") or "").strip()
-    price_field = (rec.get("price_field") if rec else "") or ""
+    if title is not None or price_field is not None:
+        # Designed Purchase button — persist a lightweight record so the Claim
+        # step can show the right product/price on the receipt.
+        title = (title or "").strip()
+        price_field = (price_field or "")
+        if pkg_msg_id:
+            try:
+                await _pkg_files_set(str(pkg_msg_id), {"product": title, "price_field": price_field})
+            except Exception:
+                pass
+    else:
+        rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
+        title = ((rec.get("product") if rec else "") or "").strip()
+        price_field = (rec.get("price_field") if rec else "") or ""
     if kind == "gamepass":
         await _pkg_flow_gamepass(interaction, title, pkg_msg_id, deliver_to)
     elif kind == "select":
