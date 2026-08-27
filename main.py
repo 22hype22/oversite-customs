@@ -1628,6 +1628,7 @@ def _sub_placeholders(text, member):
     for token, value in repl.items():
         text = text.replace(token, value)
     text = _sub_invite_list(text, member.guild)
+    text = _sub_queue_list(text, member.guild)
     return _resolve_emoji_shortcodes(_resolve_channel_mentions(_resolve_channel_links(_resolve_role_mentions(text, member.guild), member.guild), member.guild), member.guild)
 
 
@@ -1637,6 +1638,35 @@ def _sub_invite_list(text, guild):
         return text
     lst, _ = _render_invite_list(guild)
     return text.replace("{invite list}", lst).replace("{invite_list}", lst)
+
+
+_QUEUE_LIST_RE = re.compile(r"\{queue[ _]list\}", re.IGNORECASE)
+
+
+def _ads_queue_text(guild):
+    """A human summary of the ad queue — used by the {queue list} token."""
+    gd = ads_data.get(str(guild.id)) or {}
+    items = [("bypass", a) for a in (gd.get("bypass") or [])] + [("normal", a) for a in (gd.get("queue") or [])]
+    if not items:
+        return "The ad queue is empty — your ad would post next."
+    lines = []
+    for i, (lane, a) in enumerate(items, 1):
+        typ = "Sponsored Giveaway" if a.get("type") == "giveaway" else "Regular Post"
+        tag = " · 🚀 Bypass" if lane == "bypass" else ""
+        lines.append(f"`{i}.` {typ} by <@{a.get('user_id')}>{tag}")
+    interval = max(1, int(ads_config.get("interval_minutes") or 60))
+    last = int(gd.get("last_drip", 0))
+    wait = max(0, interval * 60 - (int(time.time()) - last)) if last else 0
+    eta = f"\n\nNext post in ~{max(1, wait // 60)} min." if wait else f"\n\nOne posts about every {interval} min."
+    return f"**{len(items)} ad(s) in the queue:**\n" + "\n".join(lines) + eta
+
+
+def _sub_queue_list(text, guild):
+    """Replace {queue list} / {Queue List} (any case) with the ad-queue summary."""
+    if not text or guild is None or not _QUEUE_LIST_RE.search(text):
+        return text
+    summary = _ads_queue_text(guild)
+    return _QUEUE_LIST_RE.sub(lambda _m: summary, text)
 
 
 def _render_guild_text(text, guild):
@@ -1669,6 +1699,7 @@ def _render_guild_text(text, guild):
         # Custom per-service status tokens ({liveries}, {liveriesstatus}, …).
         text = _render_order_tokens(text, guild)
     text = _sub_invite_list(text, guild)
+    text = _sub_queue_list(text, guild)
     return _resolve_emoji_shortcodes(_resolve_channel_mentions(_resolve_channel_links(_resolve_role_mentions(text, guild), guild), guild), guild)
 
 
