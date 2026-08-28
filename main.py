@@ -111,6 +111,8 @@ def _purchase_cfg_from(comp):
         "button_label": str(comp.get("button_label") or comp.get("label") or "Purchase").strip() or "Purchase",
         # Donation mode: the buyer chooses USD or Robux and types the amount.
         "donation": bool(comp.get("donation")),
+        # Quantity mode: a display card — the button is an unclickable badge.
+        "quantity": bool(comp.get("quantity")),
     }
 
 
@@ -6578,12 +6580,18 @@ def _build_v2(comp, guild):
     if ctype == "purchase":
         cfg = _purchase_cfg_from(comp)
         key = _comp_key(comp)
-        purchase_msgs[key] = cfg
         title = cfg["title"]
         price = cfg["price"]
         text = f"**{title}**" + (f"\n{price}" if price else "")
         text = _render_guild_text(text, guild)
-        btn = {"type": 2, "style": 2, "label": (cfg["button_label"] or "Purchase")[:80], "custom_id": f"purchase:{key}"}
+        if cfg.get("quantity"):
+            # Display card — the button is an unclickable badge (no purchase action).
+            label = _render_guild_text(cfg["button_label"] or "Quantity", guild)
+            btn = {"type": 2, "style": 2, "label": (label or "Quantity")[:80],
+                   "custom_id": f"noop:{key}"[:100], "disabled": True}
+        else:
+            purchase_msgs[key] = cfg
+            btn = {"type": 2, "style": 2, "label": (cfg["button_label"] or "Purchase")[:80], "custom_id": f"purchase:{key}"}
         return {"type": 9, "components": [{"type": 10, "content": text}], "accessory": btn}
     if ctype in ("buttonRow", "button_row", "buttons", "action_row"):
         buttons = [build_button(b, guild) for b in comp.get("buttons", [])]
@@ -8032,6 +8040,33 @@ def _ads_inventory_cards(guild_id, user_id):
     return cards
 
 
+def _ads_fill_quantities(tree, guild_id, user_id):
+    """Fill {quantity} on any Purchase 'Quantity' cards from the viewer's own
+    inventory (matched by the card's title to a perk). Recurses into containers."""
+    inv = _ads_inventory(guild_id, user_id)
+
+    def _walk(items):
+        out = []
+        for it in (items or []):
+            if not isinstance(it, dict):
+                out.append(it)
+                continue
+            it = dict(it)
+            if it.get("type") == "container":
+                kids = it.get("children") if isinstance(it.get("children"), list) else it.get("components")
+                it["children"] = _walk(kids or [])
+                it.pop("components", None)
+            elif it.get("type") == "purchase" and it.get("quantity"):
+                perk = _ads_perk_for_name(it.get("title") or "")
+                n = int(inv.get(perk, 0)) if perk else 0
+                lbl = it.get("button_label") or "Quantity | {quantity}"
+                it["button_label"] = lbl.replace("{quantity}", str(n)).replace("{Quantity}", str(n))
+            out.append(it)
+        return out
+
+    return _walk(tree)
+
+
 def _ads_expand_inventory(tree, guild_id, user_id):
     """Replace any {inventory list} text node in a V2 tree with the per-perk cards
     (done at the component level since it becomes real Section components)."""
@@ -8365,6 +8400,7 @@ async def _ads_open_claim(interaction):
         empty = ads_config.get("empty_design") or []
         if empty:
             tree = _ads_render(empty, {"inventory": _ads_inventory_text(inv), "user": interaction.user.mention})
+            tree = _ads_fill_quantities(tree, interaction.guild.id, interaction.user.id)
             tree = _ads_expand_inventory(tree, interaction.guild.id, interaction.user.id)
             await interaction.response.defer(ephemeral=True)
             ok = await send_v2_message(interaction.channel, tree, interaction=interaction, ephemeral=True)
@@ -8380,6 +8416,7 @@ async def _ads_open_claim(interaction):
         # dropdowns + Continue off it via custom_id routing.
         _ads_claim_state[interaction.user.id] = {"ping": None, "type": "regular", "addon": None}
         tree = _ads_render(design, {"inventory": _ads_inventory_text(inv), "user": interaction.user.mention})
+        tree = _ads_fill_quantities(tree, interaction.guild.id, interaction.user.id)
         tree = _ads_expand_inventory(tree, interaction.guild.id, interaction.user.id)
         await interaction.response.defer(ephemeral=True)
         rows = _ads_claim_rows(interaction.guild.id, interaction.user.id)
