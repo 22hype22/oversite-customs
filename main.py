@@ -113,6 +113,8 @@ def _purchase_cfg_from(comp):
         "donation": bool(comp.get("donation")),
         # Quantity mode: a display card — the button is an unclickable badge.
         "quantity": bool(comp.get("quantity")),
+        # Pre-made product's page link — used verbatim so nothing is created.
+        "buy_url": str(comp.get("buy_url") or "").strip(),
     }
 
 
@@ -8944,7 +8946,8 @@ class _PurchaseModal(discord.ui.Modal):
             deliver_to = str(interaction.user.id)
         await interaction.response.defer(ephemeral=True, thinking=True)
         await _pkg_run_flow(interaction, kind, self._pkg_id, deliver_to,
-                            title=title, price_field=price_field)
+                            title=title, price_field=price_field,
+                            buy_url=self._cfg.get("buy_url"))
 
 
 async def _pkg_handle_buy(interaction, kind):
@@ -8962,12 +8965,13 @@ async def _pkg_handle_buy(interaction, kind):
             pass
 
 
-async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to, title=None, price_field=None):
+async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to, title=None, price_field=None, buy_url=None):
     """Verify the buyer, then dispatch to the right purchase flow. `deliver_to`
     is the Discord user id the receipt/product goes to (buyer, or gift target).
     `title`/`price_field` override the stored package record (used by designed
-    Purchase buttons, which carry their own title + price). Assumes the
-    interaction is already deferred (ephemeral)."""
+    Purchase buttons, which carry their own title + price). `buy_url`, when set,
+    is a pre-made product's page link — used verbatim instead of creating one.
+    Assumes the interaction is already deferred (ephemeral)."""
     acct = await _pkg_lookup_roblox(interaction.user.id)
     if not acct:
         vch = str(roblox_config.get("channel_id") or "").strip()
@@ -8981,9 +8985,10 @@ async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to, title=None, p
         # step can show the right product/price on the receipt.
         title = (title or "").strip()
         price_field = (price_field or "")
+        buy_url = (buy_url or "").strip()
         if pkg_msg_id:
             try:
-                await _pkg_files_set(str(pkg_msg_id), {"product": title, "price_field": price_field})
+                await _pkg_files_set(str(pkg_msg_id), {"product": title, "price_field": price_field, "buy_url": buy_url})
             except Exception:
                 pass
         # Stash any ad-perk grant in memory keyed by (message, buyer) so it lands
@@ -8997,8 +9002,9 @@ async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to, title=None, p
         rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
         title = ((rec.get("product") if rec else "") or "").strip()
         price_field = (rec.get("price_field") if rec else "") or ""
+        buy_url = ((rec.get("buy_url") if rec else "") or "").strip()
     if kind in ("devproduct", "gamepass"):
-        await _pkg_flow_devproduct(interaction, title, price_field, pkg_msg_id, deliver_to)
+        await _pkg_flow_devproduct(interaction, title, price_field, pkg_msg_id, deliver_to, buy_url=buy_url)
     elif kind == "select":
         await _pkg_flow_select(interaction, price_field, pkg_msg_id, deliver_to)
     elif kind == "stripe":
@@ -9011,31 +9017,40 @@ def _pkg_gift_note(deliver_to, buyer_id):
     return "" if str(deliver_to) == str(buyer_id) else f"\n\n🎁 This is a gift, the receipt goes to <@{deliver_to}>."
 
 
-async def _pkg_flow_devproduct(interaction, title, price_field, pkg_msg_id, deliver_to):
-    """Find (or create) a Roblox developer product named after the item, then
-    hand over the web Store buy link + a Claim button. Dev products are bought on
-    the experience's Store tab (no in-game visit needed)."""
+async def _pkg_flow_devproduct(interaction, title, price_field, pkg_msg_id, deliver_to, buy_url=None):
+    """Hand over the dev product's web buy link + a Claim button. If the Purchase
+    card carries a pre-made product's page link (buy_url), use it verbatim — no
+    creation needed. Otherwise fall back to find/create by name via the edge
+    function (needs an Open Cloud API key)."""
     help_to = _pkg_help_mention(interaction.guild)
-    if not title:
-        await interaction.followup.send(embed=error_embed(
-            "No product name", f"This purchase has no title to match a dev product. Open a ticket in {help_to}."), ephemeral=True)
-        return
     robux = _pkg_parse_robux(price_field)
-    res = await _devproduct_call("find_or_create", name=title, priceRobux=int(robux or 0))
-    if not (isinstance(res, dict) and res.get("ok") and res.get("productId")):
-        err = (res or {}).get("error") if isinstance(res, dict) else None
-        await interaction.followup.send(embed=error_embed(
-            "Couldn't set up the product", f"{err or 'Roblox did not respond.'} Open a ticket in {help_to}."), ephemeral=True)
-        return
-    buy = res.get("buyUrl") or ""
+    buy_url = (buy_url or "").strip()
+    if buy_url:
+        # Pinned pre-made product — link straight to its page. No API key needed.
+        buy = buy_url
+        if not title:
+            title = "your item"
+    else:
+        if not title:
+            await interaction.followup.send(embed=error_embed(
+                "No product name", f"This purchase has no title to match a dev product. Open a ticket in {help_to}."), ephemeral=True)
+            return
+        res = await _devproduct_call("find_or_create", name=title, priceRobux=int(robux or 0))
+        if not (isinstance(res, dict) and res.get("ok") and res.get("productId")):
+            err = (res or {}).get("error") if isinstance(res, dict) else None
+            await interaction.followup.send(embed=error_embed(
+                "Couldn't set up the product", f"{err or 'Roblox did not respond.'} Open a ticket in {help_to}."), ephemeral=True)
+            return
+        buy = res.get("buyUrl") or ""
     price_note = f" (R$ {robux})" if robux else ""
     view = discord.ui.View(timeout=None)
     if buy:
         view.add_item(discord.ui.Button(label="Buy on Roblox", style=discord.ButtonStyle.link, url=buy))
     view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:dp:{pkg_msg_id}:{deliver_to}"))
+    where = "on its product page" if buy_url else "open the **Store** tab and purchase it"
     await interaction.followup.send(embed=info_embed(
         "Your Dev Product",
-        f"Buy **{title}**{price_note} with the button below — open the **Store** tab and purchase it.\n"
+        f"Buy **{title}**{price_note} with the button below — {where}.\n"
         f"After buying, click **Claim Package**."
         + _pkg_gift_note(deliver_to, interaction.user.id)),
         view=view, ephemeral=True)
