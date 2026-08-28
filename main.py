@@ -1166,6 +1166,8 @@ async def on_ready():
         persist_music_state.start()
     if not ads_drip.is_running():
         ads_drip.start()
+    if not ads_invite_check.is_running():
+        ads_invite_check.start()
     if not persist_ads_state.is_running():
         persist_ads_state.start()
     await refresh_status()
@@ -8277,6 +8279,73 @@ def _ads_render(design, tokens):
         return design
 
 
+async def _ad_invite_valid(link):
+    """True if the ad's Discord invite still resolves. Only a genuine NotFound
+    (expired/invalid) is treated as bad — transient API errors are assumed OK so
+    a rate-limit doesn't wrongly flag a working invite."""
+    code = (link or "").strip()
+    if not code:
+        return False
+    try:
+        inv = await bot.fetch_invite(code)
+        return inv is not None
+    except discord.NotFound:
+        return False
+    except Exception:
+        return True  # transient (rate limit, network) — don't flag
+
+
+async def _ad_invite_warn_dm(guild, ad, position, ts):
+    """DM the advertiser: a preview of how their ad will look in the channel,
+    then a yellow ATTENTION embed telling them the invite is expired/invalid."""
+    uid = str(ad.get("user_id") or "")
+    if not uid.isdigit():
+        return
+    user = guild.get_member(int(uid))
+    if user is None:
+        try:
+            user = await bot.fetch_user(int(uid))
+        except Exception:
+            return
+    try:
+        dm = await user.create_dm()
+    except Exception:
+        return
+    advertiser = f"<@{uid}>"
+    # 1) Preview of the ad (no ping in DMs).
+    if ad.get("type") == "giveaway":
+        design = _ads_render(ads_config.get("giveaway_design") or [],
+                             {"advertiser": advertiser, "prize": ad.get("prize") or "",
+                              "winners": ad.get("winners") or 1, "duration": ad.get("length") or "",
+                              "ping": "", "server_link": ad.get("server_link") or "",
+                              "server_name": ad.get("server_name") or ""})
+    else:
+        design = _ads_render(ads_config.get("regular_design") or [],
+                             {"advertiser": advertiser, "server_link": ad.get("server_link") or "", "ping": ""})
+    if design:
+        try:
+            await send_v2_message(dm, design)
+        except Exception:
+            pass
+    # 2) Yellow ATTENTION embed.
+    typ = "Sponsored Giveaway" if ad.get("type") == "giveaway" else "Regular Post"
+    desc = (
+        "## **ATTENTION NEEDED**\n\n"
+        "The invite linked to your advertisement is currently **expired or invalid**.\n\n"
+        "Please provide an updated invite before your scheduled posting date to prevent any "
+        "delays with your advertisement.\n\n"
+        f"**User:** <@{uid}>\n"
+        f"**Ad Type:** {typ}\n"
+        f"**Invite:** {ad.get('server_link') or '—'}\n"
+        f"**Scheduled Date:** <t:{int(ts)}:F>\n"
+        f"**Queue Position:** {position}"
+    )
+    try:
+        await dm.send(embed=discord.Embed(description=desc, color=0xF1C40F))
+    except Exception:
+        pass
+
+
 async def _ads_post(guild, ad):
     """Post an approved ad to the configured ad channel."""
     ch = await resolve_channel(ads_config.get("post_channel_id"))
@@ -8796,6 +8865,58 @@ async def _ads_open_queue(interaction):
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
+async def _ads_pop_postable(guild, gd):
+    """Remove and return the next queued ad whose invite still works (bypass lane
+    first). Any dead-invite ad it passes over is left in place and its advertiser
+    is DM'd once (a yellow ATTENTION notice). Returns None if none are postable."""
+    pos = 0
+    for ad, lane, ts in _ads_queue_entries(guild):
+        pos += 1
+        if await _ad_invite_valid(ad.get("server_link")):
+            lst = gd.get("bypass" if lane == "bypass" else "queue") or []
+            try:
+                lst.remove(ad)
+            except ValueError:
+                pass
+            ad.pop("invite_flagged", None)
+            return ad
+        if not ad.get("invite_flagged"):
+            ad["invite_flagged"] = True
+            await _ad_invite_warn_dm(guild, ad, pos, ts)
+    return None
+
+
+@tasks.loop(seconds=300)
+async def ads_invite_check():
+    """Proactively verify queued ads' invites so advertisers get a heads-up
+    BEFORE their posting date. DMs once per broken invite; clears the flag (so a
+    later break re-notifies) once the invite works again."""
+    if not ads_config.get("enabled") or not _ads_loaded:
+        return
+    changed = False
+    for gid in list(ads_data.keys()):
+        guild = bot.get_guild(int(gid)) if str(gid).isdigit() else None
+        if not guild:
+            continue
+        pos = 0
+        for ad, lane, ts in _ads_queue_entries(guild):
+            pos += 1
+            if await _ad_invite_valid(ad.get("server_link")):
+                if ad.pop("invite_flagged", None) is not None:
+                    changed = True
+            elif not ad.get("invite_flagged"):
+                ad["invite_flagged"] = True
+                changed = True
+                await _ad_invite_warn_dm(guild, ad, pos, ts)
+    if changed:
+        await _ads_flush_now()
+
+
+@ads_invite_check.before_loop
+async def _before_ads_invite_check():
+    await bot.wait_until_ready()
+
+
 @tasks.loop(seconds=60)
 async def ads_drip():
     if not ads_config.get("enabled"):
@@ -8810,14 +8931,15 @@ async def ads_drip():
         guild = bot.get_guild(int(gid)) if str(gid).isdigit() else None
         if not guild:
             continue
-        ad = gd["bypass"].pop(0) if gd.get("bypass") else (gd["queue"].pop(0) if gd.get("queue") else None)
+        ad = await _ads_pop_postable(guild, gd)
         if ad:
             gd["last_drip"] = now
             try:
                 await _ads_post(guild, ad)
             except Exception as e:
                 print(f"[Ads] drip post failed: {e}")
-            _save_ads_soon()
+        # Persist queue changes + any invite flags set while scanning.
+        await _ads_flush_now()
 
 
 @ads_drip.before_loop
