@@ -7998,6 +7998,45 @@ async def _econ_wheel(message, args):
         await _econ_game_result(message, bet, False, 0, detail)
 
 
+async def _econ_crash(message, args):
+    p = gambling_config["prefix"]
+    bet = _econ_require_bet(message, args)
+    if bet is None or len(args) < 2:
+        return await _econ_send(message.channel, error_embed("Usage", f"`{p}crash <amount> <cashout, e.g. 2.0>`"))
+    if bet == "over":
+        return await _econ_send(message.channel, error_embed("Not enough cash", "You don't have that much."))
+    try:
+        target = float(args[1].lstrip("x×"))
+    except Exception:
+        return await _econ_send(message.channel, error_embed("Usage", f"Pick a cash-out like `{p}crash 100 2.0`."))
+    target = max(1.01, min(target, 100.0))
+    # Crash point with ~5% house edge: P(crash >= x) = 0.95 / x.
+    r = _rnd.random()
+    crash = min(1000.0, max(1.0, 0.95 / (1 - r))) if r < 0.9999 else 1000.0
+    won = crash >= target
+    detail = f"🚀 You set **×{target:.2f}** — the rocket crashed at **×{crash:.2f}**."
+    await _econ_game_result(message, bet, won, int(bet * target), detail)
+
+
+async def _econ_scratch(message, args):
+    p = gambling_config["prefix"]
+    bet = _econ_require_bet(message, args)
+    if bet is None:
+        return await _econ_send(message.channel, error_embed("Usage", f"`{p}scratch <amount>`"))
+    if bet == "over":
+        return await _econ_send(message.channel, error_embed("Not enough cash", "You don't have that much."))
+    syms = ["🍒", "🔔", "⭐", "💎", "7️⃣", "🍀"]
+    grid = [_rnd.choice(syms) for _ in range(3)]
+    line = " ".join(grid)
+    distinct = len(set(grid))
+    if distinct == 1:  # three of a kind
+        await _econ_game_result(message, bet, True, bet * 10, f"🎫 **[ {line} ]** — jackpot! ×10")
+    elif distinct == 2:  # exactly a pair
+        await _econ_game_result(message, bet, True, int(bet * 1.5), f"🎫 **[ {line} ]** — a pair! ×1.5")
+    else:
+        await _econ_game_result(message, bet, False, 0, f"🎫 **[ {line} ]** — no match.")
+
+
 async def _econ_help(message):
     p = gambling_config["prefix"]
     body = (
@@ -8008,7 +8047,8 @@ async def _econ_help(message):
         f"`{p}shop` · `{p}buy <name>` · `{p}sell <name>` · `{p}properties`\n\n"
         f"**🎰 Casino**\n"
         f"`{p}blackjack <amt>` · `{p}poker <amt>` · `{p}roulette <amt> <bet>` · `{p}baccarat <amt> <p|b|tie>`\n"
-        f"`{p}slots <amt>` · `{p}dice <amt>` · `{p}coinflip <amt> <h|t>` · `{p}highlow <amt> <high|low>` · `{p}wheel <amt>`"
+        f"`{p}slots <amt>` · `{p}dice <amt>` · `{p}coinflip <amt> <h|t>` · `{p}highlow <amt> <high|low>`\n"
+        f"`{p}wheel <amt>` · `{p}crash <amt> <cashout>` · `{p}scratch <amt>`"
     )
     await _econ_send(message.channel, info_embed("📖 Economy & Casino Commands", body))
 
@@ -8072,6 +8112,10 @@ async def _econ_dispatch(message, cmd, args):
         await _econ_highlow(message, args)
     elif cmd in ("wheel", "spin"):
         await _econ_wheel(message, args)
+    elif cmd in ("crash", "rocket"):
+        await _econ_crash(message, args)
+    elif cmd in ("scratch", "scratchcard"):
+        await _econ_scratch(message, args)
     elif cmd in ("shop", "store"):
         await _econ_shop(message)
     elif cmd in ("buy", "buy-property", "buyproperty"):
