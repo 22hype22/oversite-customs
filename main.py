@@ -10971,7 +10971,7 @@ class NowPlayingView(discord.ui.View):
         await interaction.response.defer()
         _taste_event_current(interaction.guild, -1.5)
         session = auto_music_sessions.get(interaction.guild.id)
-        if session and len(vc.queue) < 5 and interaction.guild.id not in _dj_mode:
+        if session and len(vc.queue) < 3 and interaction.guild.id not in _dj_mode:
             asyncio.create_task(_skip_refill_bg(interaction.guild.id, session))
         await vc.skip(force=True)
 
@@ -11013,16 +11013,21 @@ class NowPlayingView(discord.ui.View):
 
 async def _skip_refill_bg(gid, session):
     """Top up the radio queue after a skip — in the background, so it never
-    delays the Skip button."""
+    delays the Skip button. Guarded so refills can't stack up and flood the node."""
+    if gid in _topup_busy:
+        return
+    _topup_busy.add(gid)
     try:
         guild = bot.get_guild(gid)
         vc = guild.voice_client if guild else None
         if not vc:
             return
-        for t in await get_genre_playlist_tracks(session.get("genre", "pop"), count=20, guild_id=gid, source="skip-refill"):
+        for t in await get_genre_playlist_tracks(session.get("genre", "pop"), count=8, guild_id=gid, source="skip-refill"):
             await vc.queue.put_wait(t)
     except Exception as e:
         print(f"[Skip] refill error: {e}")
+    finally:
+        _topup_busy.discard(gid)
 
 
 def _cancel_progress(guild_id: int):
@@ -11172,7 +11177,7 @@ async def handle_npv2_button(interaction, cid):
                 return await interaction.response.send_message("Nothing playing.", ephemeral=True)
             _taste_event_current(guild, -1.5)
             session = auto_music_sessions.get(guild.id)
-            if session and len(vc.queue) < 5 and guild.id not in _dj_mode:
+            if session and len(vc.queue) < 3 and guild.id not in _dj_mode:
                 try:
                     for t in await get_genre_playlist_tracks(session.get("genre", "pop"), count=20, guild_id=guild.id, source="skip-v2-refill"):
                         await vc.queue.put_wait(t)
@@ -11288,6 +11293,7 @@ _dj_recent_artists = {}
 _dj_recent_genres = {}
 _dj_prev_volume = {}
 auto_music_sessions = {}
+_topup_busy = set()  # guilds currently fetching queue top-ups (prevents stacking searches that overload the node)
 
 # ---- TTS ( /join ) ----
 # When the bot is /join'd into a voice channel it reads that channel's built-in
@@ -12708,14 +12714,18 @@ async def on_wavelink_track_start(payload):
             await send_now_playing(guild, track, text_channel)
 
         session = auto_music_sessions.get(guild.id)
-        if session and len(player.queue) < 5:
-            more = await get_genre_playlist_tracks(session.get("genre", "pop"), count=10, guild_id=guild.id, source="low-queue-topup")
-            for t in (more or []):
-                try:
-                    if not any(kw in t.title.lower() for kw in KARAOKE_KEYWORDS):
-                        await player.queue.put_wait(t)
-                except Exception:
-                    pass
+        if session and len(player.queue) < 3 and guild.id not in _topup_busy:
+            _topup_busy.add(guild.id)
+            try:
+                more = await get_genre_playlist_tracks(session.get("genre", "pop"), count=8, guild_id=guild.id, source="low-queue-topup")
+                for t in (more or []):
+                    try:
+                        if not any(kw in t.title.lower() for kw in KARAOKE_KEYWORDS):
+                            await player.queue.put_wait(t)
+                    except Exception:
+                        pass
+            finally:
+                _topup_busy.discard(guild.id)
     except Exception as e:
         print(f"[Music] Track start error: {e}")
 
