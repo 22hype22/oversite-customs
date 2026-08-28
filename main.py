@@ -12619,6 +12619,8 @@ async def on_wavelink_track_start(payload):
             return
         track = payload.track
         guild = player.guild
+        if guild.id in _tts_channels:
+            return  # TTS mode — no music Now Playing card
         import time as _time
         if _time.time() - _track_last_failure_time.get(guild.id, 0) > 10:
             _track_failure_counts[guild.id] = 0
