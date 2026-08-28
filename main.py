@@ -8994,6 +8994,38 @@ async def adsgrant_cmd(interaction: discord.Interaction, user: discord.Member, p
         ephemeral=True)
 
 
+@bot.tree.command(name="adtestinvite", description="Test the invite-expired DM warning (staff)")
+@app_commands.describe(
+    invite="An invite link to test (use an expired/fake one to see the warning)",
+    type="Which ad layout to preview")
+@app_commands.choices(type=[
+    app_commands.Choice(name="Regular Post", value="regular"),
+    app_commands.Choice(name="Sponsored Giveaway", value="giveaway"),
+])
+async def adtestinvite_cmd(interaction: discord.Interaction, invite: str,
+                           type: app_commands.Choice[str] = None):
+    if not _is_ads_staff(interaction.user):
+        await interaction.response.send_message(embed=error_embed("Staff only", "You need to be ad staff (or Manage Server)."), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    kind = (type.value if type else "regular")
+    link = _normalize_invite(invite)
+    valid = await _ad_invite_valid(link)
+    # A throwaway ad addressed to the person running the command.
+    ad = {"user_id": str(interaction.user.id), "ping": "ping_none", "addon": None,
+          "type": kind, "server_link": link, "server_name": ""}
+    if kind == "giveaway":
+        ad.update({"prize": "Test Prize", "winners": 1, "length": "1d", "seconds": 86400})
+    ts = int(time.time()) + 3600
+    await _ad_invite_warn_dm(interaction.guild, ad, 1, ts)
+    status = "✅ **valid** — in real posting it would go through" if valid else "⚠️ **expired/invalid** — real posting would be skipped + the advertiser warned"
+    await interaction.followup.send(
+        embed=info_embed("Invite test sent",
+            f"Invite `{link}` is {status}.\n\nI DM'd you the preview + ATTENTION warning so you can see exactly what an advertiser gets. "
+            f"(If no DM arrived, your DMs are closed — open them for this server.)"),
+        ephemeral=True)
+
+
 async def _pkg_review_submit(interaction, pkg_msg_id):
     """Review modal submitted — post it to a #reviews-style channel in the origin
     guild (if one exists) and thank the reviewer."""
