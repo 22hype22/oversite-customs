@@ -192,17 +192,48 @@ def _ads_inventory(guild_id, user_id):
     return _ads_g(guild_id)["inventory"].get(str(user_id), {})
 
 
+# Built-in perk names + short aliases. Used as a fallback so a standard card
+# title ("No Ping", "Everyone Ping", …) always resolves to its perk even if the
+# dashboard's perk labels were renamed or the ads config didn't load.
+_ADS_DEFAULT_LABELS = {
+    "ping_everyone": "Everyone Ping",
+    "ping_here": "Here Ping",
+    "ping_none": "No Ping",
+    "instant": "Instant Post",
+    "bypass": "Bypass Queue",
+}
+_ADS_NAME_ALIASES = {
+    "everyone ping": "ping_everyone", "ping everyone": "ping_everyone", "everyone": "ping_everyone",
+    "here ping": "ping_here", "ping here": "ping_here", "here": "ping_here",
+    "no ping": "ping_none", "ping none": "ping_none", "none": "ping_none",
+    "instant post": "instant", "instant": "instant",
+    "bypass queue": "bypass", "skip queue": "bypass", "bypass": "bypass",
+}
+
+
+def _ads_norm_name(s):
+    """Lowercase, drop a trailing 'Donation …' suffix, strip emoji/punctuation
+    (keep letters, digits, spaces), and collapse whitespace. So '🔔 No Ping!' and
+    'no  ping' both normalize to 'no ping'."""
+    s = re.sub(r"\s+donation.*$", "", str(s or "").lower())
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def _ads_perk_for_name(name):
-    """Match a purchased product name to a perk key (case-insensitive, ignoring a
-    trailing 'Donation …' suffix)."""
-    n = str(name or "").strip().lower()
+    """Match a card/product name to a perk key. Tries the dashboard's configured
+    perk labels first, then the built-in default names and short aliases, so
+    matching never silently fails just because a label drifted."""
+    n = _ads_norm_name(name)
     if not n:
         return None
-    n = re.sub(r"\s+donation.*$", "", n).strip()
     for key, label in (ads_config.get("perks") or {}).items():
-        if str(label or "").strip().lower() == n and key in ADS_PERK_KEYS:
+        if key in ADS_PERK_KEYS and _ads_norm_name(label) == n:
             return key
-    return None
+    for key, label in _ADS_DEFAULT_LABELS.items():
+        if _ads_norm_name(label) == n:
+            return key
+    return _ADS_NAME_ALIASES.get(n)
 
 
 def _ads_grant(guild_id, user_id, perk_key, n=1):
