@@ -11261,8 +11261,8 @@ auto_music_sessions = {}
 _tts_channels = {}  # guild_id -> voice-channel id whose chat is being read
 _tts_queue = {}     # guild_id -> list[Playable] waiting to be spoken
 _tts_busy = {}      # guild_id -> True while a clip is playing
-# StreamElements TTS returns an MP3 the Lavalink HTTP source can play.
-_TTS_VOICE = os.getenv("TTS_VOICE", "Brian")
+# ElevenLabs voice for /join TTS — same clip pipeline as the DJ, different voice.
+TTS_VOICE_ID = os.getenv("TTS_ELEVEN_VOICE_ID", "VfdLuBKQajtI8RHxLhnk")
 
 
 def _tts_clean(content):
@@ -11278,9 +11278,10 @@ def _tts_clean(content):
 
 async def _tts_track(text):
     import wavelink as _wl
-    import urllib.parse
-    url = (f"https://api.streamelements.com/kappa/v2/speech"
-           f"?voice={urllib.parse.quote(_TTS_VOICE)}&text={urllib.parse.quote(text[:300])}")
+    # Same ElevenLabs clip pipeline as the DJ, just a different voice.
+    url = await _dj_make_clip(text[:300], voice_id=TTS_VOICE_ID)
+    if not url:
+        return None
     try:
         res = await _wl.Playable.search(url, source=None)
         return res[0] if res else None
@@ -11342,20 +11343,21 @@ DJ_SWITCH_LINES = [
 ]
 
 
-async def _dj_make_clip(text: str) -> str | None:
+async def _dj_make_clip(text: str, voice_id: str | None = None) -> str | None:
     if not DJ_PUBLIC_URL:
         return None
+    vid = voice_id or ELEVEN_VOICE_ID
     try:
         import uuid
         os.makedirs(_dj_clip_dir, exist_ok=True)
         name = f"{uuid.uuid4().hex}.mp3"
         path = os.path.join(_dj_clip_dir, name)
         made = False
-        if ELEVEN_API_KEY and ELEVEN_VOICE_ID:
+        if ELEVEN_API_KEY and vid:
             try:
                 async with httpx.AsyncClient() as client:
                     r = await client.post(
-                        f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}",
+                        f"https://api.elevenlabs.io/v1/text-to-speech/{vid}",
                         headers={"xi-api-key": ELEVEN_API_KEY, "Content-Type": "application/json"},
                         json={"text": text, "model_id": "eleven_turbo_v2_5",
                               "voice_settings": {"stability": 0.5, "similarity_boost": 0.8}}, timeout=20)
@@ -11368,7 +11370,7 @@ async def _dj_make_clip(text: str) -> str | None:
         if not made:
             import edge_tts
             await edge_tts.Communicate(text, DJ_VOICE).save(path)
-        for f in sorted(os.listdir(_dj_clip_dir))[:-10]:
+        for f in sorted(os.listdir(_dj_clip_dir))[:-30]:
             try:
                 os.remove(os.path.join(_dj_clip_dir, f))
             except Exception:
