@@ -159,6 +159,7 @@ ads_config = {
     "regular_design": [],    # V2 tree; tokens {advertiser} {server_link} {ping}
     "giveaway_design": [],   # V2 tree; tokens {advertiser} {prize} {winners} {duration} {ping}
     "claim_design": [],      # V2 tree for the claim panel message; token {inventory}
+    "empty_design": [],      # V2 tree shown when they own no ping credits yet
     "claim_button_label": "📢 Post an Ad",
     # Wording of the ephemeral "post an ad" panel (all customizable).
     "claim_title": "Your Ad Inventory",
@@ -7097,6 +7098,8 @@ async def apply_config(feature, cfg, post_panel=False):
         ads_config["giveaway_design"] = gd if isinstance(gd, list) else []
         cd = cfg.get("claim_design")
         ads_config["claim_design"] = cd if isinstance(cd, list) else []
+        ed = cfg.get("empty_design")
+        ads_config["empty_design"] = ed if isinstance(ed, list) else []
         _register_eph_from_tree(ads_config["regular_design"])
         _register_eph_from_tree(ads_config["giveaway_design"])
         if cfg.get("claim_button_label"):
@@ -8305,6 +8308,14 @@ async def _ads_open_claim(interaction):
     title = ads_config.get("claim_title") or "Your Ad Inventory"
     note = ads_config.get("claim_note") or ""
     if not any(inv.get(k) for k in ADS_PING_KEYS):
+        empty = ads_config.get("empty_design") or []
+        if empty:
+            tree = _ads_render(empty, {"inventory": _ads_inventory_text(inv), "user": interaction.user.mention})
+            await interaction.response.defer(ephemeral=True)
+            ok = await send_v2_message(interaction.channel, tree, interaction=interaction, ephemeral=True)
+            if not ok:
+                await interaction.followup.send(embed=info_embed(title, _ads_inventory_text(inv)), ephemeral=True)
+            return
         await interaction.response.send_message(
             embed=info_embed(title, _ads_inventory_text(inv) + "\n\nYou need a ping credit (Everyone / Here / No Ping) to post."), ephemeral=True)
         return
