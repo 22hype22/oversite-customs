@@ -6273,6 +6273,11 @@ async def feedback_cmd(interaction: discord.Interaction):
     await _pf_command(interaction, "customs-feedback")
 
 
+@bot.tree.command(name="reportbug", description="Report a bug")
+async def reportbug_cmd(interaction: discord.Interaction):
+    await _pf_command(interaction, "customs-reportbug")
+
+
 # ===================== Free Release (reaction-goal file drop) =====================
 # `/freerelease` -> a form to attach the release file -> posts the designed
 # announcement with a hardcoded Enter button + a live "X/goal" counter. When the
