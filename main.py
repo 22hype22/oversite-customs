@@ -161,12 +161,13 @@ ads_config = {
     "regular_design": [],    # V2 tree; tokens {advertiser} {server_link} {ping}
     "giveaway_design": [],   # V2 tree; tokens {advertiser} {prize} {winners} {duration} {ping}
     "claim_design": [],      # V2 tree for the claim panel message; token {inventory}
-    "empty_design": [],      # V2 tree shown when they own no ping credits yet
+    "empty_design": [],      # V2 tree shown when they own nothing yet
+    "noposts_design": [],    # V2 tree shown when applying an add-on with no active post
     "claim_button_label": "📢 Post an Ad",
     # Wording of the ephemeral "post an ad" panel (all customizable).
     "claim_title": "Your Ad Inventory",
     "claim_note": "",
-    "ping_placeholder": "Which ping credit to use",
+    "ping_placeholder": "Choose an item to use",
     "type_placeholder": "Post type",
     "addon_placeholder": "Apply an add-on (optional)",
     "continue_label": "Continue",
@@ -5360,29 +5361,9 @@ async def on_interaction(interaction: discord.Interaction):
         await _ads_open_claim(interaction)
     elif cid == "ad_queue":
         await _ads_open_queue(interaction)
-    elif cid in ("adsel_ping", "adsel_type", "adsel_addon"):
-        st = _ads_claim_state.setdefault(interaction.user.id, {"ping": None, "type": "regular", "addon": None})
+    elif cid == "adsel_use":
         v = ((interaction.data or {}).get("values") or [None])[0]
-        if cid == "adsel_ping":
-            st["ping"] = None if v in (None, "_none") else v
-        elif cid == "adsel_type":
-            st["type"] = v or "regular"
-        else:
-            st["addon"] = None if v in (None, "none") else v
-        try:
-            await interaction.response.defer()
-        except Exception:
-            pass
-    elif cid == "ad_continue":
-        st = _ads_claim_state.get(interaction.user.id) or {"type": "regular"}
-        if not st.get("ping"):
-            await interaction.response.send_message(embed=error_embed("Pick a ping", "Select which ping credit to use first."), ephemeral=True)
-        else:
-            state = {"ping": st["ping"], "type": st.get("type", "regular"), "addon": st.get("addon")}
-            if state["type"] == "giveaway":
-                await interaction.response.send_modal(AdGiveawayModal(state))
-            else:
-                await interaction.response.send_modal(AdRegularModal(state))
+        await _ads_handle_use(interaction, v)
     elif cid.startswith("ad_ok:"):
         await _ads_decide(interaction, cid.split(":", 1)[1], True)
     elif cid.startswith("ad_no:"):
@@ -7108,6 +7089,8 @@ async def apply_config(feature, cfg, post_panel=False):
         ads_config["claim_design"] = cd if isinstance(cd, list) else []
         ed = cfg.get("empty_design")
         ads_config["empty_design"] = ed if isinstance(ed, list) else []
+        npd = cfg.get("noposts_design")
+        ads_config["noposts_design"] = npd if isinstance(npd, list) else []
         _register_eph_from_tree(ads_config["regular_design"])
         _register_eph_from_tree(ads_config["giveaway_design"])
         if cfg.get("claim_button_label"):
@@ -8304,140 +8287,191 @@ class AdGiveawayModal(discord.ui.Modal):
         await _ads_submit(interaction, ad)
 
 
-class AdClaimView(discord.ui.View):
-    """Ephemeral inventory + post builder: pick a ping credit, the post type, and
-    an optional add-on, then Continue opens the right details form."""
-    def __init__(self, guild_id, user_id):
+class AdTypeView(discord.ui.View):
+    """After picking a ping credit — choose Regular Post or Sponsored Giveaway."""
+    def __init__(self, ping):
         super().__init__(timeout=300)
-        self.guild_id = guild_id
-        self.user_id = user_id
-        self.sel_ping = None
-        self.sel_type = "regular"
-        self.sel_addon = None
-        inv = _ads_inventory(guild_id, user_id)
+        self._ping = ping
+        r = discord.ui.Button(label=(ads_config.get("regular_label") or "Regular Post"), style=discord.ButtonStyle.primary)
+        r.callback = self._regular
+        g = discord.ui.Button(label=(ads_config.get("giveaway_label") or "Sponsored Giveaway"), style=discord.ButtonStyle.secondary)
+        g.callback = self._giveaway
+        self.add_item(r)
+        self.add_item(g)
 
-        ping_opts = [discord.SelectOption(label=f"{_ads_perk_label(k)} ({inv[k]})", value=k)
-                     for k in ADS_PING_KEYS if inv.get(k)]
-        self.ping_select = discord.ui.Select(placeholder=(ads_config.get("ping_placeholder") or "Which ping credit to use"), options=ping_opts or [discord.SelectOption(label="None", value="_none")], min_values=1, max_values=1)
-        self.ping_select.callback = self._on_ping
-        self.add_item(self.ping_select)
+    async def _regular(self, interaction):
+        await interaction.response.send_modal(AdRegularModal({"ping": self._ping, "type": "regular", "addon": None}))
 
-        self.type_select = discord.ui.Select(placeholder=(ads_config.get("type_placeholder") or "Post type"), min_values=1, max_values=1, options=[
-            discord.SelectOption(label=(ads_config.get("regular_label") or "Regular Post"), value="regular", default=True),
-            discord.SelectOption(label=(ads_config.get("giveaway_label") or "Sponsored Giveaway"), value="giveaway"),
-        ])
-        self.type_select.callback = self._on_type
-        self.add_item(self.type_select)
+    async def _giveaway(self, interaction):
+        await interaction.response.send_modal(AdGiveawayModal({"ping": self._ping, "type": "giveaway", "addon": None}))
 
-        addon_opts = [discord.SelectOption(label="No add-on", value="none", default=True)]
-        for k in ("instant", "bypass"):
-            if inv.get(k):
-                addon_opts.append(discord.SelectOption(label=f"{_ads_perk_label(k)} ({inv[k]})", value=k))
-        if len(addon_opts) > 1:
-            self.addon_select = discord.ui.Select(placeholder=(ads_config.get("addon_placeholder") or "Apply an add-on (optional)"), min_values=1, max_values=1, options=addon_opts)
-            self.addon_select.callback = self._on_addon
-            self.add_item(self.addon_select)
 
-        cont = discord.ui.Button(label=(ads_config.get("continue_label") or "Continue"), style=discord.ButtonStyle.success)
-        cont.callback = self._continue
-        self.add_item(cont)
+class ApplyAddonView(discord.ui.View):
+    """Pick which of your active posts an add-on applies to."""
+    def __init__(self, addon, posts):
+        super().__init__(timeout=180)
+        self._addon = addon
+        opts = []
+        for loc, ad in posts[:25]:
+            typ = "Sponsored Giveaway" if ad.get("type") == "giveaway" else "Regular Post"
+            status = {"pending": "awaiting approval", "queue": "queued", "bypass": "bypass lane"}.get(loc, loc)
+            sub = ad.get("prize") if ad.get("type") == "giveaway" else (ad.get("server_name") or ad.get("server_link") or "")
+            opts.append(discord.SelectOption(label=f"{typ} · {status}"[:100], value=str(ad.get("id")), description=(sub or "")[:100]))
+        self.sel = discord.ui.Select(placeholder=f"Apply {_ads_perk_label(addon)} to…"[:150], options=opts, min_values=1, max_values=1)
+        self.sel.callback = self._apply
+        self.add_item(self.sel)
 
-    async def _on_ping(self, interaction):
-        v = self.ping_select.values[0]
-        self.sel_ping = None if v == "_none" else v
-        await interaction.response.defer()
+    async def _apply(self, interaction):
+        await _ads_apply_addon(interaction, self._addon, self.sel.values[0])
 
-    async def _on_type(self, interaction):
-        self.sel_type = self.type_select.values[0]
-        await interaction.response.defer()
 
-    async def _on_addon(self, interaction):
-        v = self.addon_select.values[0]
-        self.sel_addon = None if v == "none" else v
-        await interaction.response.defer()
+def _ads_user_active_posts(guild_id, user_id):
+    """This member's posts that haven't gone out yet: pending approval, queued,
+    or in the bypass lane."""
+    gd = ads_data.get(str(guild_id)) or {}
+    out = []
+    for ad in (gd.get("pending") or {}).values():
+        if str(ad.get("user_id")) == str(user_id):
+            out.append(("pending", ad))
+    for ad in (gd.get("bypass") or []):
+        if str(ad.get("user_id")) == str(user_id):
+            out.append(("bypass", ad))
+    for ad in (gd.get("queue") or []):
+        if str(ad.get("user_id")) == str(user_id):
+            out.append(("queue", ad))
+    return out
 
-    async def _continue(self, interaction):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message(embed=error_embed("Not yours", "This isn't your inventory."), ephemeral=True)
+
+async def _ads_apply_addon(interaction, addon, ad_id):
+    gid = interaction.guild.id
+    uid = interaction.user.id
+    gd = _ads_g(gid)
+    ad, loc = None, None
+    if ad_id in (gd.get("pending") or {}):
+        ad, loc = gd["pending"][ad_id], "pending"
+    if not ad:
+        for a in (gd.get("bypass") or []):
+            if str(a.get("id")) == str(ad_id):
+                ad, loc = a, "bypass"
+                break
+    if not ad:
+        for a in (gd.get("queue") or []):
+            if str(a.get("id")) == str(ad_id):
+                ad, loc = a, "queue"
+                break
+    if not ad or str(ad.get("user_id")) != str(uid):
+        await interaction.response.send_message(embed=error_embed("Not found", "That post is no longer active."), ephemeral=True)
+        return
+    if addon == "bypass" and loc == "bypass":
+        await interaction.response.send_message(embed=info_embed("Already priority", "That post is already in the Bypass lane."), ephemeral=True)
+        return
+    if not _ads_consume(gid, uid, addon):
+        await interaction.response.send_message(embed=error_embed("Out of stock", "You don't have that add-on anymore."), ephemeral=True)
+        return
+    if loc == "pending":
+        ad["addon"] = addon
+        _save_ads_soon()
+        await interaction.response.send_message(
+            embed=success_embed("Applied", f"**{_ads_perk_label(addon)}** will apply as soon as staff approve this post."), ephemeral=True)
+        return
+    # Already approved (queued / bypass lane).
+    if addon == "instant":
+        try:
+            gd.get(loc, []).remove(ad)
+        except Exception:
+            pass
+        _save_ads_soon()
+        await interaction.response.send_message(embed=success_embed("Applied", "Posting it now."), ephemeral=True)
+        await _ads_post(interaction.guild, ad)
+    else:  # bypass, from the normal queue
+        try:
+            gd["queue"].remove(ad)
+        except Exception:
+            pass
+        gd.setdefault("bypass", []).append(ad)
+        _save_ads_soon()
+        await interaction.response.send_message(embed=success_embed("Applied", "Moved to the Bypass lane — it'll post sooner."), ephemeral=True)
+
+
+async def _ads_handle_use(interaction, v):
+    """A member picked an item from the claim dropdown."""
+    gid = interaction.guild.id
+    uid = interaction.user.id
+    if not v or v == "_none":
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+        return
+    if int(_ads_inventory(gid, uid).get(v, 0)) <= 0:
+        await interaction.response.send_message(embed=error_embed("Out of stock", "You don't have that item."), ephemeral=True)
+        return
+    if v in ADS_PING_KEYS:
+        await interaction.response.send_message(
+            embed=info_embed("Post type", "What kind of ad do you want to post?"), view=AdTypeView(v), ephemeral=True)
+        return
+    # Add-on (Instant Post / Bypass Queue) — apply to an active post.
+    posts = _ads_user_active_posts(gid, uid)
+    if not posts:
+        empty = ads_config.get("noposts_design") or []
+        if empty:
+            tree = _ads_render(empty, {"user": interaction.user.mention})
+            await interaction.response.defer(ephemeral=True)
+            if not await send_v2_message(interaction.channel, tree, interaction=interaction, ephemeral=True):
+                await interaction.followup.send(embed=info_embed("No current posts available", "If this is a mistake please contact support."), ephemeral=True)
             return
-        if not self.sel_ping:
-            await interaction.response.send_message(embed=error_embed("Pick a ping", "Select which ping credit to use first."), ephemeral=True)
-            return
-        state = {"ping": self.sel_ping, "type": self.sel_type, "addon": self.sel_addon}
-        if self.sel_type == "giveaway":
-            await interaction.response.send_modal(AdGiveawayModal(state))
-        else:
-            await interaction.response.send_modal(AdRegularModal(state))
+        embed = discord.Embed(title="No current posts available",
+                              description="If this is a mistake please contact support.", color=ACCENT)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    await interaction.response.send_message(
+        embed=info_embed("Apply add-on", f"Pick which of your posts to apply **{_ads_perk_label(v)}** to:"),
+        view=ApplyAddonView(v, posts), ephemeral=True)
 
 
 def _ads_claim_rows(guild_id, user_id):
-    """Raw select-menu + Continue action rows for the designed claim panel."""
+    """A single 'use an item' dropdown listing everything the member owns."""
     inv = _ads_inventory(guild_id, user_id)
-    ping_opts = [{"label": f"{_ads_perk_label(k)} ({inv[k]})", "value": k} for k in ADS_PING_KEYS if inv.get(k)]
-    if not ping_opts:
-        ping_opts = [{"label": "None", "value": "_none"}]
-    rows = [
-        {"type": 1, "components": [{"type": 3, "custom_id": "adsel_ping",
-            "placeholder": (ads_config.get("ping_placeholder") or "Which ping credit to use")[:150],
-            "min_values": 1, "max_values": 1, "options": ping_opts}]},
-        {"type": 1, "components": [{"type": 3, "custom_id": "adsel_type",
-            "placeholder": (ads_config.get("type_placeholder") or "Post type")[:150],
-            "min_values": 1, "max_values": 1, "options": [
-                {"label": (ads_config.get("regular_label") or "Regular Post"), "value": "regular", "default": True},
-                {"label": (ads_config.get("giveaway_label") or "Sponsored Giveaway"), "value": "giveaway"}]}]},
-    ]
-    addon_opts = [{"label": "No add-on", "value": "none", "default": True}]
-    for k in ("instant", "bypass"):
-        if inv.get(k):
-            addon_opts.append({"label": f"{_ads_perk_label(k)} ({inv[k]})", "value": k})
-    if len(addon_opts) > 1:
-        rows.append({"type": 1, "components": [{"type": 3, "custom_id": "adsel_addon",
-            "placeholder": (ads_config.get("addon_placeholder") or "Apply an add-on (optional)")[:150],
-            "min_values": 1, "max_values": 1, "options": addon_opts}]})
-    rows.append({"type": 1, "components": [{"type": 2, "style": 3,
-        "label": (ads_config.get("continue_label") or "Continue")[:80], "custom_id": "ad_continue"}]})
-    return rows
+    opts = [{"label": f"{_ads_perk_label(k)} ({inv[k]})", "value": k} for k in ADS_PERK_KEYS if inv.get(k)]
+    if not opts:
+        opts = [{"label": "Nothing to claim", "value": "_none"}]
+    return [{"type": 1, "components": [{"type": 3, "custom_id": "adsel_use",
+        "placeholder": (ads_config.get("ping_placeholder") or "Choose an item to use")[:150],
+        "min_values": 1, "max_values": 1, "options": opts}]}]
 
 
 async def _ads_open_claim(interaction):
     if not ads_config.get("enabled"):
         await interaction.response.send_message(embed=error_embed("Ads are off", "The advertisement system isn't set up yet."), ephemeral=True)
         return
-    inv = _ads_inventory(interaction.guild.id, interaction.user.id)
+    gid, uid = interaction.guild.id, interaction.user.id
+    inv = _ads_inventory(gid, uid)
     title = ads_config.get("claim_title") or "Your Ad Inventory"
     note = ads_config.get("claim_note") or ""
-    if not any(inv.get(k) for k in ADS_PING_KEYS):
+    if not any(inv.get(k) for k in ADS_PERK_KEYS):
+        # Owns nothing at all.
         empty = ads_config.get("empty_design") or []
         if empty:
             tree = _ads_render(empty, {"inventory": _ads_inventory_text(inv), "user": interaction.user.mention})
-            tree = _ads_fill_quantities(tree, interaction.guild.id, interaction.user.id)
-            tree = _ads_expand_inventory(tree, interaction.guild.id, interaction.user.id)
             await interaction.response.defer(ephemeral=True)
-            ok = await send_v2_message(interaction.channel, tree, interaction=interaction, ephemeral=True)
-            if not ok:
+            if not await send_v2_message(interaction.channel, tree, interaction=interaction, ephemeral=True):
                 await interaction.followup.send(embed=info_embed(title, _ads_inventory_text(inv)), ephemeral=True)
             return
         await interaction.response.send_message(
-            embed=info_embed(title, _ads_inventory_text(inv) + "\n\nYou need a ping credit (Everyone / Here / No Ping) to post."), ephemeral=True)
+            embed=info_embed(title, _ads_inventory_text(inv) + "\n\nBuy a perk from the ad shop to get started."), ephemeral=True)
         return
     design = ads_config.get("claim_design") or []
-    if design:
-        # A custom-designed panel: render it (with {inventory}) and hang the
-        # dropdowns + Continue off it via custom_id routing.
-        _ads_claim_state[interaction.user.id] = {"ping": None, "type": "regular", "addon": None}
-        tree = _ads_render(design, {"inventory": _ads_inventory_text(inv), "user": interaction.user.mention})
-        tree = _ads_fill_quantities(tree, interaction.guild.id, interaction.user.id)
-        tree = _ads_expand_inventory(tree, interaction.guild.id, interaction.user.id)
-        await interaction.response.defer(ephemeral=True)
-        rows = _ads_claim_rows(interaction.guild.id, interaction.user.id)
-        ok = await send_v2_message(interaction.channel, tree, interaction=interaction, ephemeral=True, extra_rows=rows)
-        if not ok:
-            await interaction.followup.send(embed=error_embed("Couldn't open", "The claim panel design couldn't render."), ephemeral=True)
-        return
-    body = _ads_inventory_text(inv) + (f"\n\n{note}" if note else "")
-    await interaction.response.send_message(
-        embed=info_embed(title, body),
-        view=AdClaimView(interaction.guild.id, interaction.user.id), ephemeral=True)
+    if not design:
+        body = _ads_inventory_text(inv) + (f"\n\n{note}" if note else "")
+        design = [{"type": "text", "text": f"**{title}**\n{body}"}]
+    tree = _ads_render(design, {"inventory": _ads_inventory_text(inv), "user": interaction.user.mention})
+    tree = _ads_fill_quantities(tree, gid, uid)
+    tree = _ads_expand_inventory(tree, gid, uid)
+    await interaction.response.defer(ephemeral=True)
+    rows = _ads_claim_rows(gid, uid)
+    ok = await send_v2_message(interaction.channel, tree, interaction=interaction, ephemeral=True, extra_rows=rows)
+    if not ok:
+        await interaction.followup.send(embed=error_embed("Couldn't open", "The claim panel couldn't render."), ephemeral=True)
 
 
 class AdQueueView(discord.ui.View):
