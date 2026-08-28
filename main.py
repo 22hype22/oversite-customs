@@ -9402,6 +9402,19 @@ async def seed_secret_slots():
         "placeholder": "_|WARNING:-DO-NOT-SHARE...  (paste the full .ROBLOSECURITY value)",
         "required": False,
         "sort_order": 0,
+    }, {
+        "addon_id": "customs",
+        "key": "ROBLOX_API_KEY",
+        "label": "Roblox Open Cloud API key",
+        "description": ("An Open Cloud API key for creating the developer products behind "
+                        "Purchase buttons. Roblox no longer lets the account cookie create dev "
+                        "products, so this is required for Purchase/Package buying. Create it at "
+                        "create.roblox.com → Open Cloud → API Keys, give it the Developer Products "
+                        "system with write access to your store experience, and allow-list the "
+                        "server (0.0.0.0/0 if unsure). Encrypted and never shown back."),
+        "placeholder": "Paste your Open Cloud API key…",
+        "required": False,
+        "sort_order": 1,
     }]
     res = await runtime_rpc("runtime_seed_secret_slots", {"_token": WORKER_TOKEN, "_slots": slots})
     print(f"[Startup] secret slots seeded: {bool(res)}")
