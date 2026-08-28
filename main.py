@@ -8369,14 +8369,14 @@ class AdGiveawayModal(discord.ui.Modal):
     def __init__(self, state):
         super().__init__(title="Sponsored Giveaway", timeout=600)
         self._state = state
+        self.link = discord.ui.TextInput(label="Your Discord server link", placeholder="https://discord.gg/…", required=True, max_length=200)
         self.prize = discord.ui.TextInput(label="Prize", required=True, max_length=200)
         self.winners = discord.ui.TextInput(label="Winners", placeholder="1", required=True, max_length=3)
         self.length = discord.ui.TextInput(label="Length", placeholder="1d, 12h, 30m", required=True, max_length=20)
-        self.link = discord.ui.TextInput(label="Your Discord server link", placeholder="https://discord.gg/…", required=True, max_length=200)
+        self.add_item(self.link)
         self.add_item(self.prize)
         self.add_item(self.winners)
         self.add_item(self.length)
-        self.add_item(self.link)
 
     async def on_submit(self, interaction):
         try:
@@ -8394,23 +8394,57 @@ class AdGiveawayModal(discord.ui.Modal):
         await _ads_submit(interaction, ad)
 
 
-class AdTypeView(discord.ui.View):
-    """After picking a ping credit — choose Regular Post or Sponsored Giveaway."""
-    def __init__(self, ping):
+class AdDetailsView(discord.ui.View):
+    """Bridge between the two forms. Discord won't let a modal submit open another
+    modal directly, so after the first form (type + Terms) we hand the member a
+    one-tap Continue button that opens the matching details form."""
+    def __init__(self, state):
         super().__init__(timeout=300)
+        self._state = state
+        label = "Enter giveaway details" if state.get("type") == "giveaway" else "Enter post details"
+        b = discord.ui.Button(label=label, style=discord.ButtonStyle.success)
+        b.callback = self._go
+        self.add_item(b)
+
+    async def _go(self, interaction):
+        if self._state.get("type") == "giveaway":
+            await interaction.response.send_modal(AdGiveawayModal(self._state))
+        else:
+            await interaction.response.send_modal(AdRegularModal(self._state))
+
+
+class AdStartModal(discord.ui.Modal):
+    """First form after picking a ping credit: choose Regular Post vs Sponsored
+    Giveaway and agree to the Advertisement Terms of Service. On submit it hands
+    over the Continue button that opens the details form (see AdDetailsView)."""
+    def __init__(self, ping):
+        super().__init__(title="Post an Ad", timeout=600)
         self._ping = ping
-        r = discord.ui.Button(label=(ads_config.get("regular_label") or "Regular Post"), style=discord.ButtonStyle.primary)
-        r.callback = self._regular
-        g = discord.ui.Button(label=(ads_config.get("giveaway_label") or "Sponsored Giveaway"), style=discord.ButtonStyle.secondary)
-        g.callback = self._giveaway
-        self.add_item(r)
-        self.add_item(g)
+        self.kind = discord.ui.Select(custom_id="kind", min_values=1, max_values=1, options=[
+            discord.SelectOption(label=(ads_config.get("regular_label") or "Regular Post")[:100], value="regular", default=True),
+            discord.SelectOption(label=(ads_config.get("giveaway_label") or "Sponsored Giveaway")[:100], value="giveaway"),
+        ])
+        self.agree = discord.ui.Checkbox(custom_id="agree")
+        self.add_item(discord.ui.Label(text="Post type", description="Regular Post or Sponsored Giveaway.", component=self.kind))
+        self.add_item(discord.ui.Label(
+            text="Advertisement Terms of Service",
+            description="I agree to the Oversite Customs Advertisement Terms of Service.",
+            component=self.agree))
 
-    async def _regular(self, interaction):
-        await interaction.response.send_modal(AdRegularModal({"ping": self._ping, "type": "regular", "addon": None}))
-
-    async def _giveaway(self, interaction):
-        await interaction.response.send_modal(AdGiveawayModal({"ping": self._ping, "type": "giveaway", "addon": None}))
+    async def on_submit(self, interaction):
+        if not self.agree.value:
+            await interaction.response.send_message(
+                embed=error_embed("Agreement required",
+                    "You must agree to the Oversite Customs Advertisement Terms of Service before posting."),
+                ephemeral=True)
+            return
+        kind = self.kind.values[0] if self.kind.values else "regular"
+        state = {"ping": self._ping, "type": kind, "addon": None}
+        label = (ads_config.get("giveaway_label") or "Sponsored Giveaway") if kind == "giveaway" \
+            else (ads_config.get("regular_label") or "Regular Post")
+        await interaction.response.send_message(
+            embed=success_embed("Terms accepted", f"**{label}** selected — tap **Continue** to enter your details."),
+            view=AdDetailsView(state), ephemeral=True)
 
 
 class ApplyAddonView(discord.ui.View):
@@ -8514,8 +8548,9 @@ async def _ads_handle_use(interaction, v):
         await interaction.response.send_message(embed=error_embed("Out of stock", "You don't have that item."), ephemeral=True)
         return
     if v in ADS_PING_KEYS:
-        await interaction.response.send_message(
-            embed=info_embed("Post type", "What kind of ad do you want to post?"), view=AdTypeView(v), ephemeral=True)
+        # Dropdown is a component interaction, so it can open the first form
+        # (post type + Terms of Service) directly.
+        await interaction.response.send_modal(AdStartModal(v))
         return
     # Add-on (Instant Post / Bypass Queue) — apply to an active post.
     posts = _ads_user_active_posts(gid, uid)
