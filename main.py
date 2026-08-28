@@ -11280,7 +11280,7 @@ TTS_LANG = os.getenv("TTS_LANG", "en")
 TTS_TLD = os.getenv("TTS_TLD", "co.uk")
 # Playback speed applied via a Lavalink timescale filter (1.0 = normal). gTTS is
 # a bit slow, so speed it up without changing pitch.
-TTS_PLAYBACK_SPEED = float(os.getenv("TTS_PLAYBACK_SPEED", "1.35"))
+TTS_PLAYBACK_SPEED = float(os.getenv("TTS_PLAYBACK_SPEED", "1.15"))
 
 
 async def _tts_set_speed(vc, speed):
