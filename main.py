@@ -7284,6 +7284,19 @@ async def apply_config(feature, cfg, post_panel=False):
             ads_config["claim_note"] = str(cfg.get("claim_note") or "")
         print(f"[Config] ads — enabled {ads_config['enabled']} "
               f"approval {ads_config['approval_channel_id'] or '(none)'}")
+    elif feature in ("customs-tts", "tts"):
+        eng = str(cfg.get("engine") or "gtts").lower()
+        tts_config["engine"] = eng if eng in ("gtts", "eleven") else "gtts"
+        tts_config["accent"] = str(cfg.get("accent") or TTS_TLD).strip() or TTS_TLD
+        try:
+            tts_config["speed"] = max(0.5, min(2.0, float(cfg.get("speed") or TTS_PLAYBACK_SPEED)))
+        except Exception:
+            tts_config["speed"] = TTS_PLAYBACK_SPEED
+        if str(cfg.get("voice_id") or "").strip():
+            tts_config["voice_id"] = str(cfg.get("voice_id")).strip()
+        tts_config["join_message"] = str(cfg.get("join_message") or "")
+        tts_config["leave_message"] = str(cfg.get("leave_message") or "")
+        print(f"[Config] tts — engine {tts_config['engine']} accent {tts_config['accent']} speed {tts_config['speed']}")
     elif feature in ("music-addon", "customs-music-addon"):
         music_config["enabled"] = True
         music_config["dj_role_ids"] = [str(x) for x in (cfg.get("dj_role_ids") or []) if x]
@@ -9804,7 +9817,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "invite-tracker", "marketplace", "ads"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "invite-tracker", "marketplace", "ads", "customs-tts"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
@@ -11282,6 +11295,16 @@ TTS_TLD = os.getenv("TTS_TLD", "co.uk")
 # a bit slow, so speed it up without changing pitch.
 TTS_PLAYBACK_SPEED = float(os.getenv("TTS_PLAYBACK_SPEED", "1.1"))
 
+# Live TTS settings, overridable from the dashboard "Text-to-Speech" block.
+tts_config = {
+    "engine": TTS_ENGINE,          # "gtts" | "eleven"
+    "accent": TTS_TLD,             # gTTS host tld: co.uk, com, com.au, ca, ie, co.in
+    "speed": TTS_PLAYBACK_SPEED,   # playback speed (timescale)
+    "voice_id": TTS_VOICE_ID,      # ElevenLabs voice (when engine=eleven)
+    "join_message": "",            # blank -> built-in default
+    "leave_message": "",
+}
+
 
 async def _tts_set_speed(vc, speed):
     """Apply (or reset) a timescale speed filter on the player."""
@@ -11330,7 +11353,7 @@ async def _gtts_clip(text):
     try:
         async with httpx.AsyncClient() as client:
             for ch in _gtts_chunks(text, 200):
-                url = (f"https://translate.google.{TTS_TLD}/translate_tts?ie=UTF-8&client=tw-ob"
+                url = (f"https://translate.google.{tts_config['accent']}/translate_tts?ie=UTF-8&client=tw-ob"
                        f"&tl={urllib.parse.quote(TTS_LANG)}&q={urllib.parse.quote(ch)}")
                 r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
                 if r.status_code == 200 and r.content:
@@ -11481,8 +11504,8 @@ def _tts_format(message):
 async def _tts_track(text):
     import wavelink as _wl
     import urllib.parse
-    if TTS_ENGINE == "eleven":
-        url = await _dj_make_clip(text[:400], voice_id=TTS_VOICE_ID, speed=TTS_SPEED)
+    if tts_config["engine"] == "eleven":
+        url = await _dj_make_clip(text[:400], voice_id=tts_config["voice_id"], speed=TTS_SPEED)
         if not url:
             return None
         try:
@@ -11495,7 +11518,7 @@ async def _tts_track(text):
     # faster) — only fall back to fetch+stitch+serve for long text or on failure.
     t = text[:600]
     if len(t) <= 200:
-        direct = (f"https://translate.google.{TTS_TLD}/translate_tts?ie=UTF-8&client=tw-ob"
+        direct = (f"https://translate.google.{tts_config['accent']}/translate_tts?ie=UTF-8&client=tw-ob"
                   f"&tl={urllib.parse.quote(TTS_LANG)}&q={urllib.parse.quote(t)}")
         try:
             res = await _wl.Playable.search(direct, source=None)
@@ -12150,11 +12173,14 @@ async def join_cmd(interaction: discord.Interaction):
     _tts_queue[gid] = []
     _tts_busy[gid] = False
     _tts_announce.pop(gid, None)
-    await _tts_set_speed(vc, TTS_PLAYBACK_SPEED)  # snappier gTTS
-    await interaction.followup.send(embed=success_embed(
-        "Joined — TTS on",
-        f"I'm in {ch.mention}. I'll read its chat aloud — **“name said message”**, and I skip the "
-        f"name while the same person keeps talking. Run `/leave` to stop."), ephemeral=True)
+    await _tts_set_speed(vc, tts_config["speed"])
+    body = (tts_config.get("join_message") or "").strip()
+    if body:
+        body = body.replace("{channel}", ch.mention).replace("{user}", interaction.user.mention)
+    else:
+        body = (f"I'm in {ch.mention}. I'll read its chat aloud — **“name said message”**, and I skip "
+                f"the name while the same person keeps talking. Run `/leave` to stop.")
+    await interaction.followup.send(embed=success_embed("Joined — TTS on", body), ephemeral=True)
 
 
 @bot.tree.command(name="leave", description="Leave the voice channel / stop TTS")
@@ -12174,7 +12200,8 @@ async def leave_cmd(interaction: discord.Interaction):
         await vc.disconnect()
     except Exception:
         pass
-    await interaction.response.send_message(embed=success_embed("Left", "Disconnected from voice."), ephemeral=True)
+    leave_body = (tts_config.get("leave_message") or "").strip() or "Disconnected from voice."
+    await interaction.response.send_message(embed=success_embed("Left", leave_body), ephemeral=True)
 
 
 _set_group = app_commands.Group(name="set", description="Set things on the server")
