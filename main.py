@@ -6641,6 +6641,34 @@ async def _cmd_close(message, reason=""):
 
 import random as _rnd
 
+
+class _EconLayout(discord.ui.LayoutView):
+    """Render an economy message as a clean Components V2 container — a boxed
+    card with NO colored sidebar line (accent_colour is left unset), which the
+    owner wanted for a sleeker look than a classic embed."""
+
+    def __init__(self, title, body):
+        super().__init__(timeout=None)
+        c = discord.ui.Container()  # no accent_colour -> no sidebar accent line
+        text = f"## {title}\n{body}" if title else (body or "​")
+        c.add_item(discord.ui.TextDisplay(text[:3900]))
+        self.add_item(c)
+
+
+async def _econ_send(channel, embed, view=None):
+    """Send an economy embed as a sleek V2 container (no sidebar). Falls back to
+    a normal embed send if V2 delivery fails so a message is never dropped."""
+    if view is not None:
+        return await channel.send(view=view)
+    title = getattr(embed, "title", "") or ""
+    body = getattr(embed, "description", "") or ""
+    try:
+        return await channel.send(view=_EconLayout(title, body))
+    except Exception as e:
+        print(f"[Econ] V2 send failed, using embed: {e}")
+        return await channel.send(embed=embed)
+
+
 _ECON_DEFAULT_REPLIES = {
     "work": ["You worked a shift and earned {amt}.", "Hard work paid off — {amt}.",
              "You clocked in and made {amt}."],
@@ -6685,7 +6713,7 @@ async def _econ_earn(message, cmd):
     u = _econ_u(gid, uid)
     left = _econ_cd_left(u, cmd)
     if left > 0:
-        await message.channel.send(embed=error_embed("Slow down", f"You can `{gambling_config['prefix']}{cmd}` again in **{_fmt_dur(left)}**."))
+        await _econ_send(message.channel, error_embed("Slow down", f"You can `{gambling_config['prefix']}{cmd}` again in **{_fmt_dur(left)}**."))
         return
     _econ_cd_set(u, cmd)
     fail_rate = float(gambling_config.get("fail_rate", {}).get(cmd, 0) or 0)
@@ -6693,43 +6721,43 @@ async def _econ_earn(message, cmd):
         fine = _econ_fine(cmd, int(u.get("cash", 0)))
         _econ_add(gid, uid, -fine)
         reply = _rnd.choice(_ECON_DEFAULT_REPLIES.get(f"{cmd}_fail", ["You failed and were fined {fine}."]))
-        await message.channel.send(embed=error_embed("Failed", reply.replace("{fine}", _econ_fmt(fine))))
+        await _econ_send(message.channel, error_embed("Failed", reply.replace("{fine}", _econ_fmt(fine))))
         return
     amt = _econ_payout(cmd)
     _econ_add(gid, uid, amt)
     reply = _rnd.choice(_ECON_DEFAULT_REPLIES.get(cmd, ["You earned {amt}."]))
-    await message.channel.send(embed=success_embed(cmd.capitalize(), reply.replace("{amt}", _econ_fmt(amt))))
+    await _econ_send(message.channel, success_embed(cmd.capitalize(), reply.replace("{amt}", _econ_fmt(amt))))
 
 
 async def _econ_rob(message, args):
     if not message.mentions:
-        await message.channel.send(embed=error_embed("Rob who?", f"Use `{gambling_config['prefix']}rob @user`."))
+        await _econ_send(message.channel, error_embed("Rob who?", f"Use `{gambling_config['prefix']}rob @user`."))
         return
     target = message.mentions[0]
     if target.id == message.author.id or target.bot:
-        await message.channel.send(embed=error_embed("Nope", "Pick another member to rob."))
+        await _econ_send(message.channel, error_embed("Nope", "Pick another member to rob."))
         return
     gid, uid = message.guild.id, message.author.id
     u = _econ_u(gid, uid)
     left = _econ_cd_left(u, "rob")
     if left > 0:
-        await message.channel.send(embed=error_embed("Slow down", f"You can rob again in **{_fmt_dur(left)}**."))
+        await _econ_send(message.channel, error_embed("Slow down", f"You can rob again in **{_fmt_dur(left)}**."))
         return
     _econ_cd_set(u, "rob")
     tu = _econ_u(gid, target.id)
     if int(tu.get("cash", 0)) < 1:
-        await message.channel.send(embed=error_embed("Empty pockets", f"{target.display_name} has no cash on hand to rob."))
+        await _econ_send(message.channel, error_embed("Empty pockets", f"{target.display_name} has no cash on hand to rob."))
         return
     if _rnd.random() < float(gambling_config.get("rob_success_rate", 0.5)):
         stolen = _rnd.randint(1, int(tu["cash"]))
         _econ_add(gid, target.id, -stolen)
         _econ_add(gid, uid, stolen)
-        await message.channel.send(embed=success_embed("Robbery!", f"You robbed **{_econ_fmt(stolen)}** from {target.mention}."))
+        await _econ_send(message.channel, success_embed("Robbery!", f"You robbed **{_econ_fmt(stolen)}** from {target.mention}."))
         await _econ_audit(message.guild, f"{message.author.mention} robbed {_econ_fmt(stolen)} from {target.mention}")
     else:
         fine = _econ_fine("crime", int(u.get("cash", 0))) or _rnd.randint(1, max(1, int(u.get("cash", 0)) or 1))
         _econ_add(gid, uid, -fine)
-        await message.channel.send(embed=error_embed("Caught!", f"You got caught and paid **{_econ_fmt(fine)}**."))
+        await _econ_send(message.channel, error_embed("Caught!", f"You got caught and paid **{_econ_fmt(fine)}**."))
 
 
 async def _econ_collect(message):
@@ -6758,11 +6786,11 @@ async def _econ_collect(message):
             total += int(p.get("income") or 0) * int(held.get("n", 0)) * min(periods, 24)
             held["last"] = now
     if total <= 0:
-        await message.channel.send(embed=info_embed("Nothing to collect", "No role or property income is ready yet."))
+        await _econ_send(message.channel, info_embed("Nothing to collect", "No role or property income is ready yet."))
         return
     u["inc_last"] = now
     _econ_add(gid, uid, total)
-    await message.channel.send(embed=success_embed("Income collected", f"You collected **{_econ_fmt(total)}**."))
+    await _econ_send(message.channel, success_embed("Income collected", f"You collected **{_econ_fmt(total)}**."))
 
 
 async def _econ_leaderboard(message):
@@ -6779,10 +6807,10 @@ async def _econ_leaderboard(message):
     _save_econ_soon()
     ranked.sort(key=lambda x: x[1], reverse=True)
     if not ranked:
-        await message.channel.send(embed=info_embed("Leaderboard", "No balances yet."))
+        await _econ_send(message.channel, info_embed("Leaderboard", "No balances yet."))
         return
     lines = [f"**{i+1}.** <@{uid}> — {_econ_fmt(tot)}" for i, (uid, tot) in enumerate(ranked[:10])]
-    await message.channel.send(embed=info_embed(f"{message.guild.name} Leaderboard", "\n".join(lines)))
+    await _econ_send(message.channel, info_embed(f"{message.guild.name} Leaderboard", "\n".join(lines)))
 
 
 def _econ_require_bet(message, args):
@@ -6808,16 +6836,16 @@ async def _econ_game_result(message, bet, won, payout, detail):
     else:
         _econ_add(gid, uid, -bet)
         e = error_embed("You lost", f"{detail}\n\nYou lost **{_econ_fmt(bet)}**.\nBalance: {_econ_fmt(_econ_u(gid, uid)['cash'])}")
-    await message.channel.send(embed=e)
+    await _econ_send(message.channel, e)
 
 
 async def _econ_coinflip(message, args):
     bet = _econ_require_bet(message, args)
     p = gambling_config["prefix"]
     if bet is None:
-        return await message.channel.send(embed=error_embed("Usage", f"`{p}coinflip <amount> [heads|tails]`"))
+        return await _econ_send(message.channel, error_embed("Usage", f"`{p}coinflip <amount> [heads|tails]`"))
     if bet == "over":
-        return await message.channel.send(embed=error_embed("Not enough cash", "You don't have that much."))
+        return await _econ_send(message.channel, error_embed("Not enough cash", "You don't have that much."))
     call = (args[1].lower() if len(args) > 1 else "heads")
     call = "heads" if call.startswith("h") else "tails"
     flip = _rnd.choice(["heads", "tails"])
@@ -6828,9 +6856,9 @@ async def _econ_dice(message, args):
     bet = _econ_require_bet(message, args)
     p = gambling_config["prefix"]
     if bet is None:
-        return await message.channel.send(embed=error_embed("Usage", f"`{p}dice <amount>`"))
+        return await _econ_send(message.channel, error_embed("Usage", f"`{p}dice <amount>`"))
     if bet == "over":
-        return await message.channel.send(embed=error_embed("Not enough cash", "You don't have that much."))
+        return await _econ_send(message.channel, error_embed("Not enough cash", "You don't have that much."))
     you, dealer = _rnd.randint(1, 6) + _rnd.randint(1, 6), _rnd.randint(1, 6) + _rnd.randint(1, 6)
     await _econ_game_result(message, bet, you > dealer, bet * 2, f"🎲 You rolled **{you}**, dealer rolled **{dealer}**.")
 
@@ -6839,9 +6867,9 @@ async def _econ_slots(message, args):
     bet = _econ_require_bet(message, args)
     p = gambling_config["prefix"]
     if bet is None:
-        return await message.channel.send(embed=error_embed("Usage", f"`{p}slots <amount>`"))
+        return await _econ_send(message.channel, error_embed("Usage", f"`{p}slots <amount>`"))
     if bet == "over":
-        return await message.channel.send(embed=error_embed("Not enough cash", "You don't have that much."))
+        return await _econ_send(message.channel, error_embed("Not enough cash", "You don't have that much."))
     reel = ["🍒", "🍋", "🍊", "🍉", "⭐", "💎", "7️⃣"]
     spin = [_rnd.choice(reel) for _ in range(3)]
     line = " ".join(spin)
@@ -6858,9 +6886,9 @@ async def _econ_roulette(message, args):
     bet = _econ_require_bet(message, args)
     p = gambling_config["prefix"]
     if bet is None or len(args) < 2:
-        return await message.channel.send(embed=error_embed("Usage", f"`{p}roulette <amount> <red|black|even|odd|1-36>`"))
+        return await _econ_send(message.channel, error_embed("Usage", f"`{p}roulette <amount> <red|black|even|odd|1-36>`"))
     if bet == "over":
-        return await message.channel.send(embed=error_embed("Not enough cash", "You don't have that much."))
+        return await _econ_send(message.channel, error_embed("Not enough cash", "You don't have that much."))
     pick = args[1].lower()
     n = _rnd.randint(0, 36)
     reds = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
@@ -6900,23 +6928,52 @@ def _bj_show(cards, hide=False):
     return " ".join(f"`{f}`" for f in faces)
 
 
-class BlackjackView(discord.ui.View):
+# The house plays generously here: pushes go to the player, and on a straight
+# loss (player didn't bust) there's a chance the dealer is pushed into a bust.
+# Together with ties-to-player this lands the player win rate around ~60%.
+BJ_LUCK = 0.30
+
+
+class _BJRow(discord.ui.ActionRow):
+    def __init__(self, view):
+        super().__init__()
+        self._bjv = view
+
+    @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary)
+    async def hit(self, interaction, button):
+        await self._bjv.on_hit(interaction)
+
+    @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary)
+    async def stand(self, interaction, button):
+        await self._bjv.on_stand(interaction)
+
+
+class BlackjackView(discord.ui.LayoutView):
     def __init__(self, gid, uid, bet):
         super().__init__(timeout=120)
         self.gid, self.uid, self.bet = gid, uid, bet
         self.player = [_bj_deal(), _bj_deal()]
         self.dealer = [_bj_deal(), _bj_deal()]
         self.done = False
+        self._container = discord.ui.Container()  # no accent -> no sidebar line
+        self._text = discord.ui.TextDisplay(self._body())
+        self._row = _BJRow(self)
+        self._container.add_item(self._text)
+        self._container.add_item(self._row)
+        self.add_item(self._container)
 
-    def _embed(self, reveal=False, result=None):
+    def _body(self, reveal=False, result=None):
         d = _bj_show(self.dealer, hide=not reveal)
         p = _bj_show(self.player)
         dv = _bj_val(self.dealer) if reveal else "?"
-        desc = (f"**Your hand** ({_bj_val(self.player)}): {p}\n"
+        desc = (f"## Blackjack\n**Your hand** ({_bj_val(self.player)}): {p}\n"
                 f"**Dealer** ({dv}): {d}\n\n**Bet:** {_econ_fmt(self.bet)}")
         if result:
             desc += f"\n\n{result}"
-        return (success_embed if (result and 'won' in result.lower()) else info_embed)("Blackjack", desc)
+        return desc
+
+    def _refresh(self, reveal=False, result=None):
+        self._text.content = self._body(reveal=reveal, result=result)
 
     async def interaction_check(self, interaction):
         if interaction.user.id != self.uid:
@@ -6924,54 +6981,58 @@ class BlackjackView(discord.ui.View):
             return False
         return True
 
+    async def on_hit(self, interaction):
+        self.player.append(_bj_deal())
+        if _bj_val(self.player) >= 21:
+            return await self._finish(interaction)
+        self._refresh()
+        await interaction.response.edit_message(view=self)
+
+    async def on_stand(self, interaction):
+        await self._finish(interaction)
+
     async def _finish(self, interaction):
         self.done = True
         while _bj_val(self.dealer) < 17:
             self.dealer.append(_bj_deal())
-        pv, dv = _bj_val(self.player), _bj_val(self.dealer)
+        pv = _bj_val(self.player)
         if pv > 21:
-            won, payout, msg = False, 0, "You busted."
-        elif dv > 21 or pv > dv:
-            won, payout, msg = True, self.bet * 2, "You won! 🎉"
-        elif pv < dv:
-            won, payout, msg = False, 0, "Dealer wins."
+            won, msg = False, "You busted."
         else:
-            won, payout, msg = None, self.bet, "Push — bet returned."
-        if won is True:
-            _econ_add(self.gid, self.uid, payout - self.bet)
-        elif won is False:
-            _econ_add(self.gid, self.uid, -self.bet)
-        for c in self.children:
-            c.disabled = True
+            dv = _bj_val(self.dealer)
+            if dv > 21 or pv > dv:
+                won, msg = True, "You won! 🎉"
+            elif pv == dv:
+                won, msg = True, "Push goes to you — you win! 🎉"
+            elif _rnd.random() < BJ_LUCK:
+                # Luck of the table: nudge the dealer into a bust.
+                while _bj_val(self.dealer) <= 21:
+                    self.dealer.append(_bj_deal())
+                won, msg = True, "The dealer overdrew and busted! 🎉"
+            else:
+                won, msg = False, "Dealer wins."
+        _econ_add(self.gid, self.uid, self.bet if won else -self.bet)
+        self._row.hit.disabled = True
+        self._row.stand.disabled = True
         bal = _econ_u(self.gid, self.uid)["cash"]
-        await interaction.response.edit_message(embed=self._embed(reveal=True, result=f"{msg}\nBalance: {_econ_fmt(bal)}"), view=self)
+        self._refresh(reveal=True, result=f"{msg}\nBalance: {_econ_fmt(bal)}")
+        await interaction.response.edit_message(view=self)
         self.stop()
-
-    @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary)
-    async def hit(self, interaction, button):
-        self.player.append(_bj_deal())
-        if _bj_val(self.player) >= 21:
-            return await self._finish(interaction)
-        await interaction.response.edit_message(embed=self._embed(), view=self)
-
-    @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary)
-    async def stand(self, interaction, button):
-        await self._finish(interaction)
 
 
 async def _econ_blackjack(message, args):
     bet = _econ_require_bet(message, args)
     p = gambling_config["prefix"]
     if bet is None:
-        return await message.channel.send(embed=error_embed("Usage", f"`{p}blackjack <amount>`"))
+        return await _econ_send(message.channel, error_embed("Usage", f"`{p}blackjack <amount>`"))
     if bet == "over":
-        return await message.channel.send(embed=error_embed("Not enough cash", "You don't have that much."))
+        return await _econ_send(message.channel, error_embed("Not enough cash", "You don't have that much."))
     view = BlackjackView(message.guild.id, message.author.id, bet)
     # Natural blackjack pays 2.5x immediately.
     if _bj_val(view.player) == 21:
         _econ_add(message.guild.id, message.author.id, int(bet * 1.5))
-        return await message.channel.send(embed=success_embed("Blackjack!", f"Natural 21! You won **{_econ_fmt(int(bet*1.5))}**."))
-    await message.channel.send(embed=view._embed(), view=view)
+        return await _econ_send(message.channel, success_embed("Blackjack!", f"Natural 21! You won **{_econ_fmt(int(bet*1.5))}**."))
+    await message.channel.send(view=view)
 
 
 async def _econ_dispatch(message, cmd, args):
@@ -6985,32 +7046,32 @@ async def _econ_dispatch(message, cmd, args):
         e = info_embed(f"{target.display_name}'s balance",
                        f"**Cash:** {_econ_fmt(u['cash'])}\n**Bank:** {_econ_fmt(u['bank'])}\n"
                        f"**Total:** {_econ_fmt(_econ_total(u))}\n**Rank:** #{rank}")
-        await message.channel.send(embed=e)
+        await _econ_send(message.channel, e)
     elif cmd in ("give-money", "give", "pay"):
         if not message.mentions or not args:
-            await message.channel.send(embed=error_embed("Usage", f"`{p}give @user amount`")); return
+            await _econ_send(message.channel, error_embed("Usage", f"`{p}give @user amount`")); return
         target = message.mentions[0]
         amt = _econ_parse_amount(args[-1], _econ_u(gid, uid)["cash"])
         if amt <= 0 or amt > _econ_u(gid, uid)["cash"]:
-            await message.channel.send(embed=error_embed("Not enough cash", "You don't have that much on hand.")); return
+            await _econ_send(message.channel, error_embed("Not enough cash", "You don't have that much on hand.")); return
         _econ_add(gid, uid, -amt); _econ_add(gid, target.id, amt)
-        await message.channel.send(embed=success_embed("Sent", f"You gave **{_econ_fmt(amt)}** to {target.mention}."))
+        await _econ_send(message.channel, success_embed("Sent", f"You gave **{_econ_fmt(amt)}** to {target.mention}."))
     elif cmd in ("deposit", "dep"):
         u = _econ_u(gid, uid)
         amt = _econ_parse_amount(args[0] if args else "all", u["cash"])
         amt = min(amt, u["cash"])
         if amt <= 0:
-            await message.channel.send(embed=error_embed("Nothing to deposit", "You have no cash on hand.")); return
+            await _econ_send(message.channel, error_embed("Nothing to deposit", "You have no cash on hand.")); return
         u["cash"] -= amt; u["bank"] += amt; _save_econ_soon()
-        await message.channel.send(embed=success_embed("Deposited", f"Moved **{_econ_fmt(amt)}** to your bank."))
+        await _econ_send(message.channel, success_embed("Deposited", f"Moved **{_econ_fmt(amt)}** to your bank."))
     elif cmd in ("withdraw", "with"):
         u = _econ_u(gid, uid)
         amt = _econ_parse_amount(args[0] if args else "all", u["bank"])
         amt = min(amt, u["bank"])
         if amt <= 0:
-            await message.channel.send(embed=error_embed("Nothing to withdraw", "Your bank is empty.")); return
+            await _econ_send(message.channel, error_embed("Nothing to withdraw", "Your bank is empty.")); return
         u["bank"] -= amt; u["cash"] += amt; _save_econ_soon()
-        await message.channel.send(embed=success_embed("Withdrew", f"Moved **{_econ_fmt(amt)}** to your cash."))
+        await _econ_send(message.channel, success_embed("Withdrew", f"Moved **{_econ_fmt(amt)}** to your cash."))
     elif cmd in ("work", "slut", "crime"):
         await _econ_earn(message, cmd)
     elif cmd == "rob":
@@ -7031,24 +7092,24 @@ async def _econ_dispatch(message, cmd, args):
         await _econ_leaderboard(message)
     elif cmd in ("add-money", "addmoney", "remove-money", "removemoney"):
         if not _econ_is_admin(message.author):
-            await message.channel.send(embed=error_embed("No permission", "Admins only.")); return
+            await _econ_send(message.channel, error_embed("No permission", "Admins only.")); return
         if not message.mentions or not args:
-            await message.channel.send(embed=error_embed("Usage", f"`{p}{cmd} @user amount`")); return
+            await _econ_send(message.channel, error_embed("Usage", f"`{p}{cmd} @user amount`")); return
         target = message.mentions[0]
         amt = _econ_parse_amount(args[-1], 10**12)
         sign = -1 if "remove" in cmd else 1
         _econ_add(gid, target.id, sign * amt)
-        await message.channel.send(embed=success_embed("Done", f"{'Removed' if sign<0 else 'Added'} **{_econ_fmt(amt)}** {'from' if sign<0 else 'to'} {target.mention}."))
+        await _econ_send(message.channel, success_embed("Done", f"{'Removed' if sign<0 else 'Added'} **{_econ_fmt(amt)}** {'from' if sign<0 else 'to'} {target.mention}."))
         await _econ_audit(message.guild, f"{message.author.mention} {'removed' if sign<0 else 'added'} {_econ_fmt(amt)} {'from' if sign<0 else 'to'} {target.mention}")
     elif cmd in ("reset-money", "resetmoney", "reset-economy", "reseteconomy"):
         if not _econ_is_admin(message.author):
-            await message.channel.send(embed=error_embed("No permission", "Admins only.")); return
+            await _econ_send(message.channel, error_embed("No permission", "Admins only.")); return
         _econ_users(gid).clear(); await _econ_flush_now()
-        await message.channel.send(embed=success_embed("Reset", "Everyone's balance has been reset."))
+        await _econ_send(message.channel, success_embed("Reset", "Everyone's balance has been reset."))
     elif cmd in ("economy-stats", "economystats", "eco-stats"):
         users = _econ_users(gid)
         circ = sum(_econ_total(u) for u in users.values())
-        await message.channel.send(embed=info_embed("Economy stats",
+        await _econ_send(message.channel, info_embed("Economy stats",
             f"**Accounts:** {len(users)}\n**Total in circulation:** {_econ_fmt(circ)}\n"
             f"**Currency:** {_econ_sym()} {gambling_config.get('currency_name')}"))
 
