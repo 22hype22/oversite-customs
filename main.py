@@ -243,6 +243,29 @@ def _ads_perk_for_name(name):
     return _ADS_NAME_ALIASES.get(n)
 
 
+# Pre-made Roblox developer products for the ad perks (owner-created, so nothing
+# is created at buy time and no Open Cloud API key is needed). Keyed by perk key.
+# The web product page is roblox.com/developer-product/<experience>/product/<id>.
+ADS_STORE_EXPERIENCE_ID = "99629898994812"
+ADS_PERK_PRODUCT_IDS = {
+    "instant": "3710170569",
+    "bypass": "3710171039",
+    "ping_everyone": "3710171057",
+    "ping_here": "3710171068",
+    "ping_none": "3710171078",
+}
+
+
+def _ads_product_buy_url(name):
+    """Direct buy link for a pre-made ad-perk product, matched by the card title.
+    Returns '' if the title isn't one of the known perks."""
+    perk = _ads_perk_for_name(name)
+    pid = ADS_PERK_PRODUCT_IDS.get(perk or "")
+    if not pid:
+        return ""
+    return f"https://www.roblox.com/developer-product/{ADS_STORE_EXPERIENCE_ID}/product/{pid}"
+
+
 def _ads_grant(guild_id, user_id, perk_key, n=1):
     if perk_key not in ADS_PERK_KEYS:
         return
@@ -9025,6 +9048,9 @@ async def _pkg_flow_devproduct(interaction, title, price_field, pkg_msg_id, deli
     help_to = _pkg_help_mention(interaction.guild)
     robux = _pkg_parse_robux(price_field)
     buy_url = (buy_url or "").strip()
+    if not buy_url:
+        # Fall back to a pre-made ad-perk product (No Ping, Instant Post, …).
+        buy_url = _ads_product_buy_url(title)
     if buy_url:
         # Pinned pre-made product — link straight to its page. No API key needed.
         buy = buy_url
