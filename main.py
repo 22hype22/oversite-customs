@@ -8041,8 +8041,9 @@ def _ads_inventory_cards(guild_id, user_id):
 
 
 def _ads_fill_quantities(tree, guild_id, user_id):
-    """Fill {quantity} on any Purchase 'Quantity' cards from the viewer's own
-    inventory (matched by the card's title to a perk). Recurses into containers."""
+    """Fill {quantity} on Purchase 'Quantity' cards from the viewer's own
+    inventory (matched by the card's title to a perk), and HIDE any card they
+    don't own (count 0). Containers left with nothing meaningful are dropped too."""
     inv = _ads_inventory(guild_id, user_id)
 
     def _walk(items):
@@ -8054,14 +8055,23 @@ def _ads_fill_quantities(tree, guild_id, user_id):
             it = dict(it)
             if it.get("type") == "container":
                 kids = it.get("children") if isinstance(it.get("children"), list) else it.get("components")
-                it["children"] = _walk(kids or [])
+                new_kids = _walk(kids or [])
+                meaningful = [k for k in new_kids if isinstance(k, dict) and k.get("type") != "separator"]
+                if not meaningful:
+                    continue  # container emptied out (its quantity cards were all 0)
+                it["children"] = new_kids
                 it.pop("components", None)
+                out.append(it)
             elif it.get("type") == "purchase" and it.get("quantity"):
                 perk = _ads_perk_for_name(it.get("title") or "")
                 n = int(inv.get(perk, 0)) if perk else 0
+                if n <= 0:
+                    continue  # they don't own this — hide the card
                 lbl = it.get("button_label") or "Quantity | {quantity}"
                 it["button_label"] = lbl.replace("{quantity}", str(n)).replace("{Quantity}", str(n))
-            out.append(it)
+                out.append(it)
+            else:
+                out.append(it)
         return out
 
     return _walk(tree)
