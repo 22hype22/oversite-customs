@@ -9214,24 +9214,43 @@ async def start_roblox_verify(interaction):
         await interaction.followup.send(embed=error_embed("Something went wrong", "Please try again."), ephemeral=True)
 
 
-async def fetch_config(feature):
+async def fetch_config(feature, attempts=4):
+    """Fetch one feature's saved config. The config endpoint occasionally returns
+    a transient gateway timeout (5xx) or drops the connection at boot; when that
+    happens we must NOT treat it as 'no config saved' — that would silently leave
+    the feature disabled for the whole session (e.g. 'Ads are off'). So retry a
+    few times with a short backoff before giving up."""
     if not (BOT_ORDER_ID and WORKER_TOKEN):
         return None
-    try:
-        session = await get_poll_session()
-        async with session.get(
-            f"{SUPABASE_FN_URL}/{BOT_API}/bot-config?feature={feature}&bot_id={BOT_ORDER_ID}",
-            headers=_fn_headers(),
-        ) as r:
-            if r.status == 200:
-                data = await r.json()
-                cfg = data.get("config") if isinstance(data, dict) else None
-                if isinstance(cfg, dict) and "config" in cfg:
-                    cfg = cfg["config"]
-                return cfg
-            print(f"[Config] fetch {feature} — HTTP {r.status}")
-    except Exception as e:
-        print(f"[Config] fetch {feature} failed: {e}")
+    for i in range(attempts):
+        last = i == attempts - 1
+        try:
+            session = await get_poll_session()
+            async with session.get(
+                f"{SUPABASE_FN_URL}/{BOT_API}/bot-config?feature={feature}&bot_id={BOT_ORDER_ID}",
+                headers=_fn_headers(),
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    cfg = data.get("config") if isinstance(data, dict) else None
+                    if isinstance(cfg, dict) and "config" in cfg:
+                        cfg = cfg["config"]
+                    return cfg
+                # 5xx = transient (gateway timeout, cold start). Retry before
+                # giving up. 4xx is a real 'not there', so don't bother.
+                if r.status >= 500 and not last:
+                    print(f"[Config] fetch {feature} — HTTP {r.status}, retry {i+1}/{attempts-1}")
+                    await asyncio.sleep(1.0 * (i + 1))
+                    continue
+                print(f"[Config] fetch {feature} — HTTP {r.status}")
+                return None
+        except Exception as e:
+            if not last:
+                print(f"[Config] fetch {feature} failed: {e}; retry {i+1}/{attempts-1}")
+                await asyncio.sleep(1.0 * (i + 1))
+                continue
+            print(f"[Config] fetch {feature} failed: {e}")
+            return None
     return None
 
 
