@@ -11261,8 +11261,10 @@ auto_music_sessions = {}
 _tts_channels = {}  # guild_id -> voice-channel id whose chat is being read
 _tts_queue = {}     # guild_id -> list[Playable] waiting to be spoken
 _tts_busy = {}      # guild_id -> True while a clip is playing
+_tts_last_speaker = {}  # guild_id -> last speaker's user id (to skip repeating names)
 # ElevenLabs voice for /join TTS — same clip pipeline as the DJ, different voice.
-TTS_VOICE_ID = os.getenv("TTS_ELEVEN_VOICE_ID", "VfdLuBKQajtI8RHxLhnk")
+TTS_VOICE_ID = os.getenv("TTS_ELEVEN_VOICE_ID", "s3TPKV1kjDlVtZbl4Ksh")
+TTS_SPEED = float(os.getenv("TTS_SPEED", "1.15"))  # ElevenLabs voice speed (0.7–1.2)
 
 
 def _tts_clean(content):
@@ -11278,8 +11280,8 @@ def _tts_clean(content):
 
 async def _tts_track(text):
     import wavelink as _wl
-    # Same ElevenLabs clip pipeline as the DJ, just a different voice.
-    url = await _dj_make_clip(text[:300], voice_id=TTS_VOICE_ID)
+    # Same ElevenLabs clip pipeline as the DJ, just a different voice + faster.
+    url = await _dj_make_clip(text[:300], voice_id=TTS_VOICE_ID, speed=TTS_SPEED)
     if not url:
         return None
     try:
@@ -11316,7 +11318,14 @@ async def _tts_handle(message):
     body = _tts_clean(message.content)
     if not body:
         return
-    track = await _tts_track(f"{message.author.display_name} {body}")
+    # Only say the name when the speaker changes — consecutive messages from the
+    # same person are read without repeating their name.
+    if _tts_last_speaker.get(gid) == message.author.id:
+        text = body
+    else:
+        _tts_last_speaker[gid] = message.author.id
+        text = f"{message.author.display_name} said {body}"
+    track = await _tts_track(text)
     if not track:
         return
     _tts_queue.setdefault(gid, []).append(track)
@@ -11343,10 +11352,13 @@ DJ_SWITCH_LINES = [
 ]
 
 
-async def _dj_make_clip(text: str, voice_id: str | None = None) -> str | None:
+async def _dj_make_clip(text: str, voice_id: str | None = None, speed: float | None = None) -> str | None:
     if not DJ_PUBLIC_URL:
         return None
     vid = voice_id or ELEVEN_VOICE_ID
+    voice_settings = {"stability": 0.5, "similarity_boost": 0.8}
+    if speed:
+        voice_settings["speed"] = max(0.7, min(1.2, float(speed)))  # ElevenLabs range
     try:
         import uuid
         os.makedirs(_dj_clip_dir, exist_ok=True)
@@ -11360,7 +11372,7 @@ async def _dj_make_clip(text: str, voice_id: str | None = None) -> str | None:
                         f"https://api.elevenlabs.io/v1/text-to-speech/{vid}",
                         headers={"xi-api-key": ELEVEN_API_KEY, "Content-Type": "application/json"},
                         json={"text": text, "model_id": "eleven_turbo_v2_5",
-                              "voice_settings": {"stability": 0.5, "similarity_boost": 0.8}}, timeout=20)
+                              "voice_settings": voice_settings}, timeout=20)
                     if r.status_code == 200:
                         with open(path, "wb") as f:
                             f.write(r.content)
@@ -11906,10 +11918,11 @@ async def join_cmd(interaction: discord.Interaction):
     _tts_channels[gid] = ch.id
     _tts_queue[gid] = []
     _tts_busy[gid] = False
+    _tts_last_speaker.pop(gid, None)
     await interaction.followup.send(embed=success_embed(
         "Joined — TTS on",
-        f"I'm in {ch.mention}. Anything typed in its chat I'll read aloud as **name + message**. "
-        f"Run `/leave` to stop."), ephemeral=True)
+        f"I'm in {ch.mention}. I'll read its chat aloud — **“name said message”**, and I skip the "
+        f"name while the same person keeps talking. Run `/leave` to stop."), ephemeral=True)
 
 
 @bot.tree.command(name="leave", description="Leave the voice channel / stop TTS")
@@ -11918,6 +11931,7 @@ async def leave_cmd(interaction: discord.Interaction):
     was_tts = _tts_channels.pop(gid, None) is not None
     _tts_queue.pop(gid, None)
     _tts_busy.pop(gid, None)
+    _tts_last_speaker.pop(gid, None)
     vc = interaction.guild.voice_client
     if not vc:
         await interaction.response.send_message(embed=error_embed("Not connected", "I'm not in a voice channel."), ephemeral=True)
@@ -11929,6 +11943,36 @@ async def leave_cmd(interaction: discord.Interaction):
     except Exception:
         pass
     await interaction.response.send_message(embed=success_embed("Left", "Disconnected from voice."), ephemeral=True)
+
+
+_set_group = app_commands.Group(name="set", description="Set things on the server")
+
+
+@_set_group.command(name="nick", description="Change a member's nickname (what the bot calls them)")
+@app_commands.describe(user="Who to rename", nickname="New nickname (blank to reset)")
+async def set_nick(interaction: discord.Interaction, user: discord.Member, nickname: str = ""):
+    # Anyone may rename themselves; renaming others needs Manage Nicknames.
+    if user.id != interaction.user.id and not interaction.user.guild_permissions.manage_nicknames:
+        await interaction.response.send_message(
+            embed=error_embed("No permission", "You need **Manage Nicknames** to rename other people."), ephemeral=True)
+        return
+    new = nickname.strip()[:32] or None
+    try:
+        await user.edit(nick=new, reason=f"/set nick by {interaction.user}")
+    except discord.Forbidden:
+        await interaction.response.send_message(embed=error_embed(
+            "Can't rename them", "My role must sit **above** theirs and I need **Manage Nicknames** "
+            "(I also can't rename the server owner)."), ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.response.send_message(embed=error_embed("Failed", str(e)[:200]), ephemeral=True)
+        return
+    shown = f"**{new}**" if new else "their original name"
+    await interaction.response.send_message(
+        embed=success_embed("Nickname set", f"{user.mention} is now {shown}."), ephemeral=True)
+
+
+bot.tree.add_command(_set_group)
 
 
 # ---- Commands ----
@@ -11946,6 +11990,7 @@ async def music_play(interaction: discord.Interaction, query: str):
     _tts_channels.pop(interaction.guild.id, None)
     _tts_queue.pop(interaction.guild.id, None)
     _tts_busy.pop(interaction.guild.id, None)
+    _tts_last_speaker.pop(interaction.guild.id, None)
     if not (music_config.get("enabled") or music_available):
         await interaction.followup.send(embed=error_embed("Music is off", "Enable the Music Add-On in the dashboard first."))
         return
