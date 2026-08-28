@@ -10961,7 +10961,7 @@ class NowPlayingView(discord.ui.View):
         if vc and vc.playing:
             _taste_event_current(interaction.guild, -1.5)
             session = auto_music_sessions.get(interaction.guild.id)
-            if session and len(vc.queue) < 2 and interaction.guild.id not in _dj_mode:
+            if session and len(vc.queue) < 5 and interaction.guild.id not in _dj_mode:
                 try:
                     genre = session.get("genre", "pop")
                     for t in await get_genre_playlist_tracks(genre, count=20, guild_id=interaction.guild.id, source="skip-refill"):
@@ -11156,7 +11156,7 @@ async def handle_npv2_button(interaction, cid):
                 return await interaction.response.send_message("Nothing playing.", ephemeral=True)
             _taste_event_current(guild, -1.5)
             session = auto_music_sessions.get(guild.id)
-            if session and len(vc.queue) < 2 and guild.id not in _dj_mode:
+            if session and len(vc.queue) < 5 and guild.id not in _dj_mode:
                 try:
                     for t in await get_genre_playlist_tracks(session.get("genre", "pop"), count=20, guild_id=guild.id, source="skip-v2-refill"):
                         await vc.queue.put_wait(t)
@@ -11213,13 +11213,15 @@ async def send_now_playing(guild, track, channel):
 
         if guild.voice_client and guild.voice_client.channel:
             try:
-                import time as _vt
-                _last = getattr(bot, "_last_vc_status", {})
-                if _vt.time() - _last.get(guild.id, 0) > 15:
-                    author = getattr(track, "author", None)
-                    await set_vc_status(guild.voice_client.channel, f"{track.title} - {author}" if author else track.title)
-                    _last[guild.id] = _vt.time()
-                    bot._last_vc_status = _last
+                author = getattr(track, "author", None)
+                new_status = f"{track.title} - {author}" if author else track.title
+                # Update whenever the SONG changes (keeps the VC status in sync
+                # with the card, even on rapid skips) — not on a fixed timer.
+                _last = getattr(bot, "_last_vc_status_text", {})
+                if _last.get(guild.id) != new_status:
+                    await set_vc_status(guild.voice_client.channel, new_status)
+                    _last[guild.id] = new_status
+                    bot._last_vc_status_text = _last
             except Exception:
                 pass
 
@@ -12032,7 +12034,7 @@ async def _snapshot_music_state():
 _music_state_idle = False  # True once we've written the "nothing playing" state
 
 
-@tasks.loop(seconds=45)
+@tasks.loop(seconds=15)
 async def persist_music_state():
     """Save live playback so a redeploy can resume it. Skips until the boot-time
     restore has run, so it never overwrites the snapshot with an empty state.
@@ -12661,14 +12663,12 @@ async def on_wavelink_track_start(payload):
                     _pt.cancel()
                 if guild.voice_client and guild.voice_client.channel:
                     await set_vc_status(guild.voice_client.channel, "DJ Carla")
-                # Reset the status throttle so the song that follows the clip
-                # updates the VC status right away (only the clip says "DJ Carla").
-                try:
-                    _l = getattr(bot, "_last_vc_status", {})
-                    _l[guild.id] = 0
-                    bot._last_vc_status = _l
-                except Exception:
-                    pass
+                    try:
+                        _l = getattr(bot, "_last_vc_status_text", {})
+                        _l[guild.id] = "DJ Carla"
+                        bot._last_vc_status_text = _l
+                    except Exception:
+                        pass
             except Exception:
                 pass
             return
@@ -12692,7 +12692,7 @@ async def on_wavelink_track_start(payload):
             await send_now_playing(guild, track, text_channel)
 
         session = auto_music_sessions.get(guild.id)
-        if session and len(player.queue) < 2:
+        if session and len(player.queue) < 5:
             more = await get_genre_playlist_tracks(session.get("genre", "pop"), count=10, guild_id=guild.id, source="low-queue-topup")
             for t in (more or []):
                 try:
@@ -13049,6 +13049,15 @@ async def _shutdown():
         await asyncio.wait_for(_bot_config_upsert("invite-tracker-data", {"guilds": invite_tracker}), timeout=8)
     except Exception as e:
         print(f"[Shutdown] invite flush error: {e}")
+    # Snapshot live music at the EXACT current position so a redeploy resumes
+    # seamlessly, mid-song, right where it left off.
+    if _music_state_ready:
+        try:
+            state = await _snapshot_music_state()
+            await asyncio.wait_for(_bot_config_upsert("runtime-music-state", {"guilds": state}), timeout=8)
+            print(f"[Shutdown] music state saved ({len(state)} guild(s)) at exact position")
+        except Exception as e:
+            print(f"[Shutdown] music flush error: {e}")
     if SUPABASE_URL and BOT_ORDER_ID:
         try:
             async with httpx.AsyncClient() as client:
