@@ -166,6 +166,29 @@ gambling_config = {
     "properties": [],    # [{"id","name","price","income","interval_minutes","max"}]
 }
 
+# Realistic income businesses used when the owner hasn't defined a custom list
+# in the dashboard. Members buy them from the shop; they pay out every cycle via
+# `collect`. Prices/income are tuned so each pays for itself in ~20-25 cycles.
+ECON_DEFAULT_PROPERTIES = [
+    {"id": "newsstand",  "name": "🗞️ Newspaper Stand", "price": 750,     "income": 45,    "interval_minutes": 60, "max": 5},
+    {"id": "vending",    "name": "🥤 Vending Machine",  "price": 2500,    "income": 130,   "interval_minutes": 60, "max": 5},
+    {"id": "carwash",    "name": "🧽 Car Wash",         "price": 6000,    "income": 300,   "interval_minutes": 60, "max": 5},
+    {"id": "gasstation", "name": "⛽ Gas Station",      "price": 15000,   "income": 720,   "interval_minutes": 60, "max": 5},
+    {"id": "diner",      "name": "🍔 Diner",            "price": 40000,   "income": 1850,  "interval_minutes": 60, "max": 5},
+    {"id": "hotel",      "name": "🏨 Hotel",            "price": 120000,  "income": 5200,  "interval_minutes": 60, "max": 3},
+    {"id": "nightclub",  "name": "🪩 Nightclub",        "price": 300000,  "income": 12500, "interval_minutes": 60, "max": 3},
+    {"id": "casino",     "name": "🎰 Casino",           "price": 1000000, "income": 40000, "interval_minutes": 60, "max": 2},
+]
+
+
+def _econ_properties():
+    """The buyable property list: the owner's custom list if set, else the
+    realistic default businesses above."""
+    custom = gambling_config.get("properties")
+    if isinstance(custom, list) and custom:
+        return [p for p in custom if p.get("id")]
+    return ECON_DEFAULT_PROPERTIES
+
 # economy_data: guild_id(str) -> { user_id(str): {cash,bank,cd:{cmd:ts},
 #   props:{prop_id:{n,last}}, inc_last} }.  Persisted to bot_config "economy-data".
 economy_data = {}
@@ -6775,7 +6798,7 @@ async def _econ_collect(message):
             if periods > 0:
                 total += int(ri.get("amount") or 0) * min(periods, 24)
     # Property income.
-    props = {p["id"]: p for p in (gambling_config.get("properties") or []) if p.get("id")}
+    props = {p["id"]: p for p in _econ_properties()}
     for pid, held in (u.get("props") or {}).items():
         p = props.get(pid)
         if not p:
@@ -7036,6 +7059,366 @@ async def _econ_blackjack(message, args):
     await message.channel.send(view=view)
 
 
+# ---- Property shop (buy businesses that pay passive income) ----
+def _econ_find_property(args):
+    """Match a property by id or (partial) name from the command args."""
+    props = _econ_properties()
+    if not args:
+        return None
+    key = args[0].lower()
+    for p in props:
+        if p["id"] == key:
+            return p
+    q = " ".join(args).lower()
+    return next((p for p in props if q == p["id"] or q in p["name"].lower()), None)
+
+
+def _econ_cycle_text(p):
+    return _fmt_dur(int(p.get("interval_minutes") or 60) * 60)
+
+
+async def _econ_shop(message):
+    p = gambling_config["prefix"]
+    lines = []
+    for prop in _econ_properties():
+        lines.append(
+            f"{prop['name']} — `{p}buy {prop['id']}`\n"
+            f"　Price **{_econ_fmt(prop['price'])}** • Earns **{_econ_fmt(prop['income'])}**/{_econ_cycle_text(prop)}"
+            + (f" • Max {prop['max']}" if prop.get('max') else "")
+        )
+    body = "\n\n".join(lines) + (
+        f"\n\nBuy with `{p}buy <name>`, view yours with `{p}properties`, "
+        f"and cash in earnings with `{p}collect`."
+    )
+    await _econ_send(message.channel, info_embed("🏪 Property Shop", body))
+
+
+async def _econ_buy(message, args):
+    p = gambling_config["prefix"]
+    if not args:
+        return await _econ_send(message.channel, error_embed("Usage", f"`{p}buy <name>` — browse `{p}shop`."))
+    prop = _econ_find_property(args)
+    if not prop:
+        return await _econ_send(message.channel, error_embed("Not found", f"No property like that. See `{p}shop`."))
+    gid, uid = message.guild.id, message.author.id
+    u = _econ_u(gid, uid)
+    held = u["props"].get(prop["id"]) or {"n": 0, "last": int(time.time())}
+    mx = int(prop.get("max") or 0)
+    if mx and int(held.get("n", 0)) >= mx:
+        return await _econ_send(message.channel, error_embed("Maxed out", f"You already own the most ({mx}) of {prop['name']} you can."))
+    price = int(prop["price"])
+    if int(u["cash"]) < price:
+        return await _econ_send(message.channel, error_embed("Not enough cash", f"{prop['name']} costs **{_econ_fmt(price)}** — you have {_econ_fmt(u['cash'])} on hand."))
+    _econ_add(gid, uid, -price)
+    held["n"] = int(held.get("n", 0)) + 1
+    held.setdefault("last", int(time.time()))
+    u["props"][prop["id"]] = held
+    _save_econ_soon()
+    await _econ_send(message.channel, success_embed(
+        "Purchased",
+        f"You bought **{prop['name']}** (now own ×{held['n']}). It earns "
+        f"**{_econ_fmt(prop['income'])}** every {_econ_cycle_text(prop)} — cash in with `{p}collect`."))
+    await _econ_audit(message.guild, f"{message.author.mention} bought {prop['name']} for {_econ_fmt(price)}")
+
+
+async def _econ_sell(message, args):
+    p = gambling_config["prefix"]
+    if not args:
+        return await _econ_send(message.channel, error_embed("Usage", f"`{p}sell <name>` — sells one back for half price."))
+    prop = _econ_find_property(args)
+    gid, uid = message.guild.id, message.author.id
+    u = _econ_u(gid, uid)
+    held = u["props"].get(prop["id"]) if prop else None
+    if not prop or not held or int(held.get("n", 0)) <= 0:
+        return await _econ_send(message.channel, error_embed("You don't own that", f"See what you own with `{p}properties`."))
+    refund = int(int(prop["price"]) * 0.5)
+    held["n"] = int(held.get("n", 0)) - 1
+    if held["n"] <= 0:
+        u["props"].pop(prop["id"], None)
+    _econ_add(gid, uid, refund)
+    _save_econ_soon()
+    await _econ_send(message.channel, success_embed("Sold", f"You sold one **{prop['name']}** for **{_econ_fmt(refund)}**."))
+
+
+async def _econ_portfolio(message):
+    p = gambling_config["prefix"]
+    gid, uid = message.guild.id, message.author.id
+    u = _econ_u(gid, uid)
+    owned = {pid: h for pid, h in (u.get("props") or {}).items() if int(h.get("n", 0)) > 0}
+    if not owned:
+        return await _econ_send(message.channel, info_embed("Your properties", f"You don't own any yet — browse the `{p}shop`."))
+    props = {pr["id"]: pr for pr in _econ_properties()}
+    lines, per_cycle = [], 0
+    for pid, h in owned.items():
+        prop = props.get(pid)
+        if not prop:
+            continue
+        n = int(h.get("n", 0))
+        rate = int(prop["income"]) * n
+        per_cycle += rate
+        lines.append(f"{prop['name']} ×{n} — **{_econ_fmt(rate)}**/{_econ_cycle_text(prop)}")
+    body = "\n".join(lines) + f"\n\n**Total income:** {_econ_fmt(per_cycle)} per cycle\nCash in with `{p}collect`."
+    await _econ_send(message.channel, info_embed("🏢 Your Properties", body))
+
+
+# ---- More casino games: poker, baccarat, higher-lower, wheel ----
+_CARD_SUITS = ["♠", "♥", "♦", "♣"]
+_CARD_RANKS = {1: "A", 11: "J", 12: "Q", 13: "K"}
+
+
+def _card_name(card):
+    r, s = card
+    return f"{_CARD_RANKS.get(r, str(r))}{_CARD_SUITS[s]}"
+
+
+def _fresh_deck():
+    deck = [(r, s) for s in range(4) for r in range(1, 14)]
+    _rnd.shuffle(deck)
+    return deck
+
+
+def _poker_eval(cards):
+    """Evaluate a 5-card hand (Jacks-or-Better paytable). Returns (name, mult)."""
+    ranks = sorted(c[0] for c in cards)
+    suits = [c[1] for c in cards]
+    counts = {}
+    for r in ranks:
+        counts[r] = counts.get(r, 0) + 1
+    by_count = sorted(counts.values(), reverse=True)
+    flush = len(set(suits)) == 1
+    uniq = sorted(set(ranks))
+    straight = len(uniq) == 5 and (uniq[-1] - uniq[0] == 4)
+    # Ace-low straight (A,2,3,4,5) and Ace-high (10,J,Q,K,A).
+    if set(ranks) == {1, 10, 11, 12, 13}:
+        straight = True
+    if flush and set(ranks) == {1, 10, 11, 12, 13}:
+        return ("Royal Flush", 250)
+    if flush and straight:
+        return ("Straight Flush", 50)
+    if by_count[0] == 4:
+        return ("Four of a Kind", 25)
+    if by_count[0] == 3 and by_count[1] == 2:
+        return ("Full House", 9)
+    if flush:
+        return ("Flush", 6)
+    if straight:
+        return ("Straight", 4)
+    if by_count[0] == 3:
+        return ("Three of a Kind", 3)
+    if by_count[0] == 2 and by_count[1] == 2:
+        return ("Two Pair", 2)
+    if by_count[0] == 2:
+        pair_rank = next(r for r, n in counts.items() if n == 2)
+        if pair_rank == 1 or pair_rank >= 11:  # Jacks or better (A,J,Q,K)
+            return ("Jacks or Better", 1)
+    return ("No win", 0)
+
+
+class _PokerHoldRow(discord.ui.ActionRow):
+    def __init__(self, view):
+        super().__init__()
+        self._pv = view
+
+    async def _toggle(self, interaction, idx):
+        await self._pv.toggle_hold(interaction, idx)
+
+    @discord.ui.button(label="1")
+    async def h0(self, i, b): await self._toggle(i, 0)
+    @discord.ui.button(label="2")
+    async def h1(self, i, b): await self._toggle(i, 1)
+    @discord.ui.button(label="3")
+    async def h2(self, i, b): await self._toggle(i, 2)
+    @discord.ui.button(label="4")
+    async def h3(self, i, b): await self._toggle(i, 3)
+    @discord.ui.button(label="5")
+    async def h4(self, i, b): await self._toggle(i, 4)
+
+
+class _PokerDrawRow(discord.ui.ActionRow):
+    def __init__(self, view):
+        super().__init__()
+        self._pv = view
+
+    @discord.ui.button(label="Draw", style=discord.ButtonStyle.success)
+    async def draw(self, i, b): await self._pv.do_draw(i)
+
+
+class PokerView(discord.ui.LayoutView):
+    def __init__(self, gid, uid, bet):
+        super().__init__(timeout=120)
+        self.gid, self.uid, self.bet = gid, uid, bet
+        self.deck = _fresh_deck()
+        self.cards = [self.deck.pop() for _ in range(5)]
+        self.held = [False] * 5
+        self.done = False
+        self._container = discord.ui.Container()
+        self._text = discord.ui.TextDisplay(self._body())
+        self._hold_row = _PokerHoldRow(self)
+        self._draw_row = _PokerDrawRow(self)
+        self._container.add_item(self._text)
+        self._container.add_item(self._hold_row)
+        self._container.add_item(self._draw_row)
+        self.add_item(self._container)
+
+    def _hand_str(self):
+        return "  ".join(
+            (f"**[{_card_name(c)}]**" if self.held[i] else f"`{_card_name(c)}`")
+            for i, c in enumerate(self.cards)
+        )
+
+    def _body(self, result=None):
+        desc = (f"## 🃏 Video Poker\n{self._hand_str()}\n\n"
+                f"**Bet:** {_econ_fmt(self.bet)}")
+        if result is None:
+            desc += "\n\nTap **1–5** to hold cards, then **Draw**. (Jacks or better pays.)"
+        else:
+            desc += f"\n\n{result}"
+        return desc
+
+    def _refresh(self, result=None):
+        self._text.content = self._body(result=result)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message("Not your game.", ephemeral=True)
+            return False
+        return True
+
+    async def toggle_hold(self, interaction, idx):
+        if self.done:
+            return await interaction.response.defer()
+        self.held[idx] = not self.held[idx]
+        btn = self._hold_row.children[idx]
+        btn.style = discord.ButtonStyle.primary if self.held[idx] else discord.ButtonStyle.secondary
+        self._refresh()
+        await interaction.response.edit_message(view=self)
+
+    async def do_draw(self, interaction):
+        if self.done:
+            return await interaction.response.defer()
+        self.done = True
+        for i in range(5):
+            if not self.held[i]:
+                self.cards[i] = self.deck.pop()
+        name, mult = _poker_eval(self.cards)
+        net = self.bet * mult - self.bet
+        _econ_add(self.gid, self.uid, net)
+        if mult >= 2:
+            res = f"**{name}!** You won **{_econ_fmt(self.bet * mult - self.bet)}** (×{mult})."
+        elif mult == 1:
+            res = f"**{name}** — your bet is returned."
+        else:
+            res = f"**{name}.** You lost **{_econ_fmt(self.bet)}**."
+        res += f"\nBalance: {_econ_fmt(_econ_u(self.gid, self.uid)['cash'])}"
+        for row in (self._hold_row, self._draw_row):
+            for c in row.children:
+                c.disabled = True
+        self._refresh(result=res)
+        await interaction.response.edit_message(view=self)
+        self.stop()
+
+
+async def _econ_poker(message, args):
+    bet = _econ_require_bet(message, args)
+    p = gambling_config["prefix"]
+    if bet is None:
+        return await _econ_send(message.channel, error_embed("Usage", f"`{p}poker <amount>`"))
+    if bet == "over":
+        return await _econ_send(message.channel, error_embed("Not enough cash", "You don't have that much."))
+    view = PokerView(message.guild.id, message.author.id, bet)
+    await message.channel.send(view=view)
+
+
+def _bacc_val(cards):
+    return sum(min(c[0], 10) % 10 if c[0] != 1 else 1 for c in cards) % 10
+
+
+async def _econ_baccarat(message, args):
+    p = gambling_config["prefix"]
+    bet = _econ_require_bet(message, args)
+    if bet is None or len(args) < 2:
+        return await _econ_send(message.channel, error_embed("Usage", f"`{p}baccarat <amount> <player|banker|tie>`"))
+    if bet == "over":
+        return await _econ_send(message.channel, error_embed("Not enough cash", "You don't have that much."))
+    pick = args[1].lower()
+    pick = "player" if pick.startswith("p") else ("banker" if pick.startswith("b") else ("tie" if pick.startswith("t") else pick))
+    if pick not in ("player", "banker", "tie"):
+        return await _econ_send(message.channel, error_embed("Usage", f"Bet on **player**, **banker**, or **tie**."))
+    deck = _fresh_deck()
+    ph = [deck.pop(), deck.pop()]
+    bh = [deck.pop(), deck.pop()]
+    pv, bv = _bacc_val(ph), _bacc_val(bh)
+    # Simplified natural rules: a third card to whoever is under 6 and no natural.
+    if max(pv, bv) < 8:
+        if pv <= 5:
+            ph.append(deck.pop()); pv = _bacc_val(ph)
+        if bv <= 5:
+            bh.append(deck.pop()); bv = _bacc_val(bh)
+    outcome = "player" if pv > bv else ("banker" if bv > pv else "tie")
+    detail = (f"🎴 Player: {' '.join('`'+_card_name(c)+'`' for c in ph)} = **{pv}**\n"
+              f"🎴 Banker: {' '.join('`'+_card_name(c)+'`' for c in bh)} = **{bv}**\n"
+              f"Result: **{outcome.capitalize()}**")
+    if pick == outcome:
+        mult = 8 if outcome == "tie" else 2
+        await _econ_game_result(message, bet, True, bet * mult, detail)
+    else:
+        await _econ_game_result(message, bet, False, 0, detail)
+
+
+async def _econ_highlow(message, args):
+    p = gambling_config["prefix"]
+    bet = _econ_require_bet(message, args)
+    if bet is None or len(args) < 2:
+        return await _econ_send(message.channel, error_embed("Usage", f"`{p}highlow <amount> <high|low>` — will the next card beat the first?"))
+    if bet == "over":
+        return await _econ_send(message.channel, error_embed("Not enough cash", "You don't have that much."))
+    call = "high" if args[1].lower().startswith("h") else "low"
+    deck = _fresh_deck()
+    first, second = deck.pop(), deck.pop()
+    a, b = (14 if first[0] == 1 else first[0]), (14 if second[0] == 1 else second[0])
+    detail = f"🃏 First card **`{_card_name(first)}`**, next card **`{_card_name(second)}`** (you called **{call}**)."
+    if b == a:
+        # Tie returns the bet.
+        await _econ_send(message.channel, info_embed("Push", f"{detail}\n\nA tie — your bet is returned."))
+        return
+    won = (b > a) if call == "high" else (b < a)
+    await _econ_game_result(message, bet, won, bet * 2, detail)
+
+
+async def _econ_wheel(message, args):
+    p = gambling_config["prefix"]
+    bet = _econ_require_bet(message, args)
+    if bet is None:
+        return await _econ_send(message.channel, error_embed("Usage", f"`{p}wheel <amount>`"))
+    if bet == "over":
+        return await _econ_send(message.channel, error_embed("Not enough cash", "You don't have that much."))
+    # Weighted wheel — mostly small outcomes, rare big multipliers. Weights are
+    # tuned to ~0.98 expected return (a small house edge) so it stays sustainable.
+    segments = [(0, 38), (0.5, 24), (1.5, 18), (2, 12), (3, 5), (5, 2), (10, 1)]
+    pool = [m for m, w in segments for _ in range(w)]
+    mult = _rnd.choice(pool)
+    detail = f"🎡 The wheel landed on **×{mult}**."
+    if mult >= 1:
+        await _econ_game_result(message, bet, True, int(bet * mult), detail)
+    else:
+        await _econ_game_result(message, bet, False, 0, detail)
+
+
+async def _econ_help(message):
+    p = gambling_config["prefix"]
+    body = (
+        f"**💰 Economy**\n"
+        f"`{p}balance` · `{p}give @user <amt>` · `{p}deposit <amt>` · `{p}withdraw <amt>` · `{p}leaderboard`\n"
+        f"`{p}work` · `{p}slut` · `{p}crime` · `{p}rob @user` · `{p}collect`\n\n"
+        f"**🏪 Property**\n"
+        f"`{p}shop` · `{p}buy <name>` · `{p}sell <name>` · `{p}properties`\n\n"
+        f"**🎰 Casino**\n"
+        f"`{p}blackjack <amt>` · `{p}poker <amt>` · `{p}roulette <amt> <bet>` · `{p}baccarat <amt> <p|b|tie>`\n"
+        f"`{p}slots <amt>` · `{p}dice <amt>` · `{p}coinflip <amt> <h|t>` · `{p}highlow <amt> <high|low>` · `{p}wheel <amt>`"
+    )
+    await _econ_send(message.channel, info_embed("📖 Economy & Casino Commands", body))
+
+
 async def _econ_dispatch(message, cmd, args):
     gid, uid = message.guild.id, message.author.id
     p = gambling_config["prefix"]
@@ -7087,6 +7470,24 @@ async def _econ_dispatch(message, cmd, args):
         await _econ_roulette(message, args)
     elif cmd in ("blackjack", "bj"):
         await _econ_blackjack(message, args)
+    elif cmd in ("poker", "videopoker"):
+        await _econ_poker(message, args)
+    elif cmd in ("baccarat", "bacc"):
+        await _econ_baccarat(message, args)
+    elif cmd in ("highlow", "hl", "higherlower"):
+        await _econ_highlow(message, args)
+    elif cmd in ("wheel", "spin"):
+        await _econ_wheel(message, args)
+    elif cmd in ("shop", "store"):
+        await _econ_shop(message)
+    elif cmd in ("buy", "buy-property", "buyproperty"):
+        await _econ_buy(message, args)
+    elif cmd in ("sell", "sell-property", "sellproperty"):
+        await _econ_sell(message, args)
+    elif cmd in ("properties", "props", "portfolio", "business", "businesses"):
+        await _econ_portfolio(message)
+    elif cmd in ("help", "commands", "economy-help", "eco-help"):
+        await _econ_help(message)
     elif cmd in ("collect-income", "collect", "collectincome"):
         await _econ_collect(message)
     elif cmd in ("leaderboard", "lb", "rich"):
