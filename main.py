@@ -1654,22 +1654,38 @@ def _sub_server_name(text, guild):
     return _SERVER_NAME_RE.sub(lambda _m: getattr(guild, "name", "") or "", text)
 
 
-def _ads_queue_text(guild):
-    """A human summary of the ad queue — used by the {queue list} token."""
+def _ads_queue_entries(guild):
+    """The queue as [(ad, lane, post_unix_ts)], bypass lane first, with the
+    estimated post time for each position."""
     gd = ads_data.get(str(guild.id)) or {}
-    items = [("bypass", a) for a in (gd.get("bypass") or [])] + [("normal", a) for a in (gd.get("queue") or [])]
-    if not items:
-        return "The ad queue is empty — your ad would post next."
-    lines = []
-    for i, (lane, a) in enumerate(items, 1):
-        typ = "Sponsored Giveaway" if a.get("type") == "giveaway" else "Regular Post"
-        tag = " · 🚀 Bypass" if lane == "bypass" else ""
-        lines.append(f"`{i}.` {typ} by <@{a.get('user_id')}>{tag}")
-    interval = max(1, int(ads_config.get("interval_minutes") or 60))
+    items = [(a, "bypass") for a in (gd.get("bypass") or [])] + [(a, "normal") for a in (gd.get("queue") or [])]
+    interval = max(1, int(ads_config.get("interval_minutes") or 60)) * 60
     last = int(gd.get("last_drip", 0))
-    wait = max(0, interval * 60 - (int(time.time()) - last)) if last else 0
-    eta = f"\n\nNext post in ~{max(1, wait // 60)} min." if wait else f"\n\nOne posts about every {interval} min."
-    return f"**{len(items)} ad(s) in the queue:**\n" + "\n".join(lines) + eta
+    now = int(time.time())
+    first = max(now + 30, (last + interval) if last else now + 30)
+    return [(a, lane, first + i * interval) for i, (a, lane) in enumerate(items)]
+
+
+def _ads_queue_line(a, lane, ts, n):
+    star = "⭐ " if lane == "bypass" else ""
+    if a.get("type") == "giveaway":
+        title = f"🎉 {a.get('prize') or 'Giveaway'}"
+    else:
+        name = a.get("server_name") or "Server"
+        link = a.get("server_link") or ""
+        title = f"[{name}]({link})" if link else name
+    return f"{star}**{n}.** {title}\nUser: <@{a.get('user_id')}>\nDate: <t:{ts}:f>"
+
+
+def _ads_queue_text(guild):
+    """A text summary of the ad queue — used by the {queue list} token. Shows the
+    first 10; the View Queue button paginates the rest."""
+    entries = _ads_queue_entries(guild)
+    if not entries:
+        return "The ad queue is empty — your ad would post next."
+    lines = [_ads_queue_line(a, lane, ts, i + 1) for i, (a, lane, ts) in enumerate(entries[:10])]
+    more = f"\n\n…and {len(entries) - 10} more." if len(entries) > 10 else ""
+    return "\n\n".join(lines) + more
 
 
 def _sub_queue_list(text, guild):
@@ -5306,6 +5322,8 @@ async def on_interaction(interaction: discord.Interaction):
         await _pkg_handle_buy(interaction, cid.split(":", 1)[1])
     elif cid == "ad_claim":
         await _ads_open_claim(interaction)
+    elif cid == "ad_queue":
+        await _ads_open_queue(interaction)
     elif cid.startswith("ad_ok:"):
         await _ads_decide(interaction, cid.split(":", 1)[1], True)
     elif cid.startswith("ad_no:"):
@@ -6736,6 +6754,9 @@ def build_button(btn, guild):
     if btn.get("adclaim"):
         # Advertising "Post an Ad" button — opens the buyer's ad inventory + post flow.
         return _btn({"type": 2, "label": (label[:80] or ads_config.get("claim_button_label") or "Post an Ad"), "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": "ad_claim"})
+    if btn.get("adqueue"):
+        # "View Queue" button — opens the paginated Live Advertisement Queue.
+        return _btn({"type": 2, "label": (label[:80] or "View Queue"), "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": "ad_queue"})
     if btn.get("__verify"):
         return _btn({"type": 2, "label": (label[:80] or "Verify"), "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": "roblox_verify"})
     if btn.get("__ticket_open"):
@@ -7997,6 +8018,13 @@ async def _ads_submit(interaction, ad):
             _ads_grant(gid, uid, ad["ping"])
             await interaction.response.send_message(embed=error_embed("Out of stock", "You no longer have that add-on."), ephemeral=True)
             return
+    # Resolve the advertised server's name from its invite (for the queue list).
+    if ad.get("type") == "regular" and ad.get("server_link"):
+        try:
+            inv = await bot.fetch_invite(ad["server_link"].strip())
+            ad["server_name"] = (inv.guild.name if inv and inv.guild else "") or ""
+        except Exception:
+            ad["server_name"] = ""
     ad_id = secrets.token_hex(6)
     ad["id"] = ad_id
     ad["guild_id"] = str(gid)
@@ -8177,6 +8205,68 @@ async def _ads_open_claim(interaction):
     await interaction.response.send_message(
         embed=info_embed("Your Ad Inventory", _ads_inventory_text(inv)),
         view=AdClaimView(interaction.guild.id, interaction.user.id), ephemeral=True)
+
+
+class AdQueueView(discord.ui.View):
+    """Ephemeral, paginated 'Live Advertisement Queue' — 5 per page."""
+    PER = 5
+
+    def __init__(self, guild, page=0):
+        super().__init__(timeout=180)
+        self.guild = guild
+        self.page = page
+        self._build()
+
+    def _pages(self, n):
+        return max(1, (n + self.PER - 1) // self.PER)
+
+    def build_embed(self):
+        entries = _ads_queue_entries(self.guild)
+        pages = self._pages(len(entries))
+        self.page = max(0, min(self.page, pages - 1))
+        embed = discord.Embed(title="Live Advertisement Queue", color=ACCENT)
+        if not entries:
+            embed.description = "The queue is empty."
+            return embed, pages
+        start = self.page * self.PER
+        lines = [_ads_queue_line(a, lane, ts, i + 1)
+                 for i, (a, lane, ts) in enumerate(entries[start:start + self.PER], start=start)]
+        embed.description = "\n\n".join(lines)
+        embed.set_footer(text=f"Page {self.page + 1}/{pages}")
+        return embed, pages
+
+    def _build(self):
+        self.clear_items()
+        entries = _ads_queue_entries(self.guild)
+        pages = self._pages(len(entries))
+        self.page = max(0, min(self.page, pages - 1))
+        prev = discord.ui.Button(label="Previous", style=discord.ButtonStyle.secondary, disabled=self.page <= 0)
+        prev.callback = self._prev
+        label = discord.ui.Button(label=f"{self.page + 1}/{pages}", style=discord.ButtonStyle.secondary, disabled=True)
+        nxt = discord.ui.Button(label="Next", style=discord.ButtonStyle.secondary, disabled=self.page >= pages - 1)
+        nxt.callback = self._next
+        self.add_item(prev)
+        self.add_item(label)
+        self.add_item(nxt)
+
+    async def _refresh(self, interaction):
+        self._build()
+        embed, _ = self.build_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def _prev(self, interaction):
+        self.page = max(0, self.page - 1)
+        await self._refresh(interaction)
+
+    async def _next(self, interaction):
+        self.page += 1
+        await self._refresh(interaction)
+
+
+async def _ads_open_queue(interaction):
+    view = AdQueueView(interaction.guild, 0)
+    embed, _ = view.build_embed()
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 @tasks.loop(seconds=60)
