@@ -246,7 +246,7 @@ def _ads_perk_for_name(name):
 # Pre-made Roblox developer products for the ad perks (owner-created, so nothing
 # is created at buy time and no Open Cloud API key is needed). Keyed by perk key.
 # The web product page is roblox.com/developer-product/<experience>/product/<id>.
-ADS_STORE_EXPERIENCE_ID = "99629898994812"
+ADS_STORE_EXPERIENCE_ID = "10357040169"
 ADS_PERK_PRODUCT_IDS = {
     "instant": "3710170569",
     "bypass": "3710171039",
