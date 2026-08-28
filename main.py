@@ -1350,6 +1350,14 @@ async def on_ready():
         ads_invite_check.start()
     if not persist_ads_state.is_running():
         persist_ads_state.start()
+    try:
+        await _announce_load()
+    except Exception as e:
+        print(f"[Announce] load failed: {e}")
+    if not announce_tick.is_running():
+        announce_tick.start()
+    if not ticket_inactivity_tick.is_running():
+        ticket_inactivity_tick.start()
     await refresh_status()
 
     try:
@@ -6506,6 +6514,171 @@ async def blacklist_cmd(interaction: discord.Interaction, user: discord.Member, 
     await interaction.response.send_message(f"✅ Logged a blacklist entry for {user.mention}.", ephemeral=True)
 
 
+# ===================== Automated package announcements =====================
+# Designed promo messages re-posted on a schedule (every N days), rotating
+# through the saved announcements one per cycle.
+announce_config = {"messages": [], "interval_days": 9}
+announce_state = {"last_ts": 0, "idx": 0}
+_announce_loaded = False
+
+
+async def _announce_load():
+    global _announce_loaded
+    try:
+        cfg = await _bot_config_get("announce-state")
+    except Exception as e:
+        print(f"[Announce] state load failed: {e}")
+        _announce_loaded = False
+        return
+    _announce_loaded = True
+    st = (cfg or {}).get("state") or {}
+    if isinstance(st, dict):
+        announce_state["last_ts"] = int(st.get("last_ts") or 0)
+        announce_state["idx"] = int(st.get("idx") or 0)
+
+
+async def _announce_save():
+    if not _announce_loaded:
+        return
+    await _bot_config_upsert("announce-state", {"state": announce_state})
+
+
+@tasks.loop(minutes=30)
+async def announce_tick():
+    msgs = announce_config.get("messages") or []
+    if not msgs:
+        return
+    interval = max(1, int(announce_config.get("interval_days") or 9)) * 86400
+    now = int(time.time())
+    if now - int(announce_state.get("last_ts") or 0) < interval:
+        return
+    idx = int(announce_state.get("idx") or 0) % len(msgs)
+    m = msgs[idx]
+    ch = await resolve_channel(m.get("channel_id"))
+    if ch:
+        try:
+            await send_v2_message(ch, m.get("components") or [], allowed_mentions={"parse": []})
+        except Exception as e:
+            print(f"[Announce] post failed: {e}")
+    announce_state["idx"] = (idx + 1) % len(msgs)
+    announce_state["last_ts"] = now
+    await _announce_save()
+
+
+@announce_tick.before_loop
+async def _announce_before():
+    await bot.wait_until_ready()
+
+
+# ===================== Small system-message designs + ticket auto-close =====================
+# small_ui_config maps a UI key (e.g. "ticket_inactivity_warn") to a designed
+# Components-V2 message. The dashboard "System Messages" block edits these; the
+# bot substitutes it wherever that system message would otherwise be hardcoded.
+small_ui_config = {}
+ticket_autoclose_config = {"enabled": True, "warn_hours": 24, "close_hours": 24}
+_ticket_warned = {}  # channel_id -> ts we posted the inactivity warning
+
+
+def _small_ui(key):
+    d = small_ui_config.get(key)
+    return d if isinstance(d, list) and d else None
+
+
+def _ui_render(design, mapping):
+    """Substitute simple {token} placeholders in a designed message."""
+    raw = json.dumps(design or [])
+    for k, v in (mapping or {}).items():
+        raw = raw.replace("{" + k + "}", json.dumps(str(v))[1:-1])
+    return json.loads(raw)
+
+
+async def _ui_channel_or_embed(interaction, key, mapping, title, desc,
+                               buttons=None, content=None, fallback_view=None):
+    """Respond to an interaction with the admin's designed system message for
+    `key` (posted in-channel, keeping any required buttons), or fall back to the
+    built-in embed."""
+    design = _small_ui(key)
+    if design:
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+        await send_v2_message(interaction.channel, _ui_render(design, mapping),
+                              content=content, buttons=buttons,
+                              allowed_mentions={"parse": ["users"]})
+    else:
+        await interaction.response.send_message(content=content, embed=info_embed(title, desc),
+                                                view=fallback_view)
+
+
+async def _ticket_last_activity(ch):
+    mid = getattr(ch, "last_message_id", None)
+    if mid:
+        try:
+            msg = await ch.fetch_message(mid)
+            return msg.created_at.timestamp()
+        except Exception:
+            pass
+    return ch.created_at.timestamp()
+
+
+async def _ticket_warn_msg(ch, opener):
+    design = _small_ui("ticket_inactivity_warn")
+    if design:
+        await send_v2_message(ch, _ui_render(design, {"user": opener.mention if opener else "there"}),
+                              allowed_mentions={"parse": ["users"]})
+    else:
+        await ch.send(
+            content=(opener.mention if opener else ""),
+            embed=info_embed("⏰ Inactivity warning",
+                             "This ticket has been quiet for 24 hours. If there's no reply in the "
+                             "next 24 hours it'll be closed automatically."))
+
+
+@tasks.loop(minutes=30)
+async def ticket_inactivity_tick():
+    if not ticket_autoclose_config.get("enabled", True):
+        return
+    warn_after = int(ticket_autoclose_config.get("warn_hours") or 24) * 3600
+    close_after = int(ticket_autoclose_config.get("close_hours") or 24) * 3600
+    now = time.time()
+    for guild in list(bot.guilds):
+        for ch in list(getattr(guild, "text_channels", [])):
+            topic = getattr(ch, "topic", "") or ""
+            if not topic.startswith("ticket|"):
+                continue
+            try:
+                last_ts = await _ticket_last_activity(ch)
+            except Exception:
+                continue
+            wid = str(ch.id)
+            warned_at = _ticket_warned.get(wid)
+            if warned_at:
+                if last_ts > warned_at + 2:  # someone replied after the warning
+                    _ticket_warned.pop(wid, None)
+                    continue
+                if now - warned_at >= close_after:
+                    _ticket_warned.pop(wid, None)
+                    try:
+                        await _do_close(ch, guild, bot.user, reason="Auto-closed for inactivity")
+                    except Exception as e:
+                        print(f"[Ticket] auto-close failed: {e}")
+            elif now - last_ts >= warn_after:
+                _ticket_warned[wid] = now
+                parts = topic.split("|")
+                opener_id = parts[1] if len(parts) > 1 else ""
+                opener = guild.get_member(int(opener_id)) if opener_id.isdigit() else None
+                try:
+                    await _ticket_warn_msg(ch, opener)
+                except Exception as e:
+                    print(f"[Ticket] warn failed: {e}")
+
+
+@ticket_inactivity_tick.before_loop
+async def _ticket_inactivity_before():
+    await bot.wait_until_ready()
+
+
 async def open_ticket_form(interaction, key):
     """A Form button/option: pop a modal to collect {Question:} answers, then
     open the ticket with those answers filled into the designed message."""
@@ -7002,10 +7175,11 @@ async def ticket_claim_toggle(interaction, claimed):
         await interaction.response.send_message(embed=error_embed("No permission", "Only staff can claim orders."), ephemeral=True)
         return
     channel, msg = interaction.channel, interaction.message
-    if claimed:
-        await interaction.response.send_message(embed=info_embed("Order claimed", f"{member.mention} claimed this order."))
-    else:
-        await interaction.response.send_message(embed=info_embed("Order unclaimed", f"{member.mention} unclaimed this order."))
+    key = "ticket_claimed" if claimed else "ticket_unclaimed"
+    title = "Order claimed" if claimed else "Order unclaimed"
+    verb = "claimed" if claimed else "unclaimed"
+    await _ui_channel_or_embed(interaction, key, {"user": member.mention},
+                               title, f"{member.mention} {verb} this order.")
     await _do_claim_toggle(channel, member, claimed, msg)
 
 
@@ -8092,8 +8266,13 @@ async def do_request_close(interaction, reason):
     mention = f"<@{opener_id}>" if opener_id.isdigit() else ""
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(label="Confirm Close", style=discord.ButtonStyle.danger, custom_id="ticket_close_confirm"))
-    embed = info_embed("Close requested", f"{interaction.user.mention} requested to close this order.\n**Reason:** {reason}\n\nThe opener or staff can confirm below.")
-    await interaction.response.send_message(content=mention or None, embed=embed, view=view)
+    confirm_btn = {"type": 2, "style": 4, "label": "Confirm Close", "custom_id": "ticket_close_confirm"}
+    await _ui_channel_or_embed(
+        interaction, "ticket_close_request",
+        {"user": interaction.user.mention, "reason": reason or "—"},
+        "Close requested",
+        f"{interaction.user.mention} requested to close this order.\n**Reason:** {reason}\n\nThe opener or staff can confirm below.",
+        buttons=[confirm_btn], content=(mention or None), fallback_view=view)
 
 
 async def build_transcript(channel):
@@ -8757,6 +8936,38 @@ async def apply_config(feature, cfg, post_panel=False):
         blacklist_config["channel_id"] = str(cfg.get("channel_id") or channel_id)
         _register_eph_from_tree(blacklist_config["design"])
         print(f"[Config] customs-blacklist — channel {blacklist_config['channel_id'] or '(none)'}")
+    elif feature in ("customs-announce",):
+        raw = cfg.get("messages")
+        msgs = []
+        if isinstance(raw, list):
+            for m in raw:
+                if isinstance(m, dict) and m.get("channel_id"):
+                    msgs.append({"channel_id": str(m["channel_id"]),
+                                 "components": m.get("components") if isinstance(m.get("components"), list) else []})
+        announce_config["messages"] = msgs
+        try:
+            announce_config["interval_days"] = max(1, int(cfg.get("interval_days") or 9))
+        except Exception:
+            announce_config["interval_days"] = 9
+        for _m in msgs:
+            _register_eph_from_tree(_m.get("components") or [])
+        print(f"[Config] customs-announce — {len(msgs)} promo(s), every {announce_config['interval_days']}d")
+    elif feature in ("customs-smallui",):
+        uis = cfg.get("uis")
+        if isinstance(uis, dict):
+            for k, v in uis.items():
+                small_ui_config[k] = v if isinstance(v, list) else []
+                _register_eph_from_tree(small_ui_config[k])
+        ac = cfg.get("ticket_autoclose") or {}
+        if isinstance(ac, dict):
+            if "enabled" in ac:
+                ticket_autoclose_config["enabled"] = bool(ac["enabled"])
+            if ac.get("warn_hours"):
+                ticket_autoclose_config["warn_hours"] = int(ac["warn_hours"])
+            if ac.get("close_hours"):
+                ticket_autoclose_config["close_hours"] = int(ac["close_hours"])
+        print(f"[Config] customs-smallui — {len(small_ui_config)} UI(s), "
+              f"autoclose {'on' if ticket_autoclose_config['enabled'] else 'off'}")
     elif feature in ("invite-tracker",):
         invite_tracker_config["enabled"] = bool(cfg.get("enabled", True))
         comps = cfg.get("board_components")
@@ -11374,7 +11585,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-feedback", "customs-reportbug", "customs-freerelease", "customs-blacklist", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-feedback", "customs-reportbug", "customs-freerelease", "customs-blacklist", "customs-announce", "customs-smallui", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
