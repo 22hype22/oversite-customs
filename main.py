@@ -11275,6 +11275,28 @@ TTS_SPEED = float(os.getenv("TTS_SPEED", "1.15"))  # ElevenLabs voice speed (0.7
 # Discord-TTS-Bot uses by default; "eleven" = the ElevenLabs voice above.
 TTS_ENGINE = os.getenv("TTS_ENGINE", "gtts").lower()
 TTS_LANG = os.getenv("TTS_LANG", "en")
+# Playback speed applied via a Lavalink timescale filter (1.0 = normal). gTTS is
+# a bit slow, so speed it up without changing pitch.
+TTS_PLAYBACK_SPEED = float(os.getenv("TTS_PLAYBACK_SPEED", "1.35"))
+
+
+async def _tts_set_speed(vc, speed):
+    """Apply (or reset) a timescale speed filter on the player."""
+    try:
+        import wavelink as _wl
+        filters = vc.filters
+        filters.timescale.set(speed=max(0.5, float(speed)), pitch=1.0, rate=1.0)
+        await vc.set_filters(filters)
+    except Exception as e:
+        print(f"[TTS] speed filter failed: {e}")
+
+
+async def _tts_reset_speed(vc):
+    try:
+        import wavelink as _wl
+        await vc.set_filters(_wl.Filters())
+    except Exception:
+        pass
 
 
 def _gtts_chunks(text, limit=200):
@@ -11455,10 +11477,30 @@ def _tts_format(message):
 
 async def _tts_track(text):
     import wavelink as _wl
+    import urllib.parse
     if TTS_ENGINE == "eleven":
         url = await _dj_make_clip(text[:400], voice_id=TTS_VOICE_ID, speed=TTS_SPEED)
-    else:  # "gtts" — the Discord-TTS-Bot default voice
-        url = await _gtts_clip(text[:600])
+        if not url:
+            return None
+        try:
+            res = await _wl.Playable.search(url, source=None)
+            return res[0] if res else None
+        except Exception as e:
+            print(f"[TTS] search failed: {e}")
+            return None
+    # gTTS: for a short line, let Lavalink fetch Google DIRECTLY (one hop, much
+    # faster) — only fall back to fetch+stitch+serve for long text or on failure.
+    t = text[:600]
+    if len(t) <= 200:
+        direct = ("https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob"
+                  f"&tl={urllib.parse.quote(TTS_LANG)}&q={urllib.parse.quote(t)}")
+        try:
+            res = await _wl.Playable.search(direct, source=None)
+            if res:
+                return res[0]
+        except Exception as e:
+            print(f"[TTS] direct gtts failed: {e}")
+    url = await _gtts_clip(t)
     if not url:
         return None
     try:
@@ -12105,6 +12147,7 @@ async def join_cmd(interaction: discord.Interaction):
     _tts_queue[gid] = []
     _tts_busy[gid] = False
     _tts_announce.pop(gid, None)
+    await _tts_set_speed(vc, TTS_PLAYBACK_SPEED)  # snappier gTTS
     await interaction.followup.send(embed=success_embed(
         "Joined — TTS on",
         f"I'm in {ch.mention}. I'll read its chat aloud — **“name said message”**, and I skip the "
@@ -12180,6 +12223,8 @@ async def music_play(interaction: discord.Interaction, query: str):
     _tts_queue.pop(interaction.guild.id, None)
     _tts_busy.pop(interaction.guild.id, None)
     _tts_announce.pop(interaction.guild.id, None)
+    if interaction.guild.voice_client:
+        await _tts_reset_speed(interaction.guild.voice_client)  # drop the TTS speed-up
     if not (music_config.get("enabled") or music_available):
         await interaction.followup.send(embed=error_embed("Music is off", "Enable the Music Add-On in the dashboard first."))
         return
