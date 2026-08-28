@@ -12634,6 +12634,14 @@ async def on_wavelink_track_start(payload):
                     _pt.cancel()
                 if guild.voice_client and guild.voice_client.channel:
                     await set_vc_status(guild.voice_client.channel, "DJ Carla")
+                # Reset the status throttle so the song that follows the clip
+                # updates the VC status right away (only the clip says "DJ Carla").
+                try:
+                    _l = getattr(bot, "_last_vc_status", {})
+                    _l[guild.id] = 0
+                    bot._last_vc_status = _l
+                except Exception:
+                    pass
             except Exception:
                 pass
             return
