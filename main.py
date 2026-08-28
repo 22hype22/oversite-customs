@@ -1140,6 +1140,10 @@ async def on_ready():
     except Exception as e:
         print(f"[Ads] load failed: {e}")
     try:
+        await _load_tts_nicks()
+    except Exception as e:
+        print(f"[TTS] nick load failed: {e}")
+    try:
         await _load_invite_tracker()
         for g in bot.guilds:
             await _cache_guild_invites(g)
@@ -11256,32 +11260,205 @@ auto_music_sessions = {}
 
 # ---- TTS ( /join ) ----
 # When the bot is /join'd into a voice channel it reads that channel's built-in
-# text chat aloud. Playback goes through the same wavelink player as music (a TTS
-# audio URL is just another Playable), so it OVERRIDES music while active.
+# text chat aloud, mirroring the Discord-TTS-Bot behaviour: "{name} said {msg}",
+# the name only when the speaker changes (or after a 60s gap), mentions resolved
+# to names, emoji made readable, acronyms expanded, links/files summarised.
+# Playback reuses the DJ ElevenLabs clip pipeline, so it OVERRIDES music.
 _tts_channels = {}  # guild_id -> voice-channel id whose chat is being read
 _tts_queue = {}     # guild_id -> list[Playable] waiting to be spoken
 _tts_busy = {}      # guild_id -> True while a clip is playing
-_tts_last_speaker = {}  # guild_id -> last speaker's user id (to skip repeating names)
-# ElevenLabs voice for /join TTS — same clip pipeline as the DJ, different voice.
+_tts_announce = {}  # guild_id -> (last_speaker_id, last_announce_unix)
+_tts_nicks = {}     # "guild_id:user_id" -> TTS nickname override (from /set nick)
 TTS_VOICE_ID = os.getenv("TTS_ELEVEN_VOICE_ID", "s3TPKV1kjDlVtZbl4Ksh")
 TTS_SPEED = float(os.getenv("TTS_SPEED", "1.15"))  # ElevenLabs voice speed (0.7–1.2)
+# Which voice to speak with. "gtts" = the Google Translate TTS voice the
+# Discord-TTS-Bot uses by default; "eleven" = the ElevenLabs voice above.
+TTS_ENGINE = os.getenv("TTS_ENGINE", "gtts").lower()
+TTS_LANG = os.getenv("TTS_LANG", "en")
 
 
-def _tts_clean(content):
-    """Plain, speakable text: drop custom emoji, links, and raw mentions; cap
-    length so one message can't hog the channel."""
-    s = content or ""
-    s = re.sub(r"<a?:\w+:\d+>", "", s)          # custom emoji
-    s = re.sub(r"https?://\S+", "link", s)      # URLs
-    s = re.sub(r"<@[!&]?\d+>|<#\d+>", "", s)     # user/role/channel mentions
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:300]
+def _gtts_chunks(text, limit=200):
+    """Split text into <=~200-char pieces on word boundaries (Google TTS caps
+    each request)."""
+    words = (text or "").split(" ")
+    chunks, cur = [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 > limit:
+            if cur:
+                chunks.append(cur)
+            cur = w[:limit]
+        else:
+            cur = (cur + " " + w).strip()
+    if cur:
+        chunks.append(cur)
+    return chunks or [(text or "")[:limit]]
+
+
+async def _gtts_clip(text):
+    """Fetch Google Translate TTS (the reference bot's default voice), stitch the
+    chunks into one MP3, and serve it via the DJ clip server for Lavalink."""
+    if not DJ_PUBLIC_URL:
+        return None
+    import uuid
+    import urllib.parse
+    data = b""
+    try:
+        async with httpx.AsyncClient() as client:
+            for ch in _gtts_chunks(text, 200):
+                url = ("https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob"
+                       f"&tl={urllib.parse.quote(TTS_LANG)}&q={urllib.parse.quote(ch)}")
+                r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                if r.status_code == 200 and r.content:
+                    data += r.content
+    except Exception as e:
+        print(f"[TTS] gTTS fetch failed: {e}")
+        return None
+    if not data:
+        return None
+    try:
+        os.makedirs(_dj_clip_dir, exist_ok=True)
+        name = f"{uuid.uuid4().hex}.mp3"
+        with open(os.path.join(_dj_clip_dir, name), "wb") as f:
+            f.write(data)
+        for old in sorted(os.listdir(_dj_clip_dir))[:-30]:
+            try:
+                os.remove(os.path.join(_dj_clip_dir, old))
+            except Exception:
+                pass
+        return f"{DJ_PUBLIC_URL}/dj/{name}"
+    except Exception as e:
+        print(f"[TTS] gTTS save failed: {e}")
+        return None
+
+_TTS_ACRONYMS = {
+    "iirc": "if I recall correctly", "afaik": "as far as I know",
+    "wdym": "what do you mean", "imo": "in my opinion", "brb": "be right back",
+    "wym": "what you mean", "irl": "in real life", "jk": "just kidding",
+    "btw": "by the way", ":)": "smiley face", "gtg": "got to go", "rn": "right now",
+    ":(": "sad face", "ig": "i guess", "ppl": "people", "rly": "really",
+    "cya": "see ya", "ik": "i know", "@": "at",
+}
+
+
+def _tts_attach_format(attachments):
+    if len(attachments) >= 2:
+        return "multiple files"
+    if not attachments:
+        return None
+    ext = (attachments[0].filename.rsplit(".", 1)[-1] if "." in attachments[0].filename else "").lower()
+    groups = {
+        "an image file": {"bmp", "gif", "ico", "png", "psd", "svg", "jpg", "jpeg", "webp"},
+        "an audio file": {"mid", "midi", "mp3", "ogg", "wav", "wma"},
+        "a video file": {"avi", "mp4", "wmv", "m4v", "mpg", "mpeg", "mov"},
+        "a compressed file": {"zip", "7z", "rar", "gz", "xz"},
+        "a text file": {"doc", "docx", "txt", "odt", "rtf"},
+        "a script file": {"bat", "sh", "jar", "py", "php"},
+        "a program file": {"apk", "exe", "msi", "deb"},
+        "a disk image": {"dmg", "iso", "img", "ima"},
+    }
+    for fmt, exts in groups.items():
+        if ext in exts:
+            return fmt
+    return "a file"
+
+
+def _tts_collapse_repeats(s, limit=5):
+    """Collapse a run of the same character to at most `limit` (so 'aaaaaaa'
+    doesn't become an eternity)."""
+    out, prev, run = [], None, 0
+    for ch in s:
+        if ch == prev:
+            run += 1
+        else:
+            prev, run = ch, 1
+        if run <= limit:
+            out.append(ch)
+    return "".join(out)
+
+
+def _tts_name_for(message):
+    """TTS name: /set nick override, else the member's display name (server nick
+    -> global name -> username)."""
+    return _tts_nicks.get(f"{message.guild.id}:{message.author.id}") or message.author.display_name
+
+
+def _tts_should_announce(gid, uid):
+    """Say the name when the speaker changed, or 60s+ since they last spoke."""
+    last = _tts_announce.get(gid)
+    now = time.time()
+    if last and last[0] == uid and (now - last[1]) < 60:
+        return False
+    _tts_announce[gid] = (uid, now)
+    return True
+
+
+def _tts_format(message):
+    """Build the spoken line from a message (mirrors the reference bot)."""
+    # Mentions/channels/roles -> readable names; lowercase like the reference.
+    content = (message.clean_content or "")
+    if len(content) >= 1500:
+        return None
+    content = content.lower()
+    if content.strip() == "?":
+        content = "what"
+    # Custom emoji -> "emoji name" / "animated emoji name".
+    content = re.sub(r"<(a)?:(\w+):\d+>",
+                     lambda m: f"{'animated emoji' if m.group(1) else 'emoji'} {m.group(2)}", content)
+    # Acronym expansion (English voice).
+    content = " ".join(_TTS_ACRONYMS.get(w, w) for w in content.split(" "))
+    # Links -> summarised, not read out.
+    had_url = bool(re.search(r"https?://\S+", content))
+    if had_url:
+        content = re.sub(r"https?://\S+", "", content)
+    content = re.sub(r"\s+", " ", content).strip()
+
+    file_fmt = _tts_attach_format(message.attachments)
+    say_name = _tts_should_announce(message.guild.id, message.author.id)
+    name = _tts_name_for(message) if say_name else None
+
+    if name:
+        if content and had_url and file_fmt:
+            text = f"{name} sent a link, attached {file_fmt}, and said {content}"
+        elif content and had_url:
+            text = f"{name} sent a link and said {content}"
+        elif content and file_fmt:
+            text = f"{name} sent {file_fmt} and said {content}"
+        elif content:
+            text = f"{name} said {content}"
+        elif had_url and file_fmt:
+            text = f"{name} sent a link and attached {file_fmt}"
+        elif had_url:
+            text = f"{name} sent a link"
+        elif file_fmt:
+            text = f"{name} sent {file_fmt}"
+        else:
+            text = f"{name} sent a message"
+    else:
+        if content and had_url:
+            text = f"{content} with a link"
+        elif content and file_fmt:
+            text = f"{content} with {file_fmt}"
+        elif content:
+            text = content
+        elif had_url:
+            text = "a link"
+        elif file_fmt:
+            text = file_fmt
+        else:
+            text = ""
+    text = _tts_collapse_repeats(text)
+    # Skip messages that are empty or only symbols.
+    if not text or all(c in " ?.)'!\":" for c in text):
+        return None
+    return text
 
 
 async def _tts_track(text):
     import wavelink as _wl
-    # Same ElevenLabs clip pipeline as the DJ, just a different voice + faster.
-    url = await _dj_make_clip(text[:300], voice_id=TTS_VOICE_ID, speed=TTS_SPEED)
+    if TTS_ENGINE == "eleven":
+        url = await _dj_make_clip(text[:400], voice_id=TTS_VOICE_ID, speed=TTS_SPEED)
+    else:  # "gtts" — the Discord-TTS-Bot default voice
+        url = await _gtts_clip(text[:600])
     if not url:
         return None
     try:
@@ -11309,28 +11486,37 @@ async def _tts_play_next(vc):
 
 
 async def _tts_handle(message):
-    """A message was sent in a joined VC's chat — speak '{user} {message}'."""
+    """A message was sent in a joined VC's chat — speak it."""
     gid = message.guild.id
     vc = message.guild.voice_client
     if not vc:
         _tts_channels.pop(gid, None)
         return
-    body = _tts_clean(message.content)
-    if not body:
+    text = _tts_format(message)
+    if not text:
         return
-    # Only say the name when the speaker changes — consecutive messages from the
-    # same person are read without repeating their name.
-    if _tts_last_speaker.get(gid) == message.author.id:
-        text = body
-    else:
-        _tts_last_speaker[gid] = message.author.id
-        text = f"{message.author.display_name} said {body}"
     track = await _tts_track(text)
     if not track:
         return
     _tts_queue.setdefault(gid, []).append(track)
     if not _tts_busy.get(gid):
         await _tts_play_next(vc)
+
+
+async def _load_tts_nicks():
+    cfg = await _bot_config_get("tts-nicks")
+    n = (cfg or {}).get("nicks")
+    if isinstance(n, dict):
+        _tts_nicks.clear()
+        _tts_nicks.update({str(k): str(v) for k, v in n.items()})
+        print(f"[TTS] restored {len(_tts_nicks)} nickname(s)")
+
+
+async def _save_tts_nicks():
+    try:
+        await _bot_config_upsert("tts-nicks", {"nicks": _tts_nicks})
+    except Exception as e:
+        print(f"[TTS] nick save failed: {e}")
 
 ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVEN_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
@@ -11918,7 +12104,7 @@ async def join_cmd(interaction: discord.Interaction):
     _tts_channels[gid] = ch.id
     _tts_queue[gid] = []
     _tts_busy[gid] = False
-    _tts_last_speaker.pop(gid, None)
+    _tts_announce.pop(gid, None)
     await interaction.followup.send(embed=success_embed(
         "Joined — TTS on",
         f"I'm in {ch.mention}. I'll read its chat aloud — **“name said message”**, and I skip the "
@@ -11931,7 +12117,7 @@ async def leave_cmd(interaction: discord.Interaction):
     was_tts = _tts_channels.pop(gid, None) is not None
     _tts_queue.pop(gid, None)
     _tts_busy.pop(gid, None)
-    _tts_last_speaker.pop(gid, None)
+    _tts_announce.pop(gid, None)
     vc = interaction.guild.voice_client
     if not vc:
         await interaction.response.send_message(embed=error_embed("Not connected", "I'm not in a voice channel."), ephemeral=True)
@@ -11948,28 +12134,31 @@ async def leave_cmd(interaction: discord.Interaction):
 _set_group = app_commands.Group(name="set", description="Set things on the server")
 
 
-@_set_group.command(name="nick", description="Change a member's nickname (what the bot calls them)")
-@app_commands.describe(user="Who to rename", nickname="New nickname (blank to reset)")
-async def set_nick(interaction: discord.Interaction, user: discord.Member, nickname: str = ""):
+@_set_group.command(name="nick", description="Set what the TTS bot calls someone (defaults to you)")
+@app_commands.describe(user="Whose name to change (defaults to you)", nickname="New name to be read (blank to reset)")
+async def set_nick(interaction: discord.Interaction, user: discord.Member = None, nickname: str = ""):
+    target = user or interaction.user
     # Anyone may rename themselves; renaming others needs Manage Nicknames.
-    if user.id != interaction.user.id and not interaction.user.guild_permissions.manage_nicknames:
+    if target.id != interaction.user.id and not interaction.user.guild_permissions.manage_nicknames:
         await interaction.response.send_message(
-            embed=error_embed("No permission", "You need **Manage Nicknames** to rename other people."), ephemeral=True)
+            embed=error_embed("No permission", "You need **Manage Nicknames** to set other people's names."), ephemeral=True)
         return
-    new = nickname.strip()[:32] or None
-    try:
-        await user.edit(nick=new, reason=f"/set nick by {interaction.user}")
-    except discord.Forbidden:
-        await interaction.response.send_message(embed=error_embed(
-            "Can't rename them", "My role must sit **above** theirs and I need **Manage Nicknames** "
-            "(I also can't rename the server owner)."), ephemeral=True)
+    new = nickname.strip()
+    if len(new) > 100:
+        await interaction.response.send_message(embed=error_embed("Too long", "Keep it under 100 characters."), ephemeral=True)
         return
-    except Exception as e:
-        await interaction.response.send_message(embed=error_embed("Failed", str(e)[:200]), ephemeral=True)
+    if "<" in new and ">" in new:
+        await interaction.response.send_message(embed=error_embed("No mentions", "Names can't contain mentions or emotes."), ephemeral=True)
         return
-    shown = f"**{new}**" if new else "their original name"
-    await interaction.response.send_message(
-        embed=success_embed("Nickname set", f"{user.mention} is now {shown}."), ephemeral=True)
+    key = f"{interaction.guild.id}:{target.id}"
+    if new:
+        _tts_nicks[key] = new
+        msg = f"The bot will now call {target.mention} **{new}** when reading messages."
+    else:
+        _tts_nicks.pop(key, None)
+        msg = f"Reset {target.mention}'s name back to their normal display name."
+    await _save_tts_nicks()
+    await interaction.response.send_message(embed=success_embed("Name set", msg), ephemeral=True)
 
 
 bot.tree.add_command(_set_group)
@@ -11990,7 +12179,7 @@ async def music_play(interaction: discord.Interaction, query: str):
     _tts_channels.pop(interaction.guild.id, None)
     _tts_queue.pop(interaction.guild.id, None)
     _tts_busy.pop(interaction.guild.id, None)
-    _tts_last_speaker.pop(interaction.guild.id, None)
+    _tts_announce.pop(interaction.guild.id, None)
     if not (music_config.get("enabled") or music_available):
         await interaction.followup.send(embed=error_embed("Music is off", "Enable the Music Add-On in the dashboard first."))
         return
