@@ -1316,6 +1316,10 @@ async def on_ready():
     except Exception as e:
         print(f"[Econ] load failed: {e}")
     try:
+        await _frel_load()
+    except Exception as e:
+        print(f"[FreeRelease] load failed: {e}")
+    try:
         await _load_invite_tracker()
         for g in bot.guilds:
             await _cache_guild_invites(g)
@@ -5520,7 +5524,11 @@ async def on_interaction(interaction: discord.Interaction):
     # keep working across redeploys.
     if interaction.type == discord.InteractionType.modal_submit:
         cid = (interaction.data or {}).get("custom_id", "")
-        if cid.startswith("ticketform:"):
+        if cid.startswith("pf:"):
+            await _pf_submit(interaction, cid.split(":", 1)[1])
+        elif cid.startswith("freerelform:"):
+            await _frel_form_submit(interaction, cid.split(":", 1)[1])
+        elif cid.startswith("ticketform:"):
             payload = cid.split(":", 1)[1]
             if "|" in payload:
                 fkey, pg = payload.rsplit("|", 1)
@@ -5619,6 +5627,8 @@ async def on_interaction(interaction: discord.Interaction):
         await start_roblox_verify(interaction)
     elif cid.startswith("gw:"):
         await giveaway_enter(interaction, cid.split(":", 1)[1])
+    elif cid.startswith("frel:"):
+        await _frel_enter(interaction, cid.split(":", 1)[1])
     elif cid.startswith("robuxstock:"):
         try:
             funds = int(cid.split(":", 1)[1])
@@ -6089,6 +6099,364 @@ def _apply_answers(open_comps, mapping):
         return json.dumps(out)[1:-1]  # JSON-escape (we're inside a string literal)
 
     return json.loads(_FIELD_RE.sub(repl, raw))
+
+
+# ===================== Prompt forms (suggestions / feedback / report-bug) =====================
+# A generic "run a slash command -> fill a form -> post the designed message to a
+# configured channel" engine. The admin designs ONE Components-V2 message in the
+# dashboard whose text embeds tokens; the tokens define both the modal inputs and
+# where the answers land in the posted message. Supported tokens:
+#   {user}                             -> the submitter's mention (no input)
+#   {question: Label}                  -> short text input
+#   {long question: Label}             -> paragraph text input
+#   {drop down: Name Opt1 Opt2 ...}    -> select menu (first word = name)
+#   {file: Name}                       -> file upload (attached to the posted message)
+# custom_id namespace for the modal is "pf:<feature>".
+prompt_forms_config = {}  # feature -> {"design": [...], "channel_id": "...", "title": "..."}
+
+_PF_TOKEN_RE = re.compile(
+    r"\{(user|long\s*question|question|drop\s*down|dropdown|select|file)\s*(?::\s*(.*?))?\}",
+    re.IGNORECASE,
+)
+
+
+def _pf_norm_kind(raw_kind):
+    k = (raw_kind or "").lower().replace(" ", "")
+    if k == "longquestion":
+        return "lquestion"
+    if k in ("dropdown", "select"):
+        return "dropdown"
+    return k  # user | question | file
+
+
+def _pf_tokens(design):
+    """Every token in a design, in document order: [{kind, content}]."""
+    raw = json.dumps(design or [])
+    toks = []
+    for m in _PF_TOKEN_RE.finditer(raw):
+        toks.append({"kind": _pf_norm_kind(m.group(1)), "content": (m.group(2) or "").strip()})
+    return toks
+
+
+def _pf_inputs(design):
+    """Just the tokens that need a modal input (everything except {user}),
+    capped at Discord's 5-per-modal limit."""
+    return [t for t in _pf_tokens(design) if t["kind"] != "user"][:5]
+
+
+def _pf_dropdown_parts(content):
+    """'Priority Low Medium Urgent' -> ('Priority', ['Low','Medium','Urgent'])."""
+    parts = [p.strip(":").strip() for p in (content or "").split() if p.strip(":").strip()]
+    if not parts:
+        return ("Choose", ["Yes", "No"])
+    return (parts[0], parts[1:] or ["Yes", "No"])
+
+
+def _pf_render(design, uid, answers):
+    """Substitute each token with its collected answer (or the submitter mention
+    for {user}) and return the resulting Components-V2 tree."""
+    raw = json.dumps(design or [])
+    state = {"i": 0}
+
+    def repl(m):
+        kind = _pf_norm_kind(m.group(1))
+        if kind == "user":
+            out = f"<@{uid}>"
+        else:
+            out = answers[state["i"]] if state["i"] < len(answers) else ""
+            state["i"] += 1
+        return json.dumps(str(out))[1:-1]
+
+    return json.loads(_PF_TOKEN_RE.sub(repl, raw))
+
+
+async def _pf_open_modal(interaction, feature, design, title):
+    inputs = _pf_inputs(design)
+    components = []
+    for idx, t in enumerate(inputs):
+        cid = f"p{idx}"
+        if t["kind"] == "file":
+            label = _clean_label(t["content"]) or "File"
+            components.append({"type": 18, "label": label[:45],
+                               "component": {"type": 19, "custom_id": cid, "min_values": 1, "max_values": 5}})
+        elif t["kind"] == "dropdown":
+            name, opts = _pf_dropdown_parts(t["content"])
+            options = [{"label": o[:100], "value": o[:100]} for o in opts[:25]]
+            components.append({"type": 18, "label": (_clean_label(name) or "Choose")[:45],
+                               "component": {"type": 3, "custom_id": cid, "min_values": 1,
+                                             "max_values": 1, "options": options}})
+        else:
+            style = 2 if t["kind"] == "lquestion" else _form_input_style(t["content"])
+            components.append({"type": 18, "label": (_clean_label(t["content"]) or "Answer")[:45],
+                               "component": {"type": 4, "custom_id": cid, "style": style,
+                                             "required": True, "max_length": 1000}})
+    data = {"title": (title or "Submit")[:45], "custom_id": f"pf:{feature}", "components": components}
+    route = discord.http.Route(
+        "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+        interaction_id=interaction.id, interaction_token=interaction.token,
+    )
+    await bot.http.request(route, json={"type": 9, "data": data})
+
+
+_PF_TITLES = {
+    "customs-suggestions": "Suggestion",
+    "customs-feedback": "Feedback",
+    "customs-reportbug": "Report a Bug",
+}
+
+
+def _pf_config_for(feature):
+    return prompt_forms_config.get(feature) or {}
+
+
+async def _pf_command(interaction, feature):
+    """Slash-command entry point: open the form, or (if the design has no input
+    tokens) post the designed message straight away."""
+    cfg = _pf_config_for(feature)
+    channel_id = cfg.get("channel_id")
+    design = cfg.get("design") or []
+    if not channel_id or not design:
+        return await interaction.response.send_message(
+            "This isn't set up yet — an admin needs to configure it in the dashboard.", ephemeral=True)
+    title = cfg.get("title") or _PF_TITLES.get(feature) or "Submit"
+    if not _pf_inputs(design):
+        ch = await resolve_channel(channel_id)
+        if ch:
+            await send_v2_message(ch, _pf_render(design, interaction.user.id, []),
+                                  allowed_mentions={"parse": []})
+        return await interaction.response.send_message("✅ Submitted — thank you!", ephemeral=True)
+    await _pf_open_modal(interaction, feature, design, title)
+
+
+async def _pf_submit(interaction, feature):
+    cfg = _pf_config_for(feature)
+    design = cfg.get("design") or []
+    inputs = _pf_inputs(design)
+    vals = _modal_values(interaction.data.get("components"))
+    answers, files = [], []
+    for idx, t in enumerate(inputs):
+        cid = f"p{idx}"
+        if t["kind"] == "file":
+            fs = _modal_uploaded_files(interaction, cid)
+            files.extend(fs)
+            answers.append(", ".join((f.get("filename") or "file") for f in fs) if fs else "")
+        else:
+            answers.append(vals.get(cid, ""))
+    ch = await resolve_channel(cfg.get("channel_id"))
+    if not ch:
+        return await interaction.response.send_message("Couldn't find the destination channel.", ephemeral=True)
+    await interaction.response.send_message("✅ Submitted — thank you!", ephemeral=True)
+    out = _pf_render(design, interaction.user.id, answers)
+    await send_v2_message(ch, out, allowed_mentions={"parse": []})
+    if files:
+        try:
+            await _post_form_files(ch, files)
+        except Exception as e:
+            print(f"[PromptForm] file post failed: {e}")
+
+
+@bot.tree.command(name="suggestion", description="Share a suggestion")
+async def suggestion_cmd(interaction: discord.Interaction):
+    await _pf_command(interaction, "customs-suggestions")
+
+
+@bot.tree.command(name="feedback", description="Send feedback")
+async def feedback_cmd(interaction: discord.Interaction):
+    await _pf_command(interaction, "customs-feedback")
+
+
+# ===================== Free Release (reaction-goal file drop) =====================
+# `/freerelease` -> a form to attach the release file -> posts the designed
+# announcement with a hardcoded Enter button + a live "X/goal" counter. When the
+# entry goal is reached the stored file is posted in the same channel.
+free_release_config = {"design": [], "button_label": "🎉 Enter", "vault_channel_id": ""}
+free_releases = {}   # id -> {channel_id, message_id, guild_id, goal, title, entrants:set, released, file_ref}
+_frel_loaded = False
+
+
+def _frel_button(rel):
+    label, emoji = _extract_button_emoji(free_release_config.get("button_label") or "🎉 Enter")
+    btn = {"type": 2, "style": 1, "custom_id": f"frel:{rel['id']}", "disabled": bool(rel.get("released"))}
+    if label:
+        btn["label"] = label[:80]
+    if emoji:
+        btn["emoji"] = emoji
+    return btn
+
+
+def _frel_built(rel, guild):
+    built = [b for b in (_build_v2(c, guild) for c in (free_release_config.get("design") or [])) if b]
+    count, goal = len(rel.get("entrants") or ()), int(rel.get("goal") or 1)
+    status = "🔓 **Released — goal reached!**" if rel.get("released") else f"🎉 **{count}/{goal}** entries — react to unlock"
+    built.append({"type": 17, "components": [{"type": 10, "content": status}]})
+    if not rel.get("released"):
+        built.append({"type": 1, "components": [_frel_button(rel)]})
+    return built
+
+
+async def _frel_send(channel, rel):
+    guild = getattr(channel, "guild", None)
+    payload = {"components": _frel_built(rel, guild), "flags": 1 << 15, "allowed_mentions": {"parse": []}}
+    route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
+    try:
+        resp = await bot.http.request(route, json=payload)
+        return str(resp["id"]) if isinstance(resp, dict) and resp.get("id") else None
+    except Exception as e:
+        print(f"[FreeRelease] send failed: {e}")
+        return None
+
+
+async def _frel_edit(rel):
+    ch = await resolve_channel(rel.get("channel_id"))
+    if not ch or not rel.get("message_id"):
+        return
+    payload = {"components": _frel_built(rel, getattr(ch, "guild", None)), "flags": 1 << 15}
+    route = discord.http.Route("PATCH", "/channels/{channel_id}/messages/{message_id}",
+                               channel_id=ch.id, message_id=int(rel["message_id"]))
+    try:
+        await bot.http.request(route, json=payload)
+    except Exception as e:
+        print(f"[FreeRelease] edit failed: {e}")
+
+
+async def _frel_stash_file(f):
+    """Re-host the uploaded file to a durable 'vault' message so it can be
+    delivered later (Discord's original upload URL expires). Falls back to the
+    raw URL if no vault channel is available."""
+    filename = f.get("filename") or "release"
+    vault_id = free_release_config.get("vault_channel_id") or ticket_config.get("log_channel_id") or ""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f["url"], timeout=120, follow_redirects=True)
+        blob = r.content
+    except Exception as e:
+        print(f"[FreeRelease] download failed: {e}")
+        return {"url": f.get("url"), "filename": filename}
+    vault = await resolve_channel(vault_id) if vault_id else None
+    if vault:
+        try:
+            msg = await vault.send(content=f"🔒 Stored release file — {filename}",
+                                   file=discord.File(io.BytesIO(blob), filename=filename))
+            return {"channel_id": str(vault.id), "message_id": str(msg.id), "filename": filename}
+        except Exception as e:
+            print(f"[FreeRelease] vault upload failed: {e}")
+    return {"url": f.get("url"), "filename": filename}
+
+
+async def _frel_deliver(rel):
+    ch = await resolve_channel(rel.get("channel_id"))
+    if not ch:
+        return
+    await _frel_edit(rel)  # flip to "Released" + drop the button
+    f = await _pkg_ref_to_file(rel.get("file_ref") or {})
+    title = rel.get("title") or "Free Release"
+    if f:
+        try:
+            await ch.send(content=f"🎉 **{title}** — goal reached! Here's the file:", file=f)
+        except Exception as e:
+            print(f"[FreeRelease] deliver failed: {e}")
+    else:
+        await ch.send(f"🎉 Goal reached for **{title}**, but the file couldn't be retrieved. An admin can re-post it.")
+
+
+async def _frel_enter(interaction, rid):
+    rel = free_releases.get(rid)
+    if not rel or rel.get("released"):
+        return await interaction.response.send_message("This release is already unlocked or closed.", ephemeral=True)
+    uid = interaction.user.id
+    ent = rel.setdefault("entrants", set())
+    if uid in ent:
+        ent.discard(uid)
+        await interaction.response.send_message("You left the release queue.", ephemeral=True)
+    else:
+        ent.add(uid)
+        await interaction.response.send_message("✅ You're in — you'll get the file when the goal is hit.", ephemeral=True)
+    if len(ent) >= int(rel.get("goal") or 1) and not rel.get("released"):
+        rel["released"] = True
+        await _frel_deliver(rel)
+    else:
+        await _frel_edit(rel)
+    await _frel_save()
+
+
+async def _frel_open_modal(interaction):
+    components = [
+        {"type": 18, "label": "Release name",
+         "component": {"type": 4, "custom_id": "title", "style": 1, "required": True, "max_length": 100}},
+        {"type": 18, "label": "Entry goal (number)",
+         "component": {"type": 4, "custom_id": "goal", "style": 1, "required": True, "max_length": 6, "value": "30"}},
+        {"type": 18, "label": "Release file",
+         "component": {"type": 19, "custom_id": "file", "min_values": 1, "max_values": 1}},
+    ]
+    data = {"title": "Free Release", "custom_id": "freerelform:new", "components": components}
+    route = discord.http.Route(
+        "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+        interaction_id=interaction.id, interaction_token=interaction.token,
+    )
+    await bot.http.request(route, json={"type": 9, "data": data})
+
+
+async def _frel_form_submit(interaction, key):
+    vals = _modal_values(interaction.data.get("components"))
+    title = (vals.get("title") or "Free Release").strip()
+    try:
+        goal = max(1, int(re.sub(r"[^0-9]", "", vals.get("goal") or "30") or "30"))
+    except Exception:
+        goal = 30
+    files = _modal_uploaded_files(interaction, "file")
+    if not files:
+        return await interaction.response.send_message("You need to attach the release file.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    ref = await _frel_stash_file(files[0])
+    rid = secrets.token_hex(6)
+    channel = interaction.channel
+    rel = {"id": rid, "channel_id": str(channel.id), "guild_id": str(interaction.guild_id or ""),
+           "message_id": None, "goal": goal, "title": title, "entrants": set(),
+           "released": False, "file_ref": ref}
+    free_releases[rid] = rel
+    mid = await _frel_send(channel, rel)
+    if not mid:
+        free_releases.pop(rid, None)
+        return await interaction.followup.send("Couldn't post the release in this channel.", ephemeral=True)
+    rel["message_id"] = mid
+    await _frel_save()
+    await interaction.followup.send(f"✅ Free release posted — unlocks at **{goal}** entries.", ephemeral=True)
+
+
+async def _frel_save():
+    if not _frel_loaded:
+        return
+    data = {}
+    for rid, r in free_releases.items():
+        data[rid] = {**{k: v for k, v in r.items() if k != "entrants"},
+                     "entrants": list(r.get("entrants") or ())}
+    await _bot_config_upsert("freerelease-data", {"releases": data})
+
+
+async def _frel_load():
+    global _frel_loaded
+    try:
+        cfg = await _bot_config_get("freerelease-data")
+    except Exception as e:
+        print(f"[FreeRelease] load failed: {e}")
+        _frel_loaded = False
+        return
+    _frel_loaded = True
+    rels = (cfg or {}).get("releases") or {}
+    if isinstance(rels, dict):
+        for rid, r in rels.items():
+            r["entrants"] = set(r.get("entrants") or [])
+            free_releases[rid] = r
+        print(f"[FreeRelease] restored {len(free_releases)} release(s)")
+
+
+@bot.tree.command(name="freerelease", description="Post a free release that unlocks when an entry goal is hit")
+async def freerelease_cmd(interaction: discord.Interaction):
+    if not interaction.guild:
+        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    if not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message("You need Manage Server to post a release.", ephemeral=True)
+    await _frel_open_modal(interaction)
 
 
 async def open_ticket_form(interaction, key):
@@ -8299,6 +8667,38 @@ async def apply_config(feature, cfg, post_panel=False):
         # Only (re)post on a deliberate save, never on boot — like ticket panels.
         if post_panel:
             await post_saved_messages(only_channel_id=edited or None)
+    elif feature in ("customs-suggestions", "customs-feedback", "customs-reportbug"):
+        # A prompt form: the designer saves {messages:[{channel_id, components}]}.
+        # First saved message holds both the output design (with {question:} etc.
+        # tokens) and the destination channel the admin picked.
+        design, channel_id = [], ""
+        raw = cfg.get("messages")
+        if isinstance(raw, list) and raw:
+            m0 = raw[0] or {}
+            design = m0.get("components") if isinstance(m0.get("components"), list) else []
+            channel_id = str(m0.get("channel_id") or "")
+        # Allow flat overrides too.
+        channel_id = str(cfg.get("channel_id") or channel_id)
+        prompt_forms_config[feature] = {
+            "design": design,
+            "channel_id": channel_id,
+            "title": str(cfg.get("title") or _PF_TITLES.get(feature) or ""),
+        }
+        _register_eph_from_tree(design)
+        print(f"[Config] {feature} — channel {channel_id or '(none)'}, "
+              f"{len(_pf_inputs(design))} form field(s)")
+    elif feature in ("customs-freerelease",):
+        raw = cfg.get("messages")
+        design = []
+        if isinstance(raw, list) and raw:
+            design = raw[0].get("components") if isinstance(raw[0].get("components"), list) else []
+        free_release_config["design"] = design if isinstance(design, list) else []
+        if cfg.get("button_label"):
+            free_release_config["button_label"] = str(cfg.get("button_label"))
+        free_release_config["vault_channel_id"] = str(
+            cfg.get("vault_channel_id") or free_release_config.get("vault_channel_id") or "")
+        _register_eph_from_tree(free_release_config["design"])
+        print(f"[Config] customs-freerelease — design {len(free_release_config['design'])} item(s)")
     elif feature in ("invite-tracker",):
         invite_tracker_config["enabled"] = bool(cfg.get("enabled", True))
         comps = cfg.get("board_components")
@@ -10916,7 +11316,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-feedback", "customs-reportbug", "customs-freerelease", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
