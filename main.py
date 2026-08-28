@@ -9415,6 +9415,18 @@ async def seed_secret_slots():
         "placeholder": "Paste your Open Cloud API key…",
         "required": False,
         "sort_order": 1,
+    }, {
+        "addon_id": "customs",
+        "key": "ROBLOX_DEVPRODUCT_PLACE_ID",
+        "label": "Store experience place ID",
+        "description": ("The place ID of the Roblox experience where Purchase dev products are "
+                        "created. Must be an experience your Open Cloud API key is authorized for "
+                        "(add it to the key's Access Permissions with developer-product write). "
+                        "Find it on the experience's page URL: roblox.com/games/<PLACE_ID>/…. "
+                        "Leave blank to use the default store."),
+        "placeholder": "e.g. 108687688483255",
+        "required": False,
+        "sort_order": 2,
     }]
     res = await runtime_rpc("runtime_seed_secret_slots", {"_token": WORKER_TOKEN, "_slots": slots})
     print(f"[Startup] secret slots seeded: {bool(res)}")
