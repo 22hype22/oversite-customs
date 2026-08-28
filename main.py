@@ -177,6 +177,11 @@ ads_config = {
 ads_data = {}  # guild_id(str) -> {"inventory": {uid: {perk: n}}, "queue": [ad], "bypass": [ad], "last_drip": 0}
 _ads_save_pending = None
 _ads_dirty = False
+# Guard against DATA LOSS: only persist ad inventory once we've SUCCESSFULLY read
+# the stored copy at boot. If the boot read failed (transient 5xx/network), the
+# in-memory ads_data is empty — writing that back would wipe everyone's real
+# inventory. So every save path checks this flag and no-ops until a good load.
+_ads_loaded = False
 _pending_perk_grant = {}  # (pkg_msg_id, buyer_id) -> (guild_id, deliver_to, perk_key)
 _ads_pending = {}  # ad_id -> ad dict awaiting approval (also mirrored in ads_data)
 _ads_claim_state = {}  # user_id -> {"ping","type","addon"} for the designed claim panel
@@ -270,6 +275,10 @@ def _save_ads_soon():
 async def _save_ads():
     global _ads_dirty
     await asyncio.sleep(4)
+    if not _ads_loaded:
+        # Never overwrite the stored inventory with an in-memory copy we couldn't
+        # verify at boot.
+        return
     await _bot_config_upsert("ads-data", {"guilds": ads_data})
     _ads_dirty = False
 
@@ -290,9 +299,56 @@ def _normalize_invite(link):
     return f"https://discord.gg/{code}"
 
 
+async def _ads_fetch_data():
+    """Read the stored ad state directly from PostgREST with retries.
+
+    Returns (ok, guilds). ok=False means the read genuinely FAILED (network /
+    5xx after retries) — the caller must NOT persist, or it would overwrite the
+    stored inventory with an empty one. ok=True means we got a definitive answer:
+    `guilds` is the saved dict, or None when there's simply no saved row yet."""
+    if not (SUPABASE_URL and SUPABASE_KEY and BOT_ORDER_ID):
+        return True, None  # no backend configured — nothing to lose
+    url = f"{SUPABASE_URL}/rest/v1/bot_config?bot_id=eq.{BOT_ORDER_ID}&feature=eq.ads-data&select=config"
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    attempts = 5
+    for i in range(attempts):
+        last = i == attempts - 1
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(url, headers=headers, timeout=15)
+            if r.status_code == 200:
+                rows = r.json()
+                if not rows:
+                    return True, None  # fresh bot — no saved inventory yet
+                cfg = rows[0].get("config") or {}
+                return True, cfg.get("guilds")
+            if r.status_code >= 500 and not last:
+                print(f"[Ads] load HTTP {r.status_code}, retry {i+1}/{attempts-1}")
+                await asyncio.sleep(1.0 * (i + 1))
+                continue
+            print(f"[Ads] load HTTP {r.status_code} — treating as read failure")
+            return False, None
+        except Exception as e:
+            if not last:
+                print(f"[Ads] load failed: {e}; retry {i+1}/{attempts-1}")
+                await asyncio.sleep(1.0 * (i + 1))
+                continue
+            print(f"[Ads] load failed: {e}")
+            return False, None
+    return False, None
+
+
 async def _load_ads():
-    cfg = await _bot_config_get("ads-data")
-    guilds = (cfg or {}).get("guilds")
+    global _ads_loaded
+    ok, guilds = await _ads_fetch_data()
+    if not ok:
+        # Read failed after retries. Do NOT mark loaded — this keeps every save
+        # path disabled so we never overwrite the stored inventory with the empty
+        # in-memory one. The next redeploy (or a later retry) can still restore it.
+        _ads_loaded = False
+        print("[Ads] load FAILED — persistence disabled this session to protect stored inventory")
+        return
+    _ads_loaded = True  # safe to persist now (even if there was nothing to load)
     if isinstance(guilds, dict):
         ads_data.clear()
         ads_data.update(guilds)
@@ -300,6 +356,8 @@ async def _load_ads():
         n_q = sum(len(gd.get("queue", [])) + len(gd.get("bypass", [])) for gd in ads_data.values())
         n_p = sum(len(gd.get("pending", {})) for gd in ads_data.values())
         print(f"[Ads] restored inventory:{n_inv} queued:{n_q} pending:{n_p}")
+    else:
+        print("[Ads] no saved data yet (fresh) — persistence enabled")
 
 
 # Marketplace = a second, independent ticket system (its own category, support
@@ -8630,6 +8688,8 @@ async def persist_ads_state():
     """Crash safety net — flush ad inventory/queue/pending on a steady cadence so
     even an ungraceful kill (no SIGTERM) loses at most ~25s of activity."""
     global _ads_dirty
+    if not _ads_loaded:
+        return  # boot read failed — don't clobber stored inventory with empty
     if _ads_dirty:
         _ads_dirty = False
         try:
@@ -12064,12 +12124,16 @@ async def _shutdown():
     except Exception as e:
         print(f"[Shutdown] giveaway flush error: {e}")
     # Flush ad inventory + queue + pending + invite tracker so a redeploy never
-    # forgets what people bought or what's waiting to post.
-    try:
-        await asyncio.wait_for(_bot_config_upsert("ads-data", {"guilds": ads_data}), timeout=8)
-        print("[Shutdown] flushed ad state to storage")
-    except Exception as e:
-        print(f"[Shutdown] ads flush error: {e}")
+    # forgets what people bought or what's waiting to post. Skip if the boot read
+    # failed — flushing the empty in-memory copy would wipe the stored inventory.
+    if _ads_loaded:
+        try:
+            await asyncio.wait_for(_bot_config_upsert("ads-data", {"guilds": ads_data}), timeout=8)
+            print("[Shutdown] flushed ad state to storage")
+        except Exception as e:
+            print(f"[Shutdown] ads flush error: {e}")
+    else:
+        print("[Shutdown] skipped ad flush — data never loaded this session (inventory preserved)")
     try:
         await asyncio.wait_for(_bot_config_upsert("invite-tracker-data", {"guilds": invite_tracker}), timeout=8)
     except Exception as e:
