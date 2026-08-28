@@ -258,11 +258,15 @@ async def _save_econ():
     await asyncio.sleep(4)
     if not _econ_loaded:
         return
-    await _bot_config_upsert("economy-data", {"guilds": economy_data})
-    _econ_dirty = False
+    ok, err = await _bot_config_upsert("economy-data", {"guilds": economy_data})
+    if ok:
+        _econ_dirty = False
+    else:
+        # Leave _econ_dirty set so the autosave loop / shutdown flush retries.
+        print(f"[Econ] debounced save failed (will retry): {err}")
 
 
-async def _econ_flush_now(attempts=5):
+async def _econ_flush_now(attempts=6):
     if not _econ_loaded:
         return False
     err = ""
@@ -278,16 +282,16 @@ async def _econ_flush_now(attempts=5):
     return False
 
 
-async def _load_econ():
-    global _econ_loaded
-    try:
-        cfg = await _bot_config_get("economy-data")
-    except Exception as e:
-        print(f"[Econ] load failed: {e}")
-        _econ_loaded = False
-        return
+async def _econ_fetch(attempts=6):
+    """Read economy-data, distinguishing a genuine (possibly empty) result from a
+    transient failure. Returns (ok, config). ok=False means DON'T trust the data
+    and DON'T enable saving — otherwise a failed read would let us overwrite
+    everyone's stored balances with an empty snapshot."""
+    return await _durable_config_get("economy-data", attempts=attempts)
+
+
+def _econ_apply_loaded(cfg):
     guilds = (cfg or {}).get("guilds")
-    _econ_loaded = True
     if isinstance(guilds, dict):
         economy_data.clear()
         economy_data.update(guilds)
@@ -295,6 +299,50 @@ async def _load_econ():
         print(f"[Econ] restored {n} balance(s)")
     else:
         print("[Econ] no saved data yet (fresh)")
+
+
+async def _econ_reload_until_loaded():
+    """If the boot read failed, keep retrying in the background. Saving stays
+    disabled (so stored data is never clobbered) until a read finally succeeds."""
+    global _econ_loaded
+    delay = 15
+    while not _econ_loaded:
+        await asyncio.sleep(delay)
+        ok, cfg = await _econ_fetch(attempts=1)
+        if ok:
+            _econ_apply_loaded(cfg)
+            _econ_loaded = True
+            print("[Econ] background reload succeeded — persistence re-enabled")
+            return
+        delay = min(120, delay + 15)
+
+
+@tasks.loop(seconds=90)
+async def econ_autosave():
+    """Belt-and-suspenders: periodically persist economy balances if there are
+    unsaved changes, so an ungraceful kill (no clean shutdown) loses at most
+    ~90s of activity instead of everything since the last debounce."""
+    if _econ_loaded and _econ_dirty:
+        await _econ_flush_now(attempts=3)
+
+
+@econ_autosave.before_loop
+async def _econ_autosave_before():
+    await bot.wait_until_ready()
+
+
+async def _load_econ():
+    global _econ_loaded
+    ok, cfg = await _econ_fetch()
+    if not ok:
+        _econ_loaded = False
+        print("[Econ] load FAILED — persistence disabled this session until a "
+              "background reload succeeds. Stored balances/properties are safe "
+              "(nothing will be overwritten).")
+        asyncio.create_task(_econ_reload_until_loaded())
+        return
+    _econ_apply_loaded(cfg)
+    _econ_loaded = True
 
 
 async def _econ_audit(guild, text):
@@ -1358,6 +1406,8 @@ async def on_ready():
         announce_tick.start()
     if not ticket_inactivity_tick.is_running():
         ticket_inactivity_tick.start()
+    if not econ_autosave.is_running():
+        econ_autosave.start()
     await refresh_status()
 
     try:
@@ -4751,6 +4801,33 @@ async def _bot_config_get(feature):
     return {}
 
 
+async def _durable_config_get(feature, attempts=6):
+    """Like _bot_config_get but distinguishes a genuine (possibly empty) result
+    from a transient failure, retrying with backoff. Returns (ok, config).
+    ok=False means the read failed — callers must NOT enable saving, or they'd
+    overwrite stored data with an empty snapshot."""
+    if not (SUPABASE_URL and SUPABASE_KEY and BOT_ORDER_ID):
+        return True, {}
+    url = (f"{SUPABASE_URL}/rest/v1/bot_config?bot_id=eq.{BOT_ORDER_ID}"
+           f"&feature=eq.{feature}&select=config")
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    err = ""
+    for i in range(attempts):
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(url, headers=headers, timeout=20)
+            if r.status_code == 200:
+                rows = r.json()
+                return True, ((rows[0].get("config") if rows else {}) or {})
+            err = f"HTTP {r.status_code}"
+        except Exception as e:
+            err = str(e)[:140]
+        if i < attempts - 1:
+            await asyncio.sleep(min(30, 1.5 * (i + 1)))
+    print(f"[Config] durable get '{feature}' failed after {attempts} tries: {err}")
+    return False, {}
+
+
 async def _bot_config_upsert(feature, config):
     if not (SUPABASE_URL and SUPABASE_KEY and BOT_ORDER_ID):
         return False, "no supabase creds"
@@ -6448,11 +6525,11 @@ async def _frel_save():
 
 async def _frel_load():
     global _frel_loaded
-    try:
-        cfg = await _bot_config_get("freerelease-data")
-    except Exception as e:
-        print(f"[FreeRelease] load failed: {e}")
+    ok, cfg = await _durable_config_get("freerelease-data")
+    if not ok:
         _frel_loaded = False
+        print("[FreeRelease] load failed — persistence disabled this session "
+              "(pending releases preserved, nothing overwritten).")
         return
     _frel_loaded = True
     rels = (cfg or {}).get("releases") or {}
@@ -6529,11 +6606,10 @@ _announce_loaded = False
 
 async def _announce_load():
     global _announce_loaded
-    try:
-        cfg = await _bot_config_get("announce-state")
-    except Exception as e:
-        print(f"[Announce] state load failed: {e}")
+    ok, cfg = await _durable_config_get("announce-state")
+    if not ok:
         _announce_loaded = False
+        print("[Announce] state load failed — will not overwrite stored schedule.")
         return
     _announce_loaded = True
     st = (cfg or {}).get("state") or {}
@@ -8054,6 +8130,13 @@ async def _econ_help(message):
 
 
 async def _econ_dispatch(message, cmd, args):
+    # Never run commands until balances/properties have loaded — otherwise a user
+    # would be acting on an empty in-memory economy that a pending reload will
+    # replace, and their changes would be lost. Blocking is the safe choice.
+    if not _econ_loaded:
+        await _econ_send(message.channel, error_embed(
+            "One moment", "The economy is still syncing — try again in a few seconds."))
+        return
     gid, uid = message.guild.id, message.author.id
     p = gambling_config["prefix"]
     if cmd in ("money", "bal", "balance", "cash"):
@@ -14921,7 +15004,8 @@ async def _shutdown():
         await bot.change_presence(status=discord.Status.invisible)
     except Exception:
         pass
-    for loop in (send_heartbeat, poll_configs, record_metrics_loop, poll_roblox_apply, poll_about_me):
+    for loop in (send_heartbeat, poll_configs, record_metrics_loop, poll_roblox_apply,
+                 poll_about_me, econ_autosave, announce_tick, ticket_inactivity_tick):
         try:
             loop.cancel()
         except Exception:
