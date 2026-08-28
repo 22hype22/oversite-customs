@@ -180,6 +180,8 @@ _ads_dirty = False
 _pending_perk_grant = {}  # (pkg_msg_id, buyer_id) -> (guild_id, deliver_to, perk_key)
 _ads_pending = {}  # ad_id -> ad dict awaiting approval (also mirrored in ads_data)
 _ads_claim_state = {}  # user_id -> {"ping","type","addon"} for the designed claim panel
+_ads_render_viewer = None    # (guild_id, user_id) set while rendering a claim panel
+_ads_inventory_placed = False  # True if the design contained an "inventory" select
 
 
 def _ads_g(guild_id):
@@ -6580,6 +6582,19 @@ def _build_v2(comp, guild):
         return {"type": 1, "components": buttons} if buttons else None
     if ctype in ("select_menu", "select"):
         placeholder = comp.get("placeholder", "Select an option")
+        # An "Ad inventory" select — the bot fills it with what the viewer owns
+        # and wires it to the claim flow. Only meaningful in the claim panel.
+        if comp.get("inventory") and _ads_render_viewer:
+            gid_, uid_ = _ads_render_viewer
+            inv = _ads_inventory(gid_, uid_)
+            opts = [{"label": f"{_ads_perk_label(k)} ({inv[k]})", "value": k} for k in ADS_PERK_KEYS if inv.get(k)]
+            if not opts:
+                opts = [{"label": "Nothing to claim", "value": "_none"}]
+            global _ads_inventory_placed
+            _ads_inventory_placed = True
+            return {"type": 1, "components": [{"type": 3, "custom_id": "adsel_use",
+                "placeholder": (placeholder or "Choose an item to use")[:150],
+                "min_values": 1, "max_values": 1, "options": opts}]}
         options = []
         has_category = False
         for opt in comp.get("options", []):
@@ -8468,8 +8483,19 @@ async def _ads_open_claim(interaction):
     tree = _ads_fill_quantities(tree, gid, uid)
     tree = _ads_expand_inventory(tree, gid, uid)
     await interaction.response.defer(ephemeral=True)
-    rows = _ads_claim_rows(gid, uid)
-    ok = await send_v2_message(interaction.channel, tree, interaction=interaction, ephemeral=True, extra_rows=rows)
+    # Render with the viewer in scope so any "inventory" select in the design
+    # fills with what THEY own. If the design placed one, don't auto-append ours.
+    global _ads_render_viewer, _ads_inventory_placed
+    _ads_render_viewer = (gid, uid)
+    _ads_inventory_placed = False
+    try:
+        # Pre-build (viewer in scope) to learn if the design placed an inventory
+        # select; keep the viewer set through the real send so it renders too.
+        [b for b in (_build_v2(c, interaction.guild) for c in tree) if b]
+        rows = [] if _ads_inventory_placed else _ads_claim_rows(gid, uid)
+        ok = await send_v2_message(interaction.channel, tree, interaction=interaction, ephemeral=True, extra_rows=rows)
+    finally:
+        _ads_render_viewer = None
     if not ok:
         await interaction.followup.send(embed=error_embed("Couldn't open", "The claim panel couldn't render."), ephemeral=True)
 
