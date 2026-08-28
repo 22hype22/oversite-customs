@@ -11275,6 +11275,9 @@ TTS_SPEED = float(os.getenv("TTS_SPEED", "1.15"))  # ElevenLabs voice speed (0.7
 # Discord-TTS-Bot uses by default; "eleven" = the ElevenLabs voice above.
 TTS_ENGINE = os.getenv("TTS_ENGINE", "gtts").lower()
 TTS_LANG = os.getenv("TTS_LANG", "en")
+# gTTS accent comes from the Google host TLD: co.uk = British, com = US,
+# com.au = Australian, ca = Canadian, ie = Irish, co.in = Indian.
+TTS_TLD = os.getenv("TTS_TLD", "co.uk")
 # Playback speed applied via a Lavalink timescale filter (1.0 = normal). gTTS is
 # a bit slow, so speed it up without changing pitch.
 TTS_PLAYBACK_SPEED = float(os.getenv("TTS_PLAYBACK_SPEED", "1.35"))
@@ -11327,7 +11330,7 @@ async def _gtts_clip(text):
     try:
         async with httpx.AsyncClient() as client:
             for ch in _gtts_chunks(text, 200):
-                url = ("https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob"
+                url = (f"https://translate.google.{TTS_TLD}/translate_tts?ie=UTF-8&client=tw-ob"
                        f"&tl={urllib.parse.quote(TTS_LANG)}&q={urllib.parse.quote(ch)}")
                 r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
                 if r.status_code == 200 and r.content:
@@ -11492,7 +11495,7 @@ async def _tts_track(text):
     # faster) — only fall back to fetch+stitch+serve for long text or on failure.
     t = text[:600]
     if len(t) <= 200:
-        direct = ("https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob"
+        direct = (f"https://translate.google.{TTS_TLD}/translate_tts?ie=UTF-8&client=tw-ob"
                   f"&tl={urllib.parse.quote(TTS_LANG)}&q={urllib.parse.quote(t)}")
         try:
             res = await _wl.Playable.search(direct, source=None)
@@ -12830,8 +12833,14 @@ async def on_voice_state_update(member, before, after):
             _dj_mode.discard(member.guild.id)
             _dj_set.pop(member.guild.id, None)
             _dj_pending.pop(member.guild.id, None)
+            # Clear TTS state too, so a re-join starts fresh.
+            _tts_channels.pop(member.guild.id, None)
+            _tts_queue.pop(member.guild.id, None)
+            _tts_busy.pop(member.guild.id, None)
+            _tts_announce.pop(member.guild.id, None)
             return
-        if member.bot or not music_config.get("auto_leave", True):
+        # Auto-leave an empty channel even while just doing TTS (no music session).
+        if member.bot or not (music_config.get("auto_leave", True) or member.guild.id in _tts_channels):
             return
         guild = member.guild
         vc = guild.voice_client if guild else None
