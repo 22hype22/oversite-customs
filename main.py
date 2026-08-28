@@ -159,6 +159,15 @@ ads_config = {
     "regular_design": [],    # V2 tree; tokens {advertiser} {server_link} {ping}
     "giveaway_design": [],   # V2 tree; tokens {advertiser} {prize} {winners} {duration} {ping}
     "claim_button_label": "📢 Post an Ad",
+    # Wording of the ephemeral "post an ad" panel (all customizable).
+    "claim_title": "Your Ad Inventory",
+    "claim_note": "",
+    "ping_placeholder": "Which ping credit to use",
+    "type_placeholder": "Post type",
+    "addon_placeholder": "Apply an add-on (optional)",
+    "continue_label": "Continue",
+    "regular_label": "Regular Post",
+    "giveaway_label": "Sponsored Giveaway",
 }
 ads_data = {}  # guild_id(str) -> {"inventory": {uid: {perk: n}}, "queue": [ad], "bypass": [ad], "last_drip": 0}
 _ads_save_pending = None
@@ -227,23 +236,18 @@ async def _save_ads():
 
 
 def _normalize_invite(link):
-    """Tidy a Discord invite URL WITHOUT ever changing the invite code itself:
-    add https:// if missing, fix a misspelled discord.gg / discord.com/invite
-    domain. The code (the '/ovs' part) is preserved exactly."""
+    """Every advertised link here is a Discord invite, so always normalize it to
+    https://discord.gg/<code> WITHOUT ever changing the code itself. Handles a
+    bare code ('ovs'), a missing scheme, a misspelled domain ('dicord.gg'), and
+    discord.com/invite/<code>."""
     s = (link or "").strip()
     if not s:
         return s
-    low = s.lower()
-    looks_discord = (".gg" in low) or ("cord" in low) or ("invite" in low)
-    if not looks_discord:
-        # Not obviously a Discord invite — just make sure it has a scheme.
-        return s if low.startswith(("http://", "https://")) else "https://" + s
-    # The invite code = last non-empty path segment (never altered).
     segs = [seg for seg in re.split(r"[\\/]+", s) if seg]
-    # Drop a leading scheme token ("https:") and the domain token so only path
-    # segments remain; the code is the final one.
+    # Drop scheme/domain tokens (they contain '.' or ':') and any 'invite' path
+    # word; whatever's left, its last item, is the invite code — kept exactly.
     path = [seg for seg in segs if "." not in seg and ":" not in seg and seg.lower() != "invite"]
-    code = path[-1] if path else segs[-1]
+    code = path[-1] if path else (segs[-1] if segs else s)
     return f"https://discord.gg/{code}"
 
 
@@ -7067,6 +7071,14 @@ async def apply_config(feature, cfg, post_panel=False):
         _register_eph_from_tree(ads_config["giveaway_design"])
         if cfg.get("claim_button_label"):
             ads_config["claim_button_label"] = str(cfg["claim_button_label"])
+        # Customizable wording of the claim panel — only overwrite when provided.
+        for _k in ("claim_title", "claim_note", "ping_placeholder", "type_placeholder",
+                   "addon_placeholder", "continue_label", "regular_label", "giveaway_label"):
+            if cfg.get(_k) is not None:
+                ads_config[_k] = str(cfg.get(_k) or "") or ads_config[_k]
+        # claim_note is allowed to be empty (no note).
+        if "claim_note" in cfg:
+            ads_config["claim_note"] = str(cfg.get("claim_note") or "")
         print(f"[Config] ads — enabled {ads_config['enabled']} "
               f"approval {ads_config['approval_channel_id'] or '(none)'}")
     elif feature in ("music-addon", "customs-music-addon"):
@@ -8174,13 +8186,13 @@ class AdClaimView(discord.ui.View):
 
         ping_opts = [discord.SelectOption(label=f"{_ads_perk_label(k)} ({inv[k]})", value=k)
                      for k in ADS_PING_KEYS if inv.get(k)]
-        self.ping_select = discord.ui.Select(placeholder="Which ping credit to use", options=ping_opts or [discord.SelectOption(label="None", value="_none")], min_values=1, max_values=1)
+        self.ping_select = discord.ui.Select(placeholder=(ads_config.get("ping_placeholder") or "Which ping credit to use"), options=ping_opts or [discord.SelectOption(label="None", value="_none")], min_values=1, max_values=1)
         self.ping_select.callback = self._on_ping
         self.add_item(self.ping_select)
 
-        self.type_select = discord.ui.Select(placeholder="Post type", min_values=1, max_values=1, options=[
-            discord.SelectOption(label="Regular Post", value="regular", default=True),
-            discord.SelectOption(label="Sponsored Giveaway", value="giveaway"),
+        self.type_select = discord.ui.Select(placeholder=(ads_config.get("type_placeholder") or "Post type"), min_values=1, max_values=1, options=[
+            discord.SelectOption(label=(ads_config.get("regular_label") or "Regular Post"), value="regular", default=True),
+            discord.SelectOption(label=(ads_config.get("giveaway_label") or "Sponsored Giveaway"), value="giveaway"),
         ])
         self.type_select.callback = self._on_type
         self.add_item(self.type_select)
@@ -8190,11 +8202,11 @@ class AdClaimView(discord.ui.View):
             if inv.get(k):
                 addon_opts.append(discord.SelectOption(label=f"{_ads_perk_label(k)} ({inv[k]})", value=k))
         if len(addon_opts) > 1:
-            self.addon_select = discord.ui.Select(placeholder="Apply an add-on (optional)", min_values=1, max_values=1, options=addon_opts)
+            self.addon_select = discord.ui.Select(placeholder=(ads_config.get("addon_placeholder") or "Apply an add-on (optional)"), min_values=1, max_values=1, options=addon_opts)
             self.addon_select.callback = self._on_addon
             self.add_item(self.addon_select)
 
-        cont = discord.ui.Button(label="Continue", style=discord.ButtonStyle.success)
+        cont = discord.ui.Button(label=(ads_config.get("continue_label") or "Continue"), style=discord.ButtonStyle.success)
         cont.callback = self._continue
         self.add_item(cont)
 
@@ -8231,12 +8243,15 @@ async def _ads_open_claim(interaction):
         await interaction.response.send_message(embed=error_embed("Ads are off", "The advertisement system isn't set up yet."), ephemeral=True)
         return
     inv = _ads_inventory(interaction.guild.id, interaction.user.id)
+    title = ads_config.get("claim_title") or "Your Ad Inventory"
+    note = ads_config.get("claim_note") or ""
     if not any(inv.get(k) for k in ADS_PING_KEYS):
         await interaction.response.send_message(
-            embed=info_embed("Your Ad Inventory", _ads_inventory_text(inv) + "\n\nYou need a ping credit (Everyone / Here / No Ping) to post."), ephemeral=True)
+            embed=info_embed(title, _ads_inventory_text(inv) + "\n\nYou need a ping credit (Everyone / Here / No Ping) to post."), ephemeral=True)
         return
+    body = _ads_inventory_text(inv) + (f"\n\n{note}" if note else "")
     await interaction.response.send_message(
-        embed=info_embed("Your Ad Inventory", _ads_inventory_text(inv)),
+        embed=info_embed(title, body),
         view=AdClaimView(interaction.guild.id, interaction.user.id), ephemeral=True)
 
 
