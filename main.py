@@ -8428,8 +8428,7 @@ class AdDetailsView(discord.ui.View):
     def __init__(self, state):
         super().__init__(timeout=300)
         self._state = state
-        label = "Enter giveaway details" if state.get("type") == "giveaway" else "Enter post details"
-        b = discord.ui.Button(label=label, style=discord.ButtonStyle.success)
+        b = discord.ui.Button(label="Continue", style=discord.ButtonStyle.primary)
         b.callback = self._go
         self.add_item(b)
 
@@ -8467,11 +8466,9 @@ class AdStartModal(discord.ui.Modal):
             return
         kind = self.kind.values[0] if self.kind.values else "regular"
         state = {"ping": self._ping, "type": kind, "addon": None}
-        label = (ads_config.get("giveaway_label") or "Sponsored Giveaway") if kind == "giveaway" \
-            else (ads_config.get("regular_label") or "Regular Post")
-        await interaction.response.send_message(
-            embed=success_embed("Terms accepted", f"**{label}** selected — tap **Continue** to enter your details."),
-            view=AdDetailsView(state), ephemeral=True)
+        # Option 1: no embed — just a bare Continue button (Discord won't let a
+        # modal submit open a modal directly, so this one tap bridges the forms).
+        await interaction.response.send_message(view=AdDetailsView(state), ephemeral=True)
 
 
 class ApplyAddonView(discord.ui.View):
