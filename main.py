@@ -283,6 +283,33 @@ async def _save_ads():
     _ads_dirty = False
 
 
+def _ads_inventory_count():
+    """How many member inventories are currently held (for snapshot logging)."""
+    return sum(len(gd.get("inventory", {})) for gd in ads_data.values())
+
+
+async def _ads_flush_now(attempts=5):
+    """Snapshot the full ad state (every member's inventory + the queues) to
+    storage RIGHT NOW, retrying transient failures. This is the 'save everyone's
+    inventory before a redeploy' step — the boot restore hands it all back.
+    Returns True once the write is confirmed, False if it couldn't be saved."""
+    if not _ads_loaded:
+        # Boot read failed this session — the stored copy is the good one, so
+        # leave it untouched rather than snapshotting an unverified state.
+        return False
+    global _ads_dirty
+    err = ""
+    for i in range(attempts):
+        ok, err = await _bot_config_upsert("ads-data", {"guilds": ads_data})
+        if ok:
+            _ads_dirty = False
+            return True
+        if i < attempts - 1:
+            await asyncio.sleep(0.8 * (i + 1))
+    print(f"[Ads] snapshot failed after {attempts} tries: {err}")
+    return False
+
+
 def _normalize_invite(link):
     """Every advertised link here is a Discord invite, so always normalize it to
     https://discord.gg/<code> WITHOUT ever changing the code itself. Handles a
@@ -12163,8 +12190,9 @@ async def _shutdown():
     # failed — flushing the empty in-memory copy would wipe the stored inventory.
     if _ads_loaded:
         try:
-            await asyncio.wait_for(_bot_config_upsert("ads-data", {"guilds": ads_data}), timeout=8)
-            print("[Shutdown] flushed ad state to storage")
+            n = _ads_inventory_count()
+            ok = await asyncio.wait_for(_ads_flush_now(), timeout=14)
+            print(f"[Shutdown] ad snapshot saved: {ok} ({n} member inventories) — will be restored on next boot")
         except Exception as e:
             print(f"[Shutdown] ads flush error: {e}")
     else:
