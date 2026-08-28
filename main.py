@@ -152,6 +152,7 @@ gambling_config = {
     "start_balance": 0,
     "max_balance": 0,                 # 0 = unlimited
     "audit_log_channel_id": "",
+    "allowed_channel_ids": [],        # if set, commands only work in these channels
     "admin_role_ids": [],             # who can add/remove money etc. (else Manage Server)
     # Per-command cooldown seconds and payout/fine ranges.
     "cooldowns": {"work": 3600, "slut": 3600, "crime": 3600, "rob": 3600},
@@ -7135,12 +7136,17 @@ async def on_message(message):
     # Economy / gambling prefix commands.
     if (gambling_config.get("enabled") and message.guild and not message.author.bot
             and message.content.startswith(gambling_config.get("prefix") or "!")):
-        try:
-            parts = message.content[len(gambling_config["prefix"]):].strip().split()
-            if parts:
-                await _econ_dispatch(message, parts[0].lower(), parts[1:])
-        except Exception as e:
-            print(f"[Econ] command error: {e}")
+        allowed = [str(c) for c in (gambling_config.get("allowed_channel_ids") or []) if c]
+        # If channels are locked, silently ignore commands anywhere else.
+        if allowed and str(message.channel.id) not in allowed:
+            pass
+        else:
+            try:
+                parts = message.content[len(gambling_config["prefix"]):].strip().split()
+                if parts:
+                    await _econ_dispatch(message, parts[0].lower(), parts[1:])
+            except Exception as e:
+                print(f"[Econ] command error: {e}")
         # fall through so other on_message logic (TTS etc.) still runs below
     # TTS: if I'm /join'd into this voice channel, read its chat aloud.
     if (not message.author.bot and message.guild
@@ -7948,6 +7954,7 @@ async def apply_config(feature, cfg, post_panel=False):
         except Exception:
             gambling_config["max_balance"] = 0
         gambling_config["audit_log_channel_id"] = str(cfg.get("audit_log_channel_id") or "")
+        gambling_config["allowed_channel_ids"] = [str(x) for x in (cfg.get("allowed_channel_ids") or []) if x]
         gambling_config["admin_role_ids"] = [str(x) for x in (cfg.get("admin_role_ids") or []) if x]
         for k in ("work", "slut", "crime", "rob"):
             try:
