@@ -10948,30 +10948,32 @@ class NowPlayingView(discord.ui.View):
     @discord.ui.button(emoji=EMOJI_PAUSE, style=discord.ButtonStyle.secondary, custom_id="music_pause_toggle", row=0)
     async def pause(self, interaction, button):
         vc = interaction.guild.voice_client
-        if vc:
-            await vc.pause(not vc.paused)
-            button.emoji = EMOJI_PLAY if vc.paused else EMOJI_PAUSE
-            await interaction.response.edit_message(view=self)
-        else:
+        if not vc:
             await interaction.response.send_message("Not connected.", ephemeral=True)
+            return
+        # Flip the icon and ack instantly, then apply the pause.
+        new_paused = not vc.paused
+        button.emoji = EMOJI_PLAY if new_paused else EMOJI_PAUSE
+        await interaction.response.edit_message(view=self)
+        try:
+            await vc.pause(new_paused)
+        except Exception:
+            pass
 
     @discord.ui.button(emoji=EMOJI_SKIP, style=discord.ButtonStyle.secondary, row=0)
     async def skip(self, interaction, button):
         vc = interaction.guild.voice_client
-        if vc and vc.playing:
-            _taste_event_current(interaction.guild, -1.5)
-            session = auto_music_sessions.get(interaction.guild.id)
-            if session and len(vc.queue) < 5 and interaction.guild.id not in _dj_mode:
-                try:
-                    genre = session.get("genre", "pop")
-                    for t in await get_genre_playlist_tracks(genre, count=20, guild_id=interaction.guild.id, source="skip-refill"):
-                        await vc.queue.put_wait(t)
-                except Exception as _e:
-                    print(f"[Skip] Refill error: {_e}")
-            await vc.skip(force=True)
-            await interaction.response.send_message("Skipped.", ephemeral=True, delete_after=3)
-        else:
+        if not (vc and vc.playing):
             await interaction.response.send_message("Nothing playing.", ephemeral=True)
+            return
+        # Ack immediately (no spinner) — then skip. The queue top-up runs in the
+        # background so it never delays the button.
+        await interaction.response.defer()
+        _taste_event_current(interaction.guild, -1.5)
+        session = auto_music_sessions.get(interaction.guild.id)
+        if session and len(vc.queue) < 5 and interaction.guild.id not in _dj_mode:
+            asyncio.create_task(_skip_refill_bg(interaction.guild.id, session))
+        await vc.skip(force=True)
 
     @discord.ui.button(emoji=EMOJI_DJ_OFF, style=discord.ButtonStyle.secondary, row=0)
     async def dj_toggle(self, interaction, button):
@@ -11007,6 +11009,20 @@ class NowPlayingView(discord.ui.View):
                     pass
             await vc.disconnect()
         await interaction.response.send_message("Disconnected.", ephemeral=True, delete_after=3)
+
+
+async def _skip_refill_bg(gid, session):
+    """Top up the radio queue after a skip — in the background, so it never
+    delays the Skip button."""
+    try:
+        guild = bot.get_guild(gid)
+        vc = guild.voice_client if guild else None
+        if not vc:
+            return
+        for t in await get_genre_playlist_tracks(session.get("genre", "pop"), count=20, guild_id=gid, source="skip-refill"):
+            await vc.queue.put_wait(t)
+    except Exception as e:
+        print(f"[Skip] refill error: {e}")
 
 
 def _cancel_progress(guild_id: int):
