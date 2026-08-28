@@ -150,7 +150,140 @@ gambling_config = {
     "currency_symbol": "🪙",
     "currency_name": "coins",
     "start_balance": 0,
+    "max_balance": 0,                 # 0 = unlimited
+    "audit_log_channel_id": "",
+    "admin_role_ids": [],             # who can add/remove money etc. (else Manage Server)
+    # Per-command cooldown seconds and payout/fine ranges.
+    "cooldowns": {"work": 3600, "slut": 3600, "crime": 3600, "rob": 3600},
+    "payouts": {"work": [20, 250], "slut": [100, 400], "crime": [250, 700]},
+    "fines": {"slut": [40, 250], "crime": [100, 400]},   # min,max fine on fail
+    "fail_rate": {"slut": 0.35, "crime": 0.45},          # 0..1
+    "fine_type": "percent",          # "percent" of cash, or "fixed"
+    "rob_success_rate": 0.5,
+    # Role income (periodic) + buyable properties (passive income via collect).
+    "role_income": [],   # [{"role_id","amount","interval_minutes"}]
+    "properties": [],    # [{"id","name","price","income","interval_minutes","max"}]
 }
+
+# economy_data: guild_id(str) -> { user_id(str): {cash,bank,cd:{cmd:ts},
+#   props:{prop_id:{n,last}}, inc_last} }.  Persisted to bot_config "economy-data".
+economy_data = {}
+_econ_loaded = False
+_econ_dirty = False
+_econ_save_task = None
+_econ_chat_cd = {}  # (gid,uid) -> ts  (in-memory chat-money cooldown)
+
+
+def _econ_users(gid):
+    return economy_data.setdefault(str(gid), {})
+
+
+def _econ_u(gid, uid):
+    u = _econ_users(gid).setdefault(str(uid), {})
+    if "cash" not in u:
+        u["cash"] = int(gambling_config.get("start_balance") or 0)
+        u["bank"] = 0
+    u.setdefault("cash", 0); u.setdefault("bank", 0)
+    u.setdefault("cd", {}); u.setdefault("props", {}); u.setdefault("inc_last", 0)
+    return u
+
+
+def _econ_sym():
+    return gambling_config.get("currency_symbol") or "🪙"
+
+
+def _econ_fmt(n):
+    return f"{_econ_sym()} {int(n):,}"
+
+
+def _econ_total(u):
+    return int(u.get("cash", 0)) + int(u.get("bank", 0))
+
+
+def _econ_add(gid, uid, amount, where="cash"):
+    """Add (or subtract) money, clamped to >=0 and the max-balance cap on total."""
+    u = _econ_u(gid, uid)
+    u[where] = int(u.get(where, 0)) + int(amount)
+    if u[where] < 0:
+        u[where] = 0
+    mx = int(gambling_config.get("max_balance") or 0)
+    if mx > 0 and _econ_total(u) > mx:
+        over = _econ_total(u) - mx
+        u[where] = max(0, u[where] - over)
+    _save_econ_soon()
+    return u[where]
+
+
+def _econ_is_admin(member):
+    ids = set(str(x) for x in (gambling_config.get("admin_role_ids") or []))
+    if ids and any(str(r.id) in ids for r in getattr(member, "roles", [])):
+        return True
+    return bool(getattr(getattr(member, "guild_permissions", None), "manage_guild", False))
+
+
+def _save_econ_soon():
+    global _econ_save_task, _econ_dirty
+    _econ_dirty = True
+    if _econ_save_task and not _econ_save_task.done():
+        return
+    _econ_save_task = asyncio.create_task(_save_econ())
+
+
+async def _save_econ():
+    global _econ_dirty
+    await asyncio.sleep(4)
+    if not _econ_loaded:
+        return
+    await _bot_config_upsert("economy-data", {"guilds": economy_data})
+    _econ_dirty = False
+
+
+async def _econ_flush_now(attempts=5):
+    if not _econ_loaded:
+        return False
+    err = ""
+    for i in range(attempts):
+        ok, err = await _bot_config_upsert("economy-data", {"guilds": economy_data})
+        if ok:
+            global _econ_dirty
+            _econ_dirty = False
+            return True
+        if i < attempts - 1:
+            await asyncio.sleep(0.8 * (i + 1))
+    print(f"[Econ] flush failed: {err}")
+    return False
+
+
+async def _load_econ():
+    global _econ_loaded
+    try:
+        cfg = await _bot_config_get("economy-data")
+    except Exception as e:
+        print(f"[Econ] load failed: {e}")
+        _econ_loaded = False
+        return
+    guilds = (cfg or {}).get("guilds")
+    _econ_loaded = True
+    if isinstance(guilds, dict):
+        economy_data.clear()
+        economy_data.update(guilds)
+        n = sum(len(u) for u in economy_data.values())
+        print(f"[Econ] restored {n} balance(s)")
+    else:
+        print("[Econ] no saved data yet (fresh)")
+
+
+async def _econ_audit(guild, text):
+    ch_id = gambling_config.get("audit_log_channel_id")
+    if not ch_id:
+        return
+    ch = guild.get_channel(int(ch_id)) if str(ch_id).isdigit() else None
+    if ch:
+        try:
+            await ch.send(embed=info_embed("Economy", text))
+        except Exception:
+            pass
+
 
 ADS_PERK_KEYS = ["ping_everyone", "ping_here", "ping_none", "instant", "bypass"]
 ADS_PING_KEYS = ["ping_everyone", "ping_here", "ping_none"]
@@ -1154,6 +1287,10 @@ async def on_ready():
         await _load_tts_nicks()
     except Exception as e:
         print(f"[TTS] nick load failed: {e}")
+    try:
+        await _load_econ()
+    except Exception as e:
+        print(f"[Econ] load failed: {e}")
     try:
         await _load_invite_tracker()
         for g in bot.guilds:
@@ -6502,8 +6639,249 @@ async def _cmd_close(message, reason=""):
     await _do_close(channel, message.guild, member, (reason or "").strip())
 
 
+import random as _rnd
+
+_ECON_DEFAULT_REPLIES = {
+    "work": ["You worked a shift and earned {amt}.", "Hard work paid off — {amt}.",
+             "You clocked in and made {amt}."],
+    "slut": ["You worked the corner and made {amt}.", "Easy money — {amt}."],
+    "crime": ["You pulled off the heist and got {amt}.", "Crime paid — {amt} this time."],
+    "slut_fail": ["You got caught and paid a fine of {fine}.", "Bad night — fined {fine}."],
+    "crime_fail": ["The cops caught you — fined {fine}.", "The heist flopped — fined {fine}."],
+}
+
+
+def _econ_cd_left(u, cmd):
+    cd = int(gambling_config.get("cooldowns", {}).get(cmd, 0) or 0)
+    last = int(u.get("cd", {}).get(cmd, 0) or 0)
+    return max(0, cd - int(time.time() - last))
+
+
+def _econ_cd_set(u, cmd):
+    u.setdefault("cd", {})[cmd] = int(time.time())
+
+
+def _fmt_dur(secs):
+    secs = int(secs)
+    h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+    return " ".join(x for x in (f"{h}h" if h else "", f"{m}m" if m else "", f"{s}s" if s and not h else "") if x) or "0s"
+
+
+def _econ_payout(cmd):
+    lo, hi = (gambling_config.get("payouts", {}).get(cmd) or [0, 0])[:2]
+    return _rnd.randint(int(lo), max(int(lo), int(hi)))
+
+
+def _econ_fine(cmd, cash):
+    lo, hi = (gambling_config.get("fines", {}).get(cmd) or [0, 0])[:2]
+    amt = _rnd.randint(int(lo), max(int(lo), int(hi)))
+    if gambling_config.get("fine_type") == "percent":
+        amt = int(cash * (amt / 100.0))
+    return max(0, min(amt, cash))
+
+
+async def _econ_earn(message, cmd):
+    gid, uid = message.guild.id, message.author.id
+    u = _econ_u(gid, uid)
+    left = _econ_cd_left(u, cmd)
+    if left > 0:
+        await message.channel.send(embed=error_embed("Slow down", f"You can `{gambling_config['prefix']}{cmd}` again in **{_fmt_dur(left)}**."))
+        return
+    _econ_cd_set(u, cmd)
+    fail_rate = float(gambling_config.get("fail_rate", {}).get(cmd, 0) or 0)
+    if cmd in ("slut", "crime") and _rnd.random() < fail_rate:
+        fine = _econ_fine(cmd, int(u.get("cash", 0)))
+        _econ_add(gid, uid, -fine)
+        reply = _rnd.choice(_ECON_DEFAULT_REPLIES.get(f"{cmd}_fail", ["You failed and were fined {fine}."]))
+        await message.channel.send(embed=error_embed("Failed", reply.replace("{fine}", _econ_fmt(fine))))
+        return
+    amt = _econ_payout(cmd)
+    _econ_add(gid, uid, amt)
+    reply = _rnd.choice(_ECON_DEFAULT_REPLIES.get(cmd, ["You earned {amt}."]))
+    await message.channel.send(embed=success_embed(cmd.capitalize(), reply.replace("{amt}", _econ_fmt(amt))))
+
+
+async def _econ_rob(message, args):
+    if not message.mentions:
+        await message.channel.send(embed=error_embed("Rob who?", f"Use `{gambling_config['prefix']}rob @user`."))
+        return
+    target = message.mentions[0]
+    if target.id == message.author.id or target.bot:
+        await message.channel.send(embed=error_embed("Nope", "Pick another member to rob."))
+        return
+    gid, uid = message.guild.id, message.author.id
+    u = _econ_u(gid, uid)
+    left = _econ_cd_left(u, "rob")
+    if left > 0:
+        await message.channel.send(embed=error_embed("Slow down", f"You can rob again in **{_fmt_dur(left)}**."))
+        return
+    _econ_cd_set(u, "rob")
+    tu = _econ_u(gid, target.id)
+    if int(tu.get("cash", 0)) < 1:
+        await message.channel.send(embed=error_embed("Empty pockets", f"{target.display_name} has no cash on hand to rob."))
+        return
+    if _rnd.random() < float(gambling_config.get("rob_success_rate", 0.5)):
+        stolen = _rnd.randint(1, int(tu["cash"]))
+        _econ_add(gid, target.id, -stolen)
+        _econ_add(gid, uid, stolen)
+        await message.channel.send(embed=success_embed("Robbery!", f"You robbed **{_econ_fmt(stolen)}** from {target.mention}."))
+        await _econ_audit(message.guild, f"{message.author.mention} robbed {_econ_fmt(stolen)} from {target.mention}")
+    else:
+        fine = _econ_fine("crime", int(u.get("cash", 0))) or _rnd.randint(1, max(1, int(u.get("cash", 0)) or 1))
+        _econ_add(gid, uid, -fine)
+        await message.channel.send(embed=error_embed("Caught!", f"You got caught and paid **{_econ_fmt(fine)}**."))
+
+
+async def _econ_collect(message):
+    gid, uid = message.guild.id, message.author.id
+    u = _econ_u(gid, uid)
+    now = int(time.time())
+    total = 0
+    # Role income.
+    for ri in (gambling_config.get("role_income") or []):
+        rid = str(ri.get("role_id") or "")
+        if rid and any(str(r.id) == rid for r in message.author.roles):
+            interval = max(60, int(ri.get("interval_minutes") or 60) * 60)
+            periods = (now - int(u.get("inc_last", 0))) // interval if u.get("inc_last") else 1
+            if periods > 0:
+                total += int(ri.get("amount") or 0) * min(periods, 24)
+    # Property income.
+    props = {p["id"]: p for p in (gambling_config.get("properties") or []) if p.get("id")}
+    for pid, held in (u.get("props") or {}).items():
+        p = props.get(pid)
+        if not p:
+            continue
+        interval = max(60, int(p.get("interval_minutes") or 60) * 60)
+        last = int(held.get("last", 0) or 0)
+        periods = (now - last) // interval if last else 1
+        if periods > 0:
+            total += int(p.get("income") or 0) * int(held.get("n", 0)) * min(periods, 24)
+            held["last"] = now
+    if total <= 0:
+        await message.channel.send(embed=info_embed("Nothing to collect", "No role or property income is ready yet."))
+        return
+    u["inc_last"] = now
+    _econ_add(gid, uid, total)
+    await message.channel.send(embed=success_embed("Income collected", f"You collected **{_econ_fmt(total)}**."))
+
+
+async def _econ_leaderboard(message):
+    gid = message.guild.id
+    users = _econ_users(gid)
+    # Auto-clean members who left the server.
+    ranked = []
+    for uid, u in list(users.items()):
+        m = message.guild.get_member(int(uid)) if str(uid).isdigit() else None
+        if m is None:
+            users.pop(uid, None)
+            continue
+        ranked.append((uid, _econ_total(u)))
+    _save_econ_soon()
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    if not ranked:
+        await message.channel.send(embed=info_embed("Leaderboard", "No balances yet."))
+        return
+    lines = [f"**{i+1}.** <@{uid}> — {_econ_fmt(tot)}" for i, (uid, tot) in enumerate(ranked[:10])]
+    await message.channel.send(embed=info_embed(f"{message.guild.name} Leaderboard", "\n".join(lines)))
+
+
+async def _econ_dispatch(message, cmd, args):
+    gid, uid = message.guild.id, message.author.id
+    p = gambling_config["prefix"]
+    if cmd in ("money", "bal", "balance", "cash"):
+        target = message.mentions[0] if message.mentions else message.author
+        u = _econ_u(gid, target.id)
+        ranked = sorted(((k, _econ_total(v)) for k, v in _econ_users(gid).items()), key=lambda x: x[1], reverse=True)
+        rank = next((i + 1 for i, (k, _v) in enumerate(ranked) if k == str(target.id)), "—")
+        e = info_embed(f"{target.display_name}'s balance",
+                       f"**Cash:** {_econ_fmt(u['cash'])}\n**Bank:** {_econ_fmt(u['bank'])}\n"
+                       f"**Total:** {_econ_fmt(_econ_total(u))}\n**Rank:** #{rank}")
+        await message.channel.send(embed=e)
+    elif cmd in ("give-money", "give", "pay"):
+        if not message.mentions or not args:
+            await message.channel.send(embed=error_embed("Usage", f"`{p}give @user amount`")); return
+        target = message.mentions[0]
+        amt = _econ_parse_amount(args[-1], _econ_u(gid, uid)["cash"])
+        if amt <= 0 or amt > _econ_u(gid, uid)["cash"]:
+            await message.channel.send(embed=error_embed("Not enough cash", "You don't have that much on hand.")); return
+        _econ_add(gid, uid, -amt); _econ_add(gid, target.id, amt)
+        await message.channel.send(embed=success_embed("Sent", f"You gave **{_econ_fmt(amt)}** to {target.mention}."))
+    elif cmd in ("deposit", "dep"):
+        u = _econ_u(gid, uid)
+        amt = _econ_parse_amount(args[0] if args else "all", u["cash"])
+        amt = min(amt, u["cash"])
+        if amt <= 0:
+            await message.channel.send(embed=error_embed("Nothing to deposit", "You have no cash on hand.")); return
+        u["cash"] -= amt; u["bank"] += amt; _save_econ_soon()
+        await message.channel.send(embed=success_embed("Deposited", f"Moved **{_econ_fmt(amt)}** to your bank."))
+    elif cmd in ("withdraw", "with"):
+        u = _econ_u(gid, uid)
+        amt = _econ_parse_amount(args[0] if args else "all", u["bank"])
+        amt = min(amt, u["bank"])
+        if amt <= 0:
+            await message.channel.send(embed=error_embed("Nothing to withdraw", "Your bank is empty.")); return
+        u["bank"] -= amt; u["cash"] += amt; _save_econ_soon()
+        await message.channel.send(embed=success_embed("Withdrew", f"Moved **{_econ_fmt(amt)}** to your cash."))
+    elif cmd in ("work", "slut", "crime"):
+        await _econ_earn(message, cmd)
+    elif cmd == "rob":
+        await _econ_rob(message, args)
+    elif cmd in ("collect-income", "collect", "collectincome"):
+        await _econ_collect(message)
+    elif cmd in ("leaderboard", "lb", "rich"):
+        await _econ_leaderboard(message)
+    elif cmd in ("add-money", "addmoney", "remove-money", "removemoney"):
+        if not _econ_is_admin(message.author):
+            await message.channel.send(embed=error_embed("No permission", "Admins only.")); return
+        if not message.mentions or not args:
+            await message.channel.send(embed=error_embed("Usage", f"`{p}{cmd} @user amount`")); return
+        target = message.mentions[0]
+        amt = _econ_parse_amount(args[-1], 10**12)
+        sign = -1 if "remove" in cmd else 1
+        _econ_add(gid, target.id, sign * amt)
+        await message.channel.send(embed=success_embed("Done", f"{'Removed' if sign<0 else 'Added'} **{_econ_fmt(amt)}** {'from' if sign<0 else 'to'} {target.mention}."))
+        await _econ_audit(message.guild, f"{message.author.mention} {'removed' if sign<0 else 'added'} {_econ_fmt(amt)} {'from' if sign<0 else 'to'} {target.mention}")
+    elif cmd in ("reset-money", "resetmoney", "reset-economy", "reseteconomy"):
+        if not _econ_is_admin(message.author):
+            await message.channel.send(embed=error_embed("No permission", "Admins only.")); return
+        _econ_users(gid).clear(); await _econ_flush_now()
+        await message.channel.send(embed=success_embed("Reset", "Everyone's balance has been reset."))
+    elif cmd in ("economy-stats", "economystats", "eco-stats"):
+        users = _econ_users(gid)
+        circ = sum(_econ_total(u) for u in users.values())
+        await message.channel.send(embed=info_embed("Economy stats",
+            f"**Accounts:** {len(users)}\n**Total in circulation:** {_econ_fmt(circ)}\n"
+            f"**Currency:** {_econ_sym()} {gambling_config.get('currency_name')}"))
+
+
+def _econ_parse_amount(tok, ceiling):
+    tok = str(tok or "").strip().lower().replace(",", "")
+    if tok in ("all", "max"):
+        return int(ceiling)
+    if tok in ("half",):
+        return int(ceiling) // 2
+    mult = 1
+    if tok.endswith("k"): mult, tok = 1_000, tok[:-1]
+    elif tok.endswith("m"): mult, tok = 1_000_000, tok[:-1]
+    elif tok.endswith("b"): mult, tok = 1_000_000_000, tok[:-1]
+    try:
+        return max(0, int(float(tok) * mult))
+    except Exception:
+        return 0
+
+
 @bot.event
 async def on_message(message):
+    # Economy / gambling prefix commands.
+    if (gambling_config.get("enabled") and message.guild and not message.author.bot
+            and message.content.startswith(gambling_config.get("prefix") or "!")):
+        try:
+            parts = message.content[len(gambling_config["prefix"]):].strip().split()
+            if parts:
+                await _econ_dispatch(message, parts[0].lower(), parts[1:])
+        except Exception as e:
+            print(f"[Econ] command error: {e}")
+        # fall through so other on_message logic (TTS etc.) still runs below
     # TTS: if I'm /join'd into this voice channel, read its chat aloud.
     if (not message.author.bot and message.guild
             and _tts_channels.get(message.guild.id) == message.channel.id):
@@ -7305,6 +7683,37 @@ async def apply_config(feature, cfg, post_panel=False):
             gambling_config["start_balance"] = max(0, int(cfg.get("start_balance") or 0))
         except Exception:
             gambling_config["start_balance"] = 0
+        try:
+            gambling_config["max_balance"] = max(0, int(cfg.get("max_balance") or 0))
+        except Exception:
+            gambling_config["max_balance"] = 0
+        gambling_config["audit_log_channel_id"] = str(cfg.get("audit_log_channel_id") or "")
+        gambling_config["admin_role_ids"] = [str(x) for x in (cfg.get("admin_role_ids") or []) if x]
+        for k in ("work", "slut", "crime", "rob"):
+            try:
+                gambling_config["cooldowns"][k] = max(0, int(cfg.get(f"cooldown_{k}") or gambling_config["cooldowns"][k]))
+            except Exception:
+                pass
+        for k in ("work", "slut", "crime"):
+            lo, hi = cfg.get(f"payout_{k}_min"), cfg.get(f"payout_{k}_max")
+            if lo is not None or hi is not None:
+                gambling_config["payouts"][k] = [int(lo or 0), int(hi or lo or 0)]
+        for k in ("slut", "crime"):
+            lo, hi = cfg.get(f"fine_{k}_min"), cfg.get(f"fine_{k}_max")
+            if lo is not None or hi is not None:
+                gambling_config["fines"][k] = [int(lo or 0), int(hi or lo or 0)]
+            fr = cfg.get(f"failrate_{k}")
+            if fr is not None:
+                try:
+                    gambling_config["fail_rate"][k] = max(0.0, min(1.0, float(fr) / 100.0))
+                except Exception:
+                    pass
+        if cfg.get("fine_type"):
+            gambling_config["fine_type"] = "fixed" if str(cfg.get("fine_type")) == "fixed" else "percent"
+        if isinstance(cfg.get("role_income"), list):
+            gambling_config["role_income"] = cfg.get("role_income")
+        if isinstance(cfg.get("properties"), list):
+            gambling_config["properties"] = cfg.get("properties")
         print(f"[Config] gambling — enabled {gambling_config['enabled']} prefix '{gambling_config['prefix']}' currency {gambling_config['currency_symbol']} {gambling_config['currency_name']}")
     elif feature in ("customs-tts", "tts"):
         eng = str(cfg.get("engine") or "gtts").lower()
@@ -13097,6 +13506,12 @@ async def _shutdown():
         await asyncio.wait_for(_bot_config_upsert("invite-tracker-data", {"guilds": invite_tracker}), timeout=8)
     except Exception as e:
         print(f"[Shutdown] invite flush error: {e}")
+    if _econ_loaded:
+        try:
+            await asyncio.wait_for(_econ_flush_now(), timeout=8)
+            print("[Shutdown] economy balances saved")
+        except Exception as e:
+            print(f"[Shutdown] economy flush error: {e}")
     # Snapshot live music at the EXACT current position so a redeploy resumes
     # seamlessly, mid-song, right where it left off.
     if _music_state_ready:
