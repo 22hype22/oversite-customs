@@ -162,6 +162,7 @@ ads_config = {
 }
 ads_data = {}  # guild_id(str) -> {"inventory": {uid: {perk: n}}, "queue": [ad], "bypass": [ad], "last_drip": 0}
 _ads_save_pending = None
+_ads_dirty = False
 _pending_perk_grant = {}  # (pkg_msg_id, buyer_id) -> (guild_id, deliver_to, perk_key)
 _ads_pending = {}  # ad_id -> ad dict awaiting approval (also mirrored in ads_data)
 
@@ -211,15 +212,18 @@ def _ads_perk_label(perk_key):
 
 
 def _save_ads_soon():
-    global _ads_save_pending
+    global _ads_save_pending, _ads_dirty
+    _ads_dirty = True  # a periodic loop also flushes this, as a crash safety net
     if _ads_save_pending and not _ads_save_pending.done():
         return
     _ads_save_pending = asyncio.create_task(_save_ads())
 
 
 async def _save_ads():
+    global _ads_dirty
     await asyncio.sleep(4)
     await _bot_config_upsert("ads-data", {"guilds": ads_data})
+    _ads_dirty = False
 
 
 async def _load_ads():
@@ -228,10 +232,10 @@ async def _load_ads():
     if isinstance(guilds, dict):
         ads_data.clear()
         ads_data.update(guilds)
-        # Rehydrate pending approvals so their buttons work after a restart.
-        for gd in ads_data.values():
-            for ad in (gd.get("queue", []) + gd.get("bypass", [])):
-                pass
+        n_inv = sum(len(gd.get("inventory", {})) for gd in ads_data.values())
+        n_q = sum(len(gd.get("queue", [])) + len(gd.get("bypass", [])) for gd in ads_data.values())
+        n_p = sum(len(gd.get("pending", {})) for gd in ads_data.values())
+        print(f"[Ads] restored inventory:{n_inv} queued:{n_q} pending:{n_p}")
 
 
 # Marketplace = a second, independent ticket system (its own category, support
@@ -988,6 +992,8 @@ async def on_ready():
         persist_music_state.start()
     if not ads_drip.is_running():
         ads_drip.start()
+    if not persist_ads_state.is_running():
+        persist_ads_state.start()
     await refresh_status()
 
     try:
@@ -8298,6 +8304,25 @@ async def _before_ads_drip():
     await bot.wait_until_ready()
 
 
+@tasks.loop(seconds=25)
+async def persist_ads_state():
+    """Crash safety net — flush ad inventory/queue/pending on a steady cadence so
+    even an ungraceful kill (no SIGTERM) loses at most ~25s of activity."""
+    global _ads_dirty
+    if _ads_dirty:
+        _ads_dirty = False
+        try:
+            await _bot_config_upsert("ads-data", {"guilds": ads_data})
+        except Exception as e:
+            _ads_dirty = True
+            print(f"[Ads] periodic persist failed: {e}")
+
+
+@persist_ads_state.before_loop
+async def _before_persist_ads_state():
+    await bot.wait_until_ready()
+
+
 @bot.tree.command(name="ads", description="Open your advertising inventory and post an ad")
 async def ads_cmd(interaction: discord.Interaction):
     await _ads_open_claim(interaction)
@@ -11698,6 +11723,17 @@ async def _shutdown():
             print(f"[Shutdown] flushed {len(pending)} giveaway(s) to storage")
     except Exception as e:
         print(f"[Shutdown] giveaway flush error: {e}")
+    # Flush ad inventory + queue + pending + invite tracker so a redeploy never
+    # forgets what people bought or what's waiting to post.
+    try:
+        await asyncio.wait_for(_bot_config_upsert("ads-data", {"guilds": ads_data}), timeout=8)
+        print("[Shutdown] flushed ad state to storage")
+    except Exception as e:
+        print(f"[Shutdown] ads flush error: {e}")
+    try:
+        await asyncio.wait_for(_bot_config_upsert("invite-tracker-data", {"guilds": invite_tracker}), timeout=8)
+    except Exception as e:
+        print(f"[Shutdown] invite flush error: {e}")
     if SUPABASE_URL and BOT_ORDER_ID:
         try:
             async with httpx.AsyncClient() as client:
