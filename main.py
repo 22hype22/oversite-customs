@@ -5513,6 +5513,10 @@ async def on_interaction(interaction: discord.Interaction):
         await _ads_decide(interaction, cid.split(":", 1)[1], True)
     elif cid.startswith("ad_no:"):
         await _ads_decide(interaction, cid.split(":", 1)[1], False)
+    elif cid.startswith("adinv:"):
+        parts = cid.split(":")
+        await interaction.response.send_modal(
+            AdUpdateInviteModal(parts[1] if len(parts) > 1 else "", parts[2] if len(parts) > 2 else ""))
     elif cid.startswith("purchase:"):
         key = cid.split(":", 1)[1]
         cfg = purchase_msgs.get(key)
@@ -8340,10 +8344,67 @@ async def _ad_invite_warn_dm(guild, ad, position, ts):
         f"**Scheduled Date:** <t:{int(ts)}:F>\n"
         f"**Queue Position:** {position}"
     )
+    view = None
+    if ad.get("id"):
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(
+            label="Update Invite", style=discord.ButtonStyle.primary,
+            custom_id=f"adinv:{guild.id}:{ad.get('id')}"))
     try:
-        await dm.send(embed=discord.Embed(description=desc, color=0xF1C40F))
+        await dm.send(embed=discord.Embed(description=desc, color=0xF1C40F), view=view)
     except Exception:
         pass
+
+
+def _ads_find_by_id(gid, ad_id):
+    """Find an ad by its id across a guild's bypass, queue, and pending."""
+    gd = ads_data.get(str(gid)) or {}
+    for lane in ("bypass", "queue"):
+        for ad in (gd.get(lane) or []):
+            if str(ad.get("id")) == str(ad_id):
+                return ad
+    for ad in (gd.get("pending") or {}).values():
+        if str(ad.get("id")) == str(ad_id):
+            return ad
+    return None
+
+
+class AdUpdateInviteModal(discord.ui.Modal):
+    """Opened from the 'Update Invite' button in the expired-invite DM. Sets a new
+    invite on the queued ad in place — no resubmit, no lost queue spot."""
+    def __init__(self, gid, ad_id):
+        super().__init__(title="Update Invite", timeout=600)
+        self._gid = str(gid)
+        self._ad_id = str(ad_id)
+        self.link = discord.ui.TextInput(
+            label="New server invite link", placeholder="https://discord.gg/…",
+            required=True, max_length=200)
+        self.add_item(self.link)
+
+    async def on_submit(self, interaction):
+        ad = _ads_find_by_id(self._gid, self._ad_id)
+        if not ad:
+            await interaction.response.send_message(embed=error_embed(
+                "Not found", "That ad is no longer in the queue — it may have already posted. "
+                "Submit a new ad if you'd like to advertise again."), ephemeral=True)
+            return
+        new_link = _normalize_invite(self.link.value)
+        if not await _ad_invite_valid(new_link):
+            await interaction.response.send_message(embed=error_embed(
+                "Still invalid", f"`{new_link}` didn't work either — make sure it's a live, "
+                "non-expiring invite, then try the button again."), ephemeral=True)
+            return
+        ad["server_link"] = new_link
+        ad.pop("invite_flagged", None)
+        try:
+            inv = await bot.fetch_invite(new_link.strip())
+            ad["server_name"] = (inv.guild.name if inv and inv.guild else "") or ""
+        except Exception:
+            pass
+        await _ads_flush_now()
+        await interaction.response.send_message(embed=success_embed(
+            "Invite updated", f"Your advertisement now points to `{new_link}`. "
+            "It'll post on schedule — no need to resubmit."), ephemeral=True)
 
 
 async def _ads_post(guild, ad):
