@@ -6230,11 +6230,13 @@ def _pf_inputs(design):
 
 
 def _pf_dropdown_parts(content):
-    """'Priority Low Medium Urgent' -> ('Priority', ['Low','Medium','Urgent'])."""
+    """'Priority Low Medium Urgent' -> ('Priority', ['Low','Medium','Urgent']).
+    Options are de-duplicated (Discord rejects a select with repeated values)."""
     parts = [p.strip(":").strip() for p in (content or "").split() if p.strip(":").strip()]
     if not parts:
         return ("Choose", ["Yes", "No"])
-    return (parts[0], parts[1:] or ["Yes", "No"])
+    name, opts = parts[0], list(dict.fromkeys(parts[1:]))  # de-dupe, keep order
+    return (name, opts or ["Yes", "No"])
 
 
 def _pf_render(design, uid, answers):
@@ -6262,14 +6264,22 @@ async def _pf_open_modal(interaction, feature, design, title):
         cid = f"p{idx}"
         if t["kind"] == "file":
             label = _clean_label(t["content"]) or "File"
+            # Optional: a submitter may not have a file to attach.
             components.append({"type": 18, "label": label[:45],
-                               "component": {"type": 19, "custom_id": cid, "min_values": 1, "max_values": 5}})
+                               "component": {"type": 19, "custom_id": cid, "min_values": 0, "max_values": 5}})
         elif t["kind"] == "dropdown":
             name, opts = _pf_dropdown_parts(t["content"])
-            options = [{"label": o[:100], "value": o[:100]} for o in opts[:25]]
+            seen, options = set(), []
+            for o in opts:
+                v = o[:100]
+                if v and v not in seen:
+                    seen.add(v)
+                    options.append({"label": v, "value": v})
+                if len(options) >= 25:
+                    break
             components.append({"type": 18, "label": (_clean_label(name) or "Choose")[:45],
                                "component": {"type": 3, "custom_id": cid, "min_values": 1,
-                                             "max_values": 1, "options": options}})
+                                             "max_values": 1, "required": True, "options": options}})
         else:
             style = 2 if t["kind"] == "lquestion" else _form_input_style(t["content"])
             components.append({"type": 18, "label": (_clean_label(t["content"]) or "Answer")[:45],
@@ -6280,7 +6290,16 @@ async def _pf_open_modal(interaction, feature, design, title):
         "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
         interaction_id=interaction.id, interaction_token=interaction.token,
     )
-    await bot.http.request(route, json={"type": 9, "data": data})
+    try:
+        await bot.http.request(route, json={"type": 9, "data": data})
+    except Exception as e:
+        print(f"[PromptForm] modal open failed for {feature}: {e}")
+        try:
+            await interaction.response.send_message(
+                "Couldn't open the form — an admin should double-check the form design "
+                "(each dropdown option must be unique).", ephemeral=True)
+        except Exception:
+            pass
 
 
 _PF_TITLES = {
@@ -6510,7 +6529,16 @@ async def _frel_form_submit(interaction, key):
         return await interaction.followup.send("Couldn't post the release in this channel.", ephemeral=True)
     rel["message_id"] = mid
     await _frel_save()
-    await interaction.followup.send(f"✅ Free release posted — unlocks at **{goal}** entries.", ephemeral=True)
+    # If the file was only kept as a raw CDN URL (no durable vault channel), warn:
+    # Discord's upload URLs now expire in ~24h, so a slow-to-fill release could
+    # lose the file. A vault/log channel re-hosts it durably.
+    durable = bool((ref or {}).get("message_id"))
+    note = ("" if durable else
+            "\n⚠️ No file vault channel is set, so the file is only held via a "
+            "temporary link (~24h). Set a **File vault channel** in the Free Release "
+            "block so releases that take longer to fill still deliver the file.")
+    await interaction.followup.send(
+        f"✅ Free release posted — unlocks at **{goal}** entries.{note}", ephemeral=True)
 
 
 async def _frel_save():
@@ -6626,6 +6654,11 @@ async def _announce_save():
 
 @tasks.loop(minutes=30)
 async def announce_tick():
+    # Don't run until the persisted schedule state has loaded — otherwise a
+    # failed boot read (last_ts=0) would re-post a promo that storage already
+    # marked as sent, spamming the channel.
+    if not _announce_loaded:
+        return
     msgs = announce_config.get("messages") or []
     if not msgs:
         return
@@ -9083,6 +9116,12 @@ async def apply_config(feature, cfg, post_panel=False):
             announce_config["interval_days"] = 9
         for _m in msgs:
             _register_eph_from_tree(_m.get("components") or [])
+        # First-ever setup: start the clock now so the first promo posts one full
+        # interval from now, not immediately on save.
+        if msgs and not int(announce_state.get("last_ts") or 0):
+            announce_state["last_ts"] = int(time.time())
+            if _announce_loaded:
+                await _announce_save()
         print(f"[Config] customs-announce — {len(msgs)} promo(s), every {announce_config['interval_days']}d")
     elif feature in ("customs-smallui",):
         uis = cfg.get("uis")
