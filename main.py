@@ -6582,9 +6582,12 @@ def _build_v2(comp, guild):
         return {"type": 1, "components": buttons} if buttons else None
     if ctype in ("select_menu", "select"):
         placeholder = comp.get("placeholder", "Select an option")
-        # An "Ad inventory" select — the bot fills it with what the viewer owns
-        # and wires it to the claim flow. Only meaningful in the claim panel.
-        if comp.get("inventory") and _ads_render_viewer:
+        # In the claim panel (rendered with a viewer in scope), ANY dropdown you
+        # place IS the "use an item" selector: the bot fills it with what the
+        # viewer owns and wires it to the claim flow, so the owner doesn't have
+        # to tick the "Ad inventory dropdown" box and no second dropdown is
+        # auto-appended underneath. Outside the claim panel this branch is dead.
+        if _ads_render_viewer:
             gid_, uid_ = _ads_render_viewer
             inv = _ads_inventory(gid_, uid_)
             opts = [{"label": f"{_ads_perk_label(k)} ({inv[k]})", "value": k} for k in ADS_PERK_KEYS if inv.get(k)]
