@@ -141,6 +141,17 @@ def _register_purchase_from_tree(tree):
 # inventory. To post, they spend one PING credit (Everyone/Here/No Ping) and may
 # apply Instant Post or Bypass Queue add-ons. Every ad is staff-approved, then
 # posted now (Instant), via a priority Bypass lane, or via the normal queue.
+# ---- Economy / Gambling (UnbelievaBoat-style) ----
+# Configured in the dashboard "Economy & Gambling" block. Members have a cash +
+# bank balance in a server currency and gamble it with the prefix commands.
+gambling_config = {
+    "enabled": False,
+    "prefix": "!",
+    "currency_symbol": "🪙",
+    "currency_name": "coins",
+    "start_balance": 0,
+}
+
 ADS_PERK_KEYS = ["ping_everyone", "ping_here", "ping_none", "instant", "bypass"]
 ADS_PING_KEYS = ["ping_everyone", "ping_here", "ping_none"]
 _ADS_PING_CONTENT = {"ping_everyone": "@everyone", "ping_here": "@here", "ping_none": ""}
@@ -7284,6 +7295,17 @@ async def apply_config(feature, cfg, post_panel=False):
             ads_config["claim_note"] = str(cfg.get("claim_note") or "")
         print(f"[Config] ads — enabled {ads_config['enabled']} "
               f"approval {ads_config['approval_channel_id'] or '(none)'}")
+    elif feature in ("customs-gambling", "gambling", "economy"):
+        gambling_config["enabled"] = bool(cfg.get("enabled", True))
+        pfx = str(cfg.get("prefix") or "!").strip()
+        gambling_config["prefix"] = (pfx or "!")[:5]
+        gambling_config["currency_symbol"] = str(cfg.get("currency_symbol") or "🪙").strip() or "🪙"
+        gambling_config["currency_name"] = str(cfg.get("currency_name") or "coins").strip() or "coins"
+        try:
+            gambling_config["start_balance"] = max(0, int(cfg.get("start_balance") or 0))
+        except Exception:
+            gambling_config["start_balance"] = 0
+        print(f"[Config] gambling — enabled {gambling_config['enabled']} prefix '{gambling_config['prefix']}' currency {gambling_config['currency_symbol']} {gambling_config['currency_name']}")
     elif feature in ("customs-tts", "tts"):
         eng = str(cfg.get("engine") or "gtts").lower()
         tts_config["engine"] = eng if eng in ("gtts", "eleven") else "gtts"
@@ -9817,7 +9839,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "invite-tracker", "marketplace", "ads", "customs-tts"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
