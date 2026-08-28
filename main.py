@@ -8010,6 +8010,60 @@ def _ads_inventory_text(inv):
     return "\n".join(owned) if owned else "Empty — buy a ping credit from the ad shop to post."
 
 
+_INV_LIST_RE = re.compile(r"\{inventory[ _]list\}", re.IGNORECASE)
+
+
+def _ads_inventory_cards(guild_id, user_id):
+    """One card (Section: name + a disabled 'Quantity | N' button) per owned perk
+    — what the {inventory list} token expands into."""
+    inv = _ads_inventory(guild_id, user_id)
+    cards = []
+    for k in ADS_PERK_KEYS:
+        n = inv.get(k)
+        if n:
+            cards.append({
+                "type": "section",
+                "title": _ads_perk_label(k),
+                "text": "",
+                "button": {"label": f"Quantity | {n}", "disabled": True, "style": "secondary"},
+            })
+    if not cards:
+        cards.append({"type": "text", "text": "*Your inventory is empty.*"})
+    return cards
+
+
+def _ads_expand_inventory(tree, guild_id, user_id):
+    """Replace any {inventory list} text node in a V2 tree with the per-perk cards
+    (done at the component level since it becomes real Section components)."""
+    cards = None
+
+    def _has_token(item):
+        if not isinstance(item, dict):
+            return False
+        t = item.get("text") or item.get("content") or ""
+        return isinstance(t, str) and bool(_INV_LIST_RE.search(t))
+
+    def _expand(items):
+        nonlocal cards
+        out = []
+        for it in (items or []):
+            if isinstance(it, dict) and it.get("type") == "container":
+                it = dict(it)
+                kids = it.get("children") if isinstance(it.get("children"), list) else it.get("components")
+                it["children"] = _expand(kids or [])
+                it.pop("components", None)
+                out.append(it)
+            elif _has_token(it):
+                if cards is None:
+                    cards = _ads_inventory_cards(guild_id, user_id)
+                out.extend(cards)
+            else:
+                out.append(it)
+        return out
+
+    return _expand(tree)
+
+
 def _ads_summary(ad):
     lines = [f"**By:** <@{ad.get('user_id')}>", f"**Ping:** {_ads_perk_label(ad.get('ping'))}"]
     if ad.get("addon"):
@@ -8311,6 +8365,7 @@ async def _ads_open_claim(interaction):
         empty = ads_config.get("empty_design") or []
         if empty:
             tree = _ads_render(empty, {"inventory": _ads_inventory_text(inv), "user": interaction.user.mention})
+            tree = _ads_expand_inventory(tree, interaction.guild.id, interaction.user.id)
             await interaction.response.defer(ephemeral=True)
             ok = await send_v2_message(interaction.channel, tree, interaction=interaction, ephemeral=True)
             if not ok:
@@ -8325,6 +8380,7 @@ async def _ads_open_claim(interaction):
         # dropdowns + Continue off it via custom_id routing.
         _ads_claim_state[interaction.user.id] = {"ping": None, "type": "regular", "addon": None}
         tree = _ads_render(design, {"inventory": _ads_inventory_text(inv), "user": interaction.user.mention})
+        tree = _ads_expand_inventory(tree, interaction.guild.id, interaction.user.id)
         await interaction.response.defer(ephemeral=True)
         rows = _ads_claim_rows(interaction.guild.id, interaction.user.id)
         ok = await send_v2_message(interaction.channel, tree, interaction=interaction, ephemeral=True, extra_rows=rows)
