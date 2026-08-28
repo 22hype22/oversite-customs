@@ -6785,6 +6785,195 @@ async def _econ_leaderboard(message):
     await message.channel.send(embed=info_embed(f"{message.guild.name} Leaderboard", "\n".join(lines)))
 
 
+def _econ_require_bet(message, args):
+    """Parse + validate a bet from the first arg. Returns the int amount, or None
+    (after sending an error) if it's missing/too big/invalid."""
+    gid, uid = message.guild.id, message.author.id
+    cash = int(_econ_u(gid, uid)["cash"])
+    if not args:
+        return None
+    amt = _econ_parse_amount(args[0], cash)
+    if amt <= 0:
+        return None
+    if amt > cash:
+        return "over"
+    return amt
+
+
+async def _econ_game_result(message, bet, won, payout, detail):
+    gid, uid = message.guild.id, message.author.id
+    if won:
+        _econ_add(gid, uid, payout - bet)  # net gain
+        e = success_embed("You won!", f"{detail}\n\nYou won **{_econ_fmt(payout - bet)}**.\nBalance: {_econ_fmt(_econ_u(gid, uid)['cash'])}")
+    else:
+        _econ_add(gid, uid, -bet)
+        e = error_embed("You lost", f"{detail}\n\nYou lost **{_econ_fmt(bet)}**.\nBalance: {_econ_fmt(_econ_u(gid, uid)['cash'])}")
+    await message.channel.send(embed=e)
+
+
+async def _econ_coinflip(message, args):
+    bet = _econ_require_bet(message, args)
+    p = gambling_config["prefix"]
+    if bet is None:
+        return await message.channel.send(embed=error_embed("Usage", f"`{p}coinflip <amount> [heads|tails]`"))
+    if bet == "over":
+        return await message.channel.send(embed=error_embed("Not enough cash", "You don't have that much."))
+    call = (args[1].lower() if len(args) > 1 else "heads")
+    call = "heads" if call.startswith("h") else "tails"
+    flip = _rnd.choice(["heads", "tails"])
+    await _econ_game_result(message, bet, flip == call, bet * 2, f"🪙 It landed **{flip}** (you called **{call}**).")
+
+
+async def _econ_dice(message, args):
+    bet = _econ_require_bet(message, args)
+    p = gambling_config["prefix"]
+    if bet is None:
+        return await message.channel.send(embed=error_embed("Usage", f"`{p}dice <amount>`"))
+    if bet == "over":
+        return await message.channel.send(embed=error_embed("Not enough cash", "You don't have that much."))
+    you, dealer = _rnd.randint(1, 6) + _rnd.randint(1, 6), _rnd.randint(1, 6) + _rnd.randint(1, 6)
+    await _econ_game_result(message, bet, you > dealer, bet * 2, f"🎲 You rolled **{you}**, dealer rolled **{dealer}**.")
+
+
+async def _econ_slots(message, args):
+    bet = _econ_require_bet(message, args)
+    p = gambling_config["prefix"]
+    if bet is None:
+        return await message.channel.send(embed=error_embed("Usage", f"`{p}slots <amount>`"))
+    if bet == "over":
+        return await message.channel.send(embed=error_embed("Not enough cash", "You don't have that much."))
+    reel = ["🍒", "🍋", "🍊", "🍉", "⭐", "💎", "7️⃣"]
+    spin = [_rnd.choice(reel) for _ in range(3)]
+    line = " ".join(spin)
+    if spin[0] == spin[1] == spin[2]:
+        mult = 10 if spin[0] == "7️⃣" else (7 if spin[0] == "💎" else 5)
+        await _econ_game_result(message, bet, True, bet * mult, f"**[ {line} ]** — three of a kind! ×{mult}")
+    elif spin[0] == spin[1] or spin[1] == spin[2]:
+        await _econ_game_result(message, bet, True, int(bet * 1.5), f"**[ {line} ]** — a pair! ×1.5")
+    else:
+        await _econ_game_result(message, bet, False, 0, f"**[ {line} ]** — no match.")
+
+
+async def _econ_roulette(message, args):
+    bet = _econ_require_bet(message, args)
+    p = gambling_config["prefix"]
+    if bet is None or len(args) < 2:
+        return await message.channel.send(embed=error_embed("Usage", f"`{p}roulette <amount> <red|black|even|odd|1-36>`"))
+    if bet == "over":
+        return await message.channel.send(embed=error_embed("Not enough cash", "You don't have that much."))
+    pick = args[1].lower()
+    n = _rnd.randint(0, 36)
+    reds = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+    colour = "green" if n == 0 else ("red" if n in reds else "black")
+    won, payout = False, 0
+    if pick.isdigit() and int(pick) == n:
+        won, payout = True, bet * 36
+    elif pick in ("red", "black") and pick == colour:
+        won, payout = True, bet * 2
+    elif pick in ("even", "odd") and n != 0 and (n % 2 == 0) == (pick == "even"):
+        won, payout = True, bet * 2
+    await _econ_game_result(message, bet, won, payout, f"🎡 The ball landed on **{n} ({colour})**.")
+
+
+# ---- Blackjack (interactive) ----
+def _bj_deal():
+    return _rnd.randint(1, 13)
+
+
+def _bj_val(cards):
+    total, aces = 0, 0
+    for c in cards:
+        if c == 1:
+            aces += 1; total += 11
+        else:
+            total += min(c, 10)
+    while total > 21 and aces:
+        total -= 10; aces -= 1
+    return total
+
+
+def _bj_show(cards, hide=False):
+    names = {1: "A", 11: "J", 12: "Q", 13: "K"}
+    faces = [names.get(c, str(c)) for c in cards]
+    if hide:
+        faces[-1] = "?"
+    return " ".join(f"`{f}`" for f in faces)
+
+
+class BlackjackView(discord.ui.View):
+    def __init__(self, gid, uid, bet):
+        super().__init__(timeout=120)
+        self.gid, self.uid, self.bet = gid, uid, bet
+        self.player = [_bj_deal(), _bj_deal()]
+        self.dealer = [_bj_deal(), _bj_deal()]
+        self.done = False
+
+    def _embed(self, reveal=False, result=None):
+        d = _bj_show(self.dealer, hide=not reveal)
+        p = _bj_show(self.player)
+        dv = _bj_val(self.dealer) if reveal else "?"
+        desc = (f"**Your hand** ({_bj_val(self.player)}): {p}\n"
+                f"**Dealer** ({dv}): {d}\n\n**Bet:** {_econ_fmt(self.bet)}")
+        if result:
+            desc += f"\n\n{result}"
+        return (success_embed if (result and 'won' in result.lower()) else info_embed)("Blackjack", desc)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message("Not your game.", ephemeral=True)
+            return False
+        return True
+
+    async def _finish(self, interaction):
+        self.done = True
+        while _bj_val(self.dealer) < 17:
+            self.dealer.append(_bj_deal())
+        pv, dv = _bj_val(self.player), _bj_val(self.dealer)
+        if pv > 21:
+            won, payout, msg = False, 0, "You busted."
+        elif dv > 21 or pv > dv:
+            won, payout, msg = True, self.bet * 2, "You won! 🎉"
+        elif pv < dv:
+            won, payout, msg = False, 0, "Dealer wins."
+        else:
+            won, payout, msg = None, self.bet, "Push — bet returned."
+        if won is True:
+            _econ_add(self.gid, self.uid, payout - self.bet)
+        elif won is False:
+            _econ_add(self.gid, self.uid, -self.bet)
+        for c in self.children:
+            c.disabled = True
+        bal = _econ_u(self.gid, self.uid)["cash"]
+        await interaction.response.edit_message(embed=self._embed(reveal=True, result=f"{msg}\nBalance: {_econ_fmt(bal)}"), view=self)
+        self.stop()
+
+    @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary)
+    async def hit(self, interaction, button):
+        self.player.append(_bj_deal())
+        if _bj_val(self.player) >= 21:
+            return await self._finish(interaction)
+        await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary)
+    async def stand(self, interaction, button):
+        await self._finish(interaction)
+
+
+async def _econ_blackjack(message, args):
+    bet = _econ_require_bet(message, args)
+    p = gambling_config["prefix"]
+    if bet is None:
+        return await message.channel.send(embed=error_embed("Usage", f"`{p}blackjack <amount>`"))
+    if bet == "over":
+        return await message.channel.send(embed=error_embed("Not enough cash", "You don't have that much."))
+    view = BlackjackView(message.guild.id, message.author.id, bet)
+    # Natural blackjack pays 2.5x immediately.
+    if _bj_val(view.player) == 21:
+        _econ_add(message.guild.id, message.author.id, int(bet * 1.5))
+        return await message.channel.send(embed=success_embed("Blackjack!", f"Natural 21! You won **{_econ_fmt(int(bet*1.5))}**."))
+    await message.channel.send(embed=view._embed(), view=view)
+
+
 async def _econ_dispatch(message, cmd, args):
     gid, uid = message.guild.id, message.author.id
     p = gambling_config["prefix"]
@@ -6826,6 +7015,16 @@ async def _econ_dispatch(message, cmd, args):
         await _econ_earn(message, cmd)
     elif cmd == "rob":
         await _econ_rob(message, args)
+    elif cmd in ("coinflip", "cf", "bet", "gamble"):
+        await _econ_coinflip(message, args)
+    elif cmd in ("dice", "roll"):
+        await _econ_dice(message, args)
+    elif cmd in ("slots", "slot"):
+        await _econ_slots(message, args)
+    elif cmd in ("roulette", "rl"):
+        await _econ_roulette(message, args)
+    elif cmd in ("blackjack", "bj"):
+        await _econ_blackjack(message, args)
     elif cmd in ("collect-income", "collect", "collectincome"):
         await _econ_collect(message)
     elif cmd in ("leaderboard", "lb", "rich"):
