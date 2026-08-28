@@ -6489,6 +6489,14 @@ async def _cmd_close(message, reason=""):
 
 @bot.event
 async def on_message(message):
+    # TTS: if I'm /join'd into this voice channel, read its chat aloud.
+    if (not message.author.bot and message.guild
+            and _tts_channels.get(message.guild.id) == message.channel.id):
+        try:
+            await _tts_handle(message)
+        except Exception as e:
+            print(f"[TTS] handle error: {e}")
+        return
     # Ticket text commands work only inside a ticket channel; everything else
     # falls through to the normal command processor.
     if not message.author.bot and message.guild:
@@ -11246,6 +11254,74 @@ _dj_recent_genres = {}
 _dj_prev_volume = {}
 auto_music_sessions = {}
 
+# ---- TTS ( /join ) ----
+# When the bot is /join'd into a voice channel it reads that channel's built-in
+# text chat aloud. Playback goes through the same wavelink player as music (a TTS
+# audio URL is just another Playable), so it OVERRIDES music while active.
+_tts_channels = {}  # guild_id -> voice-channel id whose chat is being read
+_tts_queue = {}     # guild_id -> list[Playable] waiting to be spoken
+_tts_busy = {}      # guild_id -> True while a clip is playing
+# StreamElements TTS returns an MP3 the Lavalink HTTP source can play.
+_TTS_VOICE = os.getenv("TTS_VOICE", "Brian")
+
+
+def _tts_clean(content):
+    """Plain, speakable text: drop custom emoji, links, and raw mentions; cap
+    length so one message can't hog the channel."""
+    s = content or ""
+    s = re.sub(r"<a?:\w+:\d+>", "", s)          # custom emoji
+    s = re.sub(r"https?://\S+", "link", s)      # URLs
+    s = re.sub(r"<@[!&]?\d+>|<#\d+>", "", s)     # user/role/channel mentions
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:300]
+
+
+async def _tts_track(text):
+    import wavelink as _wl
+    import urllib.parse
+    url = (f"https://api.streamelements.com/kappa/v2/speech"
+           f"?voice={urllib.parse.quote(_TTS_VOICE)}&text={urllib.parse.quote(text[:300])}")
+    try:
+        res = await _wl.Playable.search(url, source=None)
+        return res[0] if res else None
+    except Exception as e:
+        print(f"[TTS] search failed: {e}")
+        return None
+
+
+async def _tts_play_next(vc):
+    """Play the next queued TTS clip, or go idle when the queue is empty."""
+    gid = vc.guild.id
+    q = _tts_queue.get(gid) or []
+    if not q:
+        _tts_busy[gid] = False
+        return
+    track = q.pop(0)
+    _tts_busy[gid] = True
+    try:
+        await vc.play(track)
+    except Exception as e:
+        print(f"[TTS] play failed: {e}")
+        await _tts_play_next(vc)
+
+
+async def _tts_handle(message):
+    """A message was sent in a joined VC's chat — speak '{user} {message}'."""
+    gid = message.guild.id
+    vc = message.guild.voice_client
+    if not vc:
+        _tts_channels.pop(gid, None)
+        return
+    body = _tts_clean(message.content)
+    if not body:
+        return
+    track = await _tts_track(f"{message.author.display_name} {body}")
+    if not track:
+        return
+    _tts_queue.setdefault(gid, []).append(track)
+    if not _tts_busy.get(gid):
+        await _tts_play_next(vc)
+
 ELEVEN_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVEN_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
 
@@ -11794,6 +11870,65 @@ async def musicdebug_cmd(interaction: discord.Interaction):
     await interaction.followup.send(embed=info_embed("Music Diagnostics", "\n".join(lines)), ephemeral=True)
 
 
+@bot.tree.command(name="join", description="Join your voice channel and read its chat aloud (TTS)")
+async def join_cmd(interaction: discord.Interaction):
+    if not (interaction.user.voice and interaction.user.voice.channel):
+        await interaction.response.send_message(
+            embed=error_embed("Join a voice channel first", "Hop into a VC, then run `/join`."), ephemeral=True)
+        return
+    ch = interaction.user.voice.channel
+    await interaction.response.defer(ephemeral=True)
+    import wavelink as _wl
+    gid = interaction.guild.id
+    vc = interaction.guild.voice_client
+    try:
+        if vc and vc.channel and vc.channel.id != ch.id:
+            await vc.move_to(ch)
+        elif not vc:
+            vc = await ch.connect(cls=_wl.Player)
+    except Exception as e:
+        await interaction.followup.send(embed=error_embed("Couldn't join", str(e)[:200]), ephemeral=True)
+        return
+    # Override music: stop playback, drop its queue and any auto/DJ session.
+    try:
+        vc.queue.clear()
+    except Exception:
+        pass
+    try:
+        await vc.stop()
+    except Exception:
+        pass
+    auto_music_sessions.pop(gid, None)
+    _dj_mode.discard(gid)
+    _cancel_progress(gid)
+    _tts_channels[gid] = ch.id
+    _tts_queue[gid] = []
+    _tts_busy[gid] = False
+    await interaction.followup.send(embed=success_embed(
+        "Joined — TTS on",
+        f"I'm in {ch.mention}. Anything typed in its chat I'll read aloud as **name + message**. "
+        f"Run `/leave` to stop."), ephemeral=True)
+
+
+@bot.tree.command(name="leave", description="Leave the voice channel / stop TTS")
+async def leave_cmd(interaction: discord.Interaction):
+    gid = interaction.guild.id
+    was_tts = _tts_channels.pop(gid, None) is not None
+    _tts_queue.pop(gid, None)
+    _tts_busy.pop(gid, None)
+    vc = interaction.guild.voice_client
+    if not vc:
+        await interaction.response.send_message(embed=error_embed("Not connected", "I'm not in a voice channel."), ephemeral=True)
+        return
+    auto_music_sessions.pop(gid, None)
+    _dj_mode.discard(gid)
+    try:
+        await vc.disconnect()
+    except Exception:
+        pass
+    await interaction.response.send_message(embed=success_embed("Left", "Disconnected from voice."), ephemeral=True)
+
+
 # ---- Commands ----
 @bot.tree.command(name="play", description="Play a song in your voice channel")
 @app_commands.describe(query="Song name, a link, a genre, or 'favorites'")
@@ -11805,6 +11940,10 @@ async def music_play(interaction: discord.Interaction, query: str):
     if wavelink is None:
         await interaction.followup.send(embed=error_embed("Music unavailable", "Music isn't configured."))
         return
+    # Starting music cleanly exits TTS mode (they're mutually exclusive).
+    _tts_channels.pop(interaction.guild.id, None)
+    _tts_queue.pop(interaction.guild.id, None)
+    _tts_busy.pop(interaction.guild.id, None)
     if not (music_config.get("enabled") or music_available):
         await interaction.followup.send(embed=error_embed("Music is off", "Enable the Music Add-On in the dashboard first."))
         return
@@ -12302,6 +12441,11 @@ async def on_wavelink_track_end(payload):
             return
         guild = payload.player.guild
         player = payload.player
+
+        # TTS mode owns the player — advance the spoken queue, skip music logic.
+        if guild.id in _tts_channels:
+            await _tts_play_next(player)
+            return
 
         if repeat_enabled.get(guild.id, False) and payload.track:
             try:
