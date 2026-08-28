@@ -158,6 +158,7 @@ ads_config = {
     },
     "regular_design": [],    # V2 tree; tokens {advertiser} {server_link} {ping}
     "giveaway_design": [],   # V2 tree; tokens {advertiser} {prize} {winners} {duration} {ping}
+    "claim_design": [],      # V2 tree for the claim panel message; token {inventory}
     "claim_button_label": "📢 Post an Ad",
     # Wording of the ephemeral "post an ad" panel (all customizable).
     "claim_title": "Your Ad Inventory",
@@ -174,6 +175,7 @@ _ads_save_pending = None
 _ads_dirty = False
 _pending_perk_grant = {}  # (pkg_msg_id, buyer_id) -> (guild_id, deliver_to, perk_key)
 _ads_pending = {}  # ad_id -> ad dict awaiting approval (also mirrored in ads_data)
+_ads_claim_state = {}  # user_id -> {"ping","type","addon"} for the designed claim panel
 
 
 def _ads_g(guild_id):
@@ -5355,6 +5357,29 @@ async def on_interaction(interaction: discord.Interaction):
         await _ads_open_claim(interaction)
     elif cid == "ad_queue":
         await _ads_open_queue(interaction)
+    elif cid in ("adsel_ping", "adsel_type", "adsel_addon"):
+        st = _ads_claim_state.setdefault(interaction.user.id, {"ping": None, "type": "regular", "addon": None})
+        v = ((interaction.data or {}).get("values") or [None])[0]
+        if cid == "adsel_ping":
+            st["ping"] = None if v in (None, "_none") else v
+        elif cid == "adsel_type":
+            st["type"] = v or "regular"
+        else:
+            st["addon"] = None if v in (None, "none") else v
+        try:
+            await interaction.response.defer()
+        except Exception:
+            pass
+    elif cid == "ad_continue":
+        st = _ads_claim_state.get(interaction.user.id) or {"type": "regular"}
+        if not st.get("ping"):
+            await interaction.response.send_message(embed=error_embed("Pick a ping", "Select which ping credit to use first."), ephemeral=True)
+        else:
+            state = {"ping": st["ping"], "type": st.get("type", "regular"), "addon": st.get("addon")}
+            if state["type"] == "giveaway":
+                await interaction.response.send_modal(AdGiveawayModal(state))
+            else:
+                await interaction.response.send_modal(AdRegularModal(state))
     elif cid.startswith("ad_ok:"):
         await _ads_decide(interaction, cid.split(":", 1)[1], True)
     elif cid.startswith("ad_no:"):
@@ -6606,22 +6631,25 @@ def _build_v2(comp, guild):
     return None
 
 
-async def send_v2_message(channel, components_v2, content=None, interaction=None, ephemeral=False, allowed_mentions=None, buttons=None):
+async def send_v2_message(channel, components_v2, content=None, interaction=None, ephemeral=False, allowed_mentions=None, buttons=None, extra_rows=None):
     _guild = getattr(channel, "guild", None)
 
     built = [b for b in (_build_v2(c, _guild) for c in components_v2) if b]
-    if not built:
+    if not built and not extra_rows:
         return False
     # These component types are all valid at the top level of a Components V2
     # message, so images (12), sections (9), action rows (1), separators (14),
     # etc. can live OUTSIDE a container. Only wrap if something invalid slips in.
     ALLOWED_TOP = {1, 9, 10, 12, 13, 14, 17}
     top_types = {c.get("type") for c in built}
-    if not top_types.issubset(ALLOWED_TOP):
+    if built and not top_types.issubset(ALLOWED_TOP):
         built = [{"type": 17, "components": built}]
     # Attach buttons as an action row directly on this message (raw button dicts).
     if buttons:
         built.append({"type": 1, "components": list(buttons)})
+    # Append fully-formed raw action rows (e.g. select menus + a button).
+    for row in (extra_rows or []):
+        built.append(row)
     flags = 1 << 15
     if ephemeral:
         flags |= 1 << 6
@@ -7067,6 +7095,8 @@ async def apply_config(feature, cfg, post_panel=False):
         ads_config["regular_design"] = rd if isinstance(rd, list) else []
         gd = cfg.get("giveaway_design")
         ads_config["giveaway_design"] = gd if isinstance(gd, list) else []
+        cd = cfg.get("claim_design")
+        ads_config["claim_design"] = cd if isinstance(cd, list) else []
         _register_eph_from_tree(ads_config["regular_design"])
         _register_eph_from_tree(ads_config["giveaway_design"])
         if cfg.get("claim_button_label"):
@@ -8238,6 +8268,35 @@ class AdClaimView(discord.ui.View):
             await interaction.response.send_modal(AdRegularModal(state))
 
 
+def _ads_claim_rows(guild_id, user_id):
+    """Raw select-menu + Continue action rows for the designed claim panel."""
+    inv = _ads_inventory(guild_id, user_id)
+    ping_opts = [{"label": f"{_ads_perk_label(k)} ({inv[k]})", "value": k} for k in ADS_PING_KEYS if inv.get(k)]
+    if not ping_opts:
+        ping_opts = [{"label": "None", "value": "_none"}]
+    rows = [
+        {"type": 1, "components": [{"type": 3, "custom_id": "adsel_ping",
+            "placeholder": (ads_config.get("ping_placeholder") or "Which ping credit to use")[:150],
+            "min_values": 1, "max_values": 1, "options": ping_opts}]},
+        {"type": 1, "components": [{"type": 3, "custom_id": "adsel_type",
+            "placeholder": (ads_config.get("type_placeholder") or "Post type")[:150],
+            "min_values": 1, "max_values": 1, "options": [
+                {"label": (ads_config.get("regular_label") or "Regular Post"), "value": "regular", "default": True},
+                {"label": (ads_config.get("giveaway_label") or "Sponsored Giveaway"), "value": "giveaway"}]}]},
+    ]
+    addon_opts = [{"label": "No add-on", "value": "none", "default": True}]
+    for k in ("instant", "bypass"):
+        if inv.get(k):
+            addon_opts.append({"label": f"{_ads_perk_label(k)} ({inv[k]})", "value": k})
+    if len(addon_opts) > 1:
+        rows.append({"type": 1, "components": [{"type": 3, "custom_id": "adsel_addon",
+            "placeholder": (ads_config.get("addon_placeholder") or "Apply an add-on (optional)")[:150],
+            "min_values": 1, "max_values": 1, "options": addon_opts}]})
+    rows.append({"type": 1, "components": [{"type": 2, "style": 3,
+        "label": (ads_config.get("continue_label") or "Continue")[:80], "custom_id": "ad_continue"}]})
+    return rows
+
+
 async def _ads_open_claim(interaction):
     if not ads_config.get("enabled"):
         await interaction.response.send_message(embed=error_embed("Ads are off", "The advertisement system isn't set up yet."), ephemeral=True)
@@ -8248,6 +8307,18 @@ async def _ads_open_claim(interaction):
     if not any(inv.get(k) for k in ADS_PING_KEYS):
         await interaction.response.send_message(
             embed=info_embed(title, _ads_inventory_text(inv) + "\n\nYou need a ping credit (Everyone / Here / No Ping) to post."), ephemeral=True)
+        return
+    design = ads_config.get("claim_design") or []
+    if design:
+        # A custom-designed panel: render it (with {inventory}) and hang the
+        # dropdowns + Continue off it via custom_id routing.
+        _ads_claim_state[interaction.user.id] = {"ping": None, "type": "regular", "addon": None}
+        tree = _ads_render(design, {"inventory": _ads_inventory_text(inv), "user": interaction.user.mention})
+        await interaction.response.defer(ephemeral=True)
+        rows = _ads_claim_rows(interaction.guild.id, interaction.user.id)
+        ok = await send_v2_message(interaction.channel, tree, interaction=interaction, ephemeral=True, extra_rows=rows)
+        if not ok:
+            await interaction.followup.send(embed=error_embed("Couldn't open", "The claim panel design couldn't render."), ephemeral=True)
         return
     body = _ads_inventory_text(inv) + (f"\n\n{note}" if note else "")
     await interaction.response.send_message(
