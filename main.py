@@ -8346,7 +8346,9 @@ async def _ads_submit(interaction, ad):
     ad["guild_id"] = str(gid)
     ad["user_id"] = str(uid)
     _ads_g(gid).setdefault("pending", {})[ad_id] = ad
-    _save_ads_soon()
+    # Persist NOW (durably, with retries) so a redeploy right after submitting
+    # can't lose the pending ad and leave the approval buttons dead.
+    await _ads_flush_now()
     appr = await resolve_channel(ads_config.get("approval_channel_id"))
     if appr:
         view = discord.ui.View(timeout=None)
@@ -8368,9 +8370,17 @@ async def _ads_decide(interaction, ad_id, approve):
         return
     ad = (gd.get("pending") or {}).pop(ad_id, None)
     if not ad:
-        await interaction.response.send_message(embed=error_embed("Already handled", "This ad was already approved or denied."), ephemeral=True)
+        await interaction.response.send_message(embed=error_embed(
+            "Not pending anymore",
+            "This ad is no longer awaiting approval — it was already handled, or it was lost "
+            "when the bot restarted. If it was lost, ask the advertiser to submit it again."),
+            ephemeral=True)
+        try:
+            await interaction.message.edit(view=None)  # retire the dead buttons
+        except Exception:
+            pass
         return
-    _save_ads_soon()
+    await _ads_flush_now()
     if not approve:
         _ads_grant(gid, ad["user_id"], ad["ping"])
         if ad.get("addon"):
@@ -8389,14 +8399,14 @@ async def _ads_decide(interaction, ad_id, approve):
         await _ads_post(interaction.guild, ad)
     elif addon == "bypass":
         gd.setdefault("bypass", []).append(ad)
-        _save_ads_soon()
+        await _ads_flush_now()
         try:
             await interaction.response.edit_message(embed=info_embed("Ad approved", _ads_summary(ad) + "\n\n🚀 **Queued — Bypass lane** (posts before the regular queue)."), view=None)
         except Exception:
             pass
     else:
         gd.setdefault("queue", []).append(ad)
-        _save_ads_soon()
+        await _ads_flush_now()
         try:
             await interaction.response.edit_message(embed=info_embed("Ad approved", _ads_summary(ad) + "\n\n🕒 **Queued.**"), view=None)
         except Exception:
