@@ -226,6 +226,27 @@ async def _save_ads():
     _ads_dirty = False
 
 
+def _normalize_invite(link):
+    """Tidy a Discord invite URL WITHOUT ever changing the invite code itself:
+    add https:// if missing, fix a misspelled discord.gg / discord.com/invite
+    domain. The code (the '/ovs' part) is preserved exactly."""
+    s = (link or "").strip()
+    if not s:
+        return s
+    low = s.lower()
+    looks_discord = (".gg" in low) or ("cord" in low) or ("invite" in low)
+    if not looks_discord:
+        # Not obviously a Discord invite — just make sure it has a scheme.
+        return s if low.startswith(("http://", "https://")) else "https://" + s
+    # The invite code = last non-empty path segment (never altered).
+    segs = [seg for seg in re.split(r"[\\/]+", s) if seg]
+    # Drop a leading scheme token ("https:") and the domain token so only path
+    # segments remain; the code is the final one.
+    path = [seg for seg in segs if "." not in seg and ":" not in seg and seg.lower() != "invite"]
+    code = path[-1] if path else segs[-1]
+    return f"https://discord.gg/{code}"
+
+
 async def _load_ads():
     cfg = await _bot_config_get("ads-data")
     guilds = (cfg or {}).get("guilds")
@@ -7950,7 +7971,8 @@ def _ads_summary(ad):
         lines.append(f"**Add-on:** {_ads_perk_label(ad.get('addon'))}")
     if ad.get("type") == "giveaway":
         lines.append(f"**Type:** Sponsored Giveaway\n**Prize:** {ad.get('prize')}\n"
-                     f"**Winners:** {ad.get('winners')}\n**Length:** {ad.get('length')}")
+                     f"**Winners:** {ad.get('winners')}\n**Length:** {ad.get('length')}\n"
+                     f"**Discord:** {ad.get('server_link') or '—'}")
     else:
         lines.append(f"**Type:** Regular Post\n**Link:** {ad.get('server_link')}")
     return "\n".join(lines)
@@ -7985,7 +8007,9 @@ async def _ads_post(guild, ad):
         length = ad.get("length") or ""
         design = _ads_render(ads_config.get("giveaway_design") or [],
                              {"advertiser": advertiser, "prize": prize, "winners": winners,
-                              "duration": length, "ping": ping}) or None
+                              "duration": length, "ping": ping,
+                              "server_link": ad.get("server_link") or "",
+                              "server_name": ad.get("server_name") or ""}) or None
         if ping:
             try:
                 await ch.send(ping, allowed_mentions=discord.AllowedMentions(everyone=True, users=True, roles=True))
@@ -8025,7 +8049,7 @@ async def _ads_submit(interaction, ad):
             await interaction.response.send_message(embed=error_embed("Out of stock", "You no longer have that add-on."), ephemeral=True)
             return
     # Resolve the advertised server's name from its invite (for the queue list).
-    if ad.get("type") == "regular" and ad.get("server_link"):
+    if ad.get("server_link"):
         try:
             inv = await bot.fetch_invite(ad["server_link"].strip())
             ad["server_name"] = (inv.guild.name if inv and inv.guild else "") or ""
@@ -8103,7 +8127,7 @@ class AdRegularModal(discord.ui.Modal):
     async def on_submit(self, interaction):
         ad = dict(self._state)
         ad["type"] = "regular"
-        ad["server_link"] = (self.link.value or "").strip()
+        ad["server_link"] = _normalize_invite(self.link.value)
         await _ads_submit(interaction, ad)
 
 
@@ -8114,9 +8138,11 @@ class AdGiveawayModal(discord.ui.Modal):
         self.prize = discord.ui.TextInput(label="Prize", required=True, max_length=200)
         self.winners = discord.ui.TextInput(label="Winners", placeholder="1", required=True, max_length=3)
         self.length = discord.ui.TextInput(label="Length", placeholder="1d, 12h, 30m", required=True, max_length=20)
+        self.link = discord.ui.TextInput(label="Your Discord server link", placeholder="https://discord.gg/…", required=True, max_length=200)
         self.add_item(self.prize)
         self.add_item(self.winners)
         self.add_item(self.length)
+        self.add_item(self.link)
 
     async def on_submit(self, interaction):
         try:
@@ -8130,6 +8156,7 @@ class AdGiveawayModal(discord.ui.Modal):
         ad["winners"] = winners
         ad["seconds"] = seconds
         ad["length"] = (self.length.value or "").strip()
+        ad["server_link"] = _normalize_invite(self.link.value)
         await _ads_submit(interaction, ad)
 
 
