@@ -6742,11 +6742,15 @@ async def _ticket_warn_msg(ch, opener):
         await send_v2_message(ch, _ui_render(design, {"user": opener.mention if opener else "there"}),
                               allowed_mentions={"parse": ["users"]})
     else:
-        await ch.send(
-            content=(opener.mention if opener else ""),
-            embed=info_embed("⏰ Inactivity warning",
-                             "This ticket has been quiet for 24 hours. If there's no reply in the "
-                             "next 24 hours it'll be closed automatically."))
+        # Clean Components V2 container (no accent side color, no emoji).
+        await send_v2_message(
+            ch,
+            [{"type": "container", "children": [{"type": "text", "text": (
+                "**Inactivity warning**\nThis ticket has been quiet for 24 hours. "
+                "If there's no reply in the next 24 hours it will be closed automatically."
+            )}]}],
+            content=(opener.mention if opener else None),
+            allowed_mentions={"parse": ["users"]})
 
 
 @tasks.loop(minutes=30)
