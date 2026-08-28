@@ -6218,16 +6218,18 @@ async def show_ephemeral(interaction, key):
     comps = eph_msgs.get(key)
     print(f"[Tickets] show_ephemeral key={key!r} registered={key in eph_msgs} len={len(comps) if comps else 0} "
           f"all_eph={{{', '.join(f'{k}:{len(v or [])}' for k, v in eph_msgs.items())}}}")
+    if not comps:
+        # Option has no content — acknowledge silently instead of posting a
+        # stray "Nothing here" ephemeral next to the real message.
+        try:
+            await interaction.response.defer()  # component ack, nothing shown
+        except Exception:
+            pass
+        return
     try:
         await interaction.response.defer(ephemeral=True)
     except Exception:
         pass
-    if not comps:
-        try:
-            await interaction.followup.send(embed=info_embed("Nothing here", "This option isn't set up yet."), ephemeral=True)
-        except Exception:
-            pass
-        return
 
     def _js(x):
         return json.dumps(str(x))[1:-1]
@@ -8407,6 +8409,70 @@ class AdUpdateInviteModal(discord.ui.Modal):
             "It'll post on schedule — no need to resubmit."), ephemeral=True)
 
 
+def _ads_date_snapshot(guild):
+    """{ad_id -> estimated post unix ts} for everything currently queued — taken
+    before a queue change so we can tell whose posting time moved."""
+    return {str(a.get("id")): ts for a, lane, ts in _ads_queue_entries(guild)}
+
+
+async def _ads_reschedule_dm(guild, ad, new_ts, old_ts, position):
+    """DM the advertiser that their posting time moved later because a
+    higher-priority ad jumped ahead of them."""
+    uid = str(ad.get("user_id") or "")
+    if not uid.isdigit():
+        return
+    user = guild.get_member(int(uid))
+    if user is None:
+        try:
+            user = await bot.fetch_user(int(uid))
+        except Exception:
+            return
+    try:
+        dm = await user.create_dm()
+    except Exception:
+        return
+    link = ad.get("server_link") or ""
+    sname = ad.get("server_name") or "Server"
+    members = 0
+    try:
+        inv = await bot.fetch_invite(link.strip(), with_counts=True)
+        if inv:
+            sname = (inv.guild.name if inv.guild else "") or sname
+            members = int(inv.approximate_member_count or 0)
+    except Exception:
+        pass
+    desc = (
+        "### **Advertisement Rescheduled**\n\n"
+        "An adjustment has been made to the posting schedule for your advertisement. Your "
+        "booking is still active and confirmed, but the expected publishing date has been moved.\n\n"
+        "> **New Posting Time**\n"
+        f"> <t:{int(new_ts)}:F>\n\n"
+        "**Originally Scheduled For**\n"
+        f"<t:{int(old_ts)}:F>\n\n"
+        "**Queue Placement**\n"
+        f"`#{position}`\n\n"
+        "There is nothing you need to do at this time. Your advertisement will remain in the "
+        "queue and will be posted automatically at its newly assigned time.\n\n"
+        f"**{sname}**\n"
+        f"`{members:,} members`\n"
+        f"{link}"
+    )
+    tree = [{"type": "container", "children": [{"type": "text", "text": desc}]}]
+    try:
+        if not await send_v2_message(dm, tree):
+            await dm.send(embed=discord.Embed(description=desc, color=ACCENT))
+    except Exception:
+        pass
+
+
+async def _ads_notify_reschedules(guild, before):
+    """After a queue change, DM anyone whose estimated post time moved later."""
+    for i, (ad, lane, ts) in enumerate(_ads_queue_entries(guild)):
+        old = before.get(str(ad.get("id")))
+        if old is not None and ts > old + 30:  # moved meaningfully later
+            await _ads_reschedule_dm(guild, ad, ts, old, i + 1)
+
+
 async def _ads_post(guild, ad):
     """Post an approved ad to the configured ad channel."""
     ch = await resolve_channel(ads_config.get("post_channel_id"))
@@ -8568,6 +8634,9 @@ async def _ads_decide(interaction, ad_id, approve):
         except Exception:
             pass
         return
+    # Snapshot everyone's estimated post time so we can tell whose time moves when
+    # this approval jumps the queue (a Bypass ad pushes the normal queue back).
+    before = _ads_date_snapshot(interaction.guild)
     addon = ad.get("addon")
     if addon == "instant":
         try:
@@ -8582,6 +8651,7 @@ async def _ads_decide(interaction, ad_id, approve):
             await interaction.response.edit_message(embed=info_embed("Ad approved", _ads_summary(ad) + "\n\n🚀 **Queued — Bypass lane** (posts before the regular queue)."), view=None)
         except Exception:
             pass
+        await _ads_notify_reschedules(interaction.guild, before)
     else:
         gd.setdefault("queue", []).append(ad)
         await _ads_flush_now()
@@ -8762,13 +8832,15 @@ async def _ads_apply_addon(interaction, addon, ad_id):
         await interaction.response.send_message(embed=success_embed("Applied", "Posting it now."), ephemeral=True)
         await _ads_post(interaction.guild, ad)
     else:  # bypass, from the normal queue
+        before = _ads_date_snapshot(interaction.guild)
         try:
             gd["queue"].remove(ad)
         except Exception:
             pass
         gd.setdefault("bypass", []).append(ad)
-        _save_ads_soon()
+        await _ads_flush_now()
         await interaction.response.send_message(embed=success_embed("Applied", "Moved to the Bypass lane — it'll post sooner."), ephemeral=True)
+        await _ads_notify_reschedules(interaction.guild, before)
 
 
 async def _ads_handle_use(interaction, v):
