@@ -6459,6 +6459,53 @@ async def freerelease_cmd(interaction: discord.Interaction):
     await _frel_open_modal(interaction)
 
 
+# ===================== Blacklist logs =====================
+# `/blacklist` posts the log message designed in the dashboard, filling tokens
+# from the command's user + reason arguments.
+blacklist_config = {"design": [], "channel_id": ""}
+_BL_TOKEN_RE = re.compile(r"\{(user|reason|moderator|mod|staff|id|username)\}", re.IGNORECASE)
+
+
+def _bl_render(design, target, moderator, reason):
+    raw = json.dumps(design or [])
+
+    def repl(m):
+        k = m.group(1).lower()
+        if k == "user":
+            out = target.mention
+        elif k in ("moderator", "mod", "staff"):
+            out = moderator.mention
+        elif k == "reason":
+            out = reason or "—"
+        elif k == "id":
+            out = str(target.id)
+        elif k == "username":
+            out = target.display_name
+        else:
+            out = ""
+        return json.dumps(str(out))[1:-1]
+
+    return json.loads(_BL_TOKEN_RE.sub(repl, raw))
+
+
+@bot.tree.command(name="blacklist", description="Log a blacklist entry")
+@app_commands.describe(user="The member to blacklist", reason="Why they're being blacklisted")
+async def blacklist_cmd(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
+    if not interaction.guild:
+        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    if not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message("You need Manage Server to blacklist.", ephemeral=True)
+    if not blacklist_config.get("channel_id") or not blacklist_config.get("design"):
+        return await interaction.response.send_message(
+            "Blacklist logging isn't set up in the dashboard yet.", ephemeral=True)
+    ch = await resolve_channel(blacklist_config["channel_id"])
+    if not ch:
+        return await interaction.response.send_message("The blacklist log channel wasn't found.", ephemeral=True)
+    out = _bl_render(blacklist_config["design"], user, interaction.user, reason)
+    await send_v2_message(ch, out, allowed_mentions={"parse": []})
+    await interaction.response.send_message(f"✅ Logged a blacklist entry for {user.mention}.", ephemeral=True)
+
+
 async def open_ticket_form(interaction, key):
     """A Form button/option: pop a modal to collect {Question:} answers, then
     open the ticket with those answers filled into the designed message."""
@@ -8699,6 +8746,17 @@ async def apply_config(feature, cfg, post_panel=False):
             cfg.get("vault_channel_id") or free_release_config.get("vault_channel_id") or "")
         _register_eph_from_tree(free_release_config["design"])
         print(f"[Config] customs-freerelease — design {len(free_release_config['design'])} item(s)")
+    elif feature in ("customs-blacklist",):
+        raw = cfg.get("messages")
+        design, channel_id = [], ""
+        if isinstance(raw, list) and raw:
+            m0 = raw[0] or {}
+            design = m0.get("components") if isinstance(m0.get("components"), list) else []
+            channel_id = str(m0.get("channel_id") or "")
+        blacklist_config["design"] = design if isinstance(design, list) else []
+        blacklist_config["channel_id"] = str(cfg.get("channel_id") or channel_id)
+        _register_eph_from_tree(blacklist_config["design"])
+        print(f"[Config] customs-blacklist — channel {blacklist_config['channel_id'] or '(none)'}")
     elif feature in ("invite-tracker",):
         invite_tracker_config["enabled"] = bool(cfg.get("enabled", True))
         comps = cfg.get("board_components")
@@ -11316,7 +11374,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-feedback", "customs-reportbug", "customs-freerelease", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-feedback", "customs-reportbug", "customs-freerelease", "customs-blacklist", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
