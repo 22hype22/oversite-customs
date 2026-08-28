@@ -8421,7 +8421,11 @@ async def ticket_close_prompt(interaction):
 
 async def do_instant_close(interaction, reason):
     channel = interaction.channel
-    await interaction.response.send_message(embed=info_embed("Closing order", f"Closed by {interaction.user.mention}\n**Reason:** {reason}\nSaving transcript\u2026"))
+    await _ui_channel_or_embed(
+        interaction, "ticket_closing",
+        {"user": interaction.user.mention, "reason": reason or "\u2014"},
+        "Closing order",
+        f"Closed by {interaction.user.mention}\n**Reason:** {reason}\nSaving transcript\u2026")
     await _do_close(channel, interaction.guild, interaction.user, reason)
 
 
