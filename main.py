@@ -8362,6 +8362,43 @@ async def _ads_submit(interaction, ad):
         embed=success_embed("Submitted!", "Your ad was sent for staff approval — you'll see it posted once approved."), ephemeral=True)
 
 
+def _ads_reconstruct_from_embed(desc):
+    """Rebuild an ad from its approval-message embed — the durable fallback so
+    staff can approve even if the stored pending record was lost in a restart.
+    Returns None if the embed can't be parsed into a usable ad."""
+    if not desc:
+        return None
+
+    def field(name):
+        m = re.search(rf"\*\*{re.escape(name)}:\*\*\s*(.+)", desc)
+        return m.group(1).strip() if m else ""
+
+    m = re.search(r"<@!?(\d+)>", desc)
+    user_id = m.group(1) if m else ""
+    ping = _ads_perk_for_name(field("Ping"))
+    if not (user_id and ping):
+        return None
+    addon_label = field("Add-on")
+    ad = {
+        "user_id": user_id,
+        "ping": ping,
+        "addon": _ads_perk_for_name(addon_label) if addon_label else None,
+        "type": "giveaway" if "giveaway" in field("Type").lower() else "regular",
+    }
+    if ad["type"] == "giveaway":
+        ad["prize"] = field("Prize")
+        try:
+            ad["winners"] = max(1, int(re.sub(r"\D", "", field("Winners")) or "1"))
+        except ValueError:
+            ad["winners"] = 1
+        ad["length"] = field("Length")
+        ad["server_link"] = field("Discord")
+        ad["seconds"] = _parse_duration_seconds(ad["length"]) or 86400
+    else:
+        ad["server_link"] = field("Link")
+    return ad
+
+
 async def _ads_decide(interaction, ad_id, approve):
     gid = str(interaction.guild.id)
     gd = _ads_g(gid)
@@ -8370,16 +8407,27 @@ async def _ads_decide(interaction, ad_id, approve):
         return
     ad = (gd.get("pending") or {}).pop(ad_id, None)
     if not ad:
-        await interaction.response.send_message(embed=error_embed(
-            "Not pending anymore",
-            "This ad is no longer awaiting approval — it was already handled, or it was lost "
-            "when the bot restarted. If it was lost, ask the advertiser to submit it again."),
-            ephemeral=True)
-        try:
-            await interaction.message.edit(view=None)  # retire the dead buttons
-        except Exception:
-            pass
-        return
+        # Storage lost the pending record (e.g. a redeploy during a backend
+        # outage), but the approval message is a durable copy — rebuild from its
+        # embed. Only if it's still awaiting (title unchanged), so an
+        # already-handled ad can't be approved twice.
+        emb = interaction.message.embeds[0] if (interaction.message and interaction.message.embeds) else None
+        if emb and "awaiting" in ((emb.title or "").lower()):
+            ad = _ads_reconstruct_from_embed(emb.description or "")
+        if ad:
+            ad["id"] = ad_id
+            ad["guild_id"] = gid
+        else:
+            await interaction.response.send_message(embed=error_embed(
+                "Not pending anymore",
+                "This ad was already approved or denied. If it went missing after a restart, "
+                "ask the advertiser to submit it again."),
+                ephemeral=True)
+            try:
+                await interaction.message.edit(view=None)  # retire the dead buttons
+            except Exception:
+                pass
+            return
     await _ads_flush_now()
     if not approve:
         _ads_grant(gid, ad["user_id"], ad["ping"])
