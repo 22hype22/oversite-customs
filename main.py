@@ -4841,9 +4841,41 @@ async def _durable_config_get(feature, attempts=6):
     return False, {}
 
 
+async def _bot_config_upsert_via_fn(feature, config):
+    """Persist config through the service-role backend (utilities-bot-api
+    /save-config). This bypasses RLS entirely, so features the bot writes itself
+    (economy-data, ads-data, …) are saved without needing INSERT on the anon key.
+    Returns (ok, err). ok=None means the endpoint isn't available (older backend)
+    so the caller should fall back to a direct write."""
+    if not (BOT_ORDER_ID and WORKER_TOKEN):
+        return None, "no worker token"
+    try:
+        session = await get_poll_session()
+        async with session.post(
+            f"{SUPABASE_FN_URL}/{BOT_API}/save-config",
+            headers=_fn_headers(),
+            json={"bot_id": BOT_ORDER_ID, "feature": feature, "config": config},
+        ) as r:
+            if r.status == 200:
+                return True, ""
+            body = (await r.text())[:120]
+            # 404/405 = endpoint not deployed yet → let the caller fall back.
+            if r.status in (404, 405):
+                return None, f"HTTP {r.status}"
+            return False, f"HTTP {r.status}: {body}"
+    except Exception as e:
+        return None, str(e)[:120]
+
+
 async def _bot_config_upsert(feature, config):
     if not (SUPABASE_URL and SUPABASE_KEY and BOT_ORDER_ID):
         return False, "no supabase creds"
+    # Prefer the service-role backend (no RLS dependency); fall back to a direct
+    # REST upsert if that endpoint isn't available.
+    ok, err = await _bot_config_upsert_via_fn(feature, config)
+    if ok is True:
+        return True, ""
+    fn_err = err
     try:
         url = f"{SUPABASE_URL}/rest/v1/bot_config?on_conflict=bot_id,feature"
         payload = {"bot_id": BOT_ORDER_ID, "feature": feature, "config": config,
@@ -4857,7 +4889,11 @@ async def _bot_config_upsert(feature, config):
                 json=payload, timeout=15)
         if r.status_code in (200, 201, 204):
             return True, ""
-        return False, f"HTTP {r.status_code}: {r.text[:100]}"
+        # If the service-role write actively failed too, surface both.
+        detail = f"HTTP {r.status_code}: {r.text[:100]}"
+        if ok is False:
+            detail = f"{detail} (fn: {fn_err})"
+        return False, detail
     except Exception as e:
         return False, str(e)[:120]
 
