@@ -1421,6 +1421,10 @@ async def on_ready():
         await _load_ticket_autoclose()
     except Exception as e:
         print(f"[Ticket] autoclose state load failed: {e}")
+    try:
+        await _bl_load_saved()
+    except Exception as e:
+        print(f"[Blacklist] saved-roles load failed: {e}")
     if not ticket_inactivity_tick.is_running():
         ticket_inactivity_tick.start()
     if not wavelink_watchdog.is_running():
@@ -6907,6 +6911,36 @@ async def freerelease_cmd(interaction: discord.Interaction):
 # from the command's user + reason arguments.
 blacklist_config = {"design": [], "channel_id": "", "apply_role": False, "role_id": "", "strip_roles": True}
 
+# Roles removed when a member was blacklisted, so /unblacklist can restore them.
+# guild_id(str) -> { user_id(str): [role_id(str), ...] }. Persisted to bot_config.
+blacklist_saved = {}
+_bl_saved_loaded = False
+
+
+async def _bl_load_saved():
+    global _bl_saved_loaded
+    ok, cfg = await _durable_config_get("blacklist-data")
+    if not ok:
+        print("[Blacklist] saved-roles load failed — role restore disabled this session.")
+        return
+    g = (cfg or {}).get("guilds")
+    if isinstance(g, dict):
+        for gid, users in g.items():
+            if isinstance(users, dict):
+                blacklist_saved[str(gid)] = {str(u): [str(x) for x in (v or [])] for u, v in users.items()}
+    _bl_saved_loaded = True
+    n = sum(len(u) for u in blacklist_saved.values())
+    print(f"[Blacklist] restored {n} saved role set(s)")
+
+
+async def _bl_save_saved():
+    if not _bl_saved_loaded:
+        return
+    try:
+        await _bot_config_upsert("blacklist-data", {"guilds": blacklist_saved})
+    except Exception as e:
+        print(f"[Blacklist] saved-roles save failed: {e}")
+
 # Auto tokens the moderator does NOT type — the bot fills them from the chosen
 # member: {username} -> server nickname, {discord} -> @mention,
 # {roblox} / {roblox profile} / {roblox group} -> a View Profile link built from
@@ -6951,6 +6985,9 @@ async def _bl_apply_punishment(member):
                          if r != guild.default_role and not r.managed and (top and r < top) and r != role]
             if removable:
                 await member.remove_roles(*removable, reason="Blacklisted")
+                # Remember what we took so /unblacklist can give it all back.
+                blacklist_saved.setdefault(str(guild.id), {})[str(member.id)] = [str(r.id) for r in removable]
+                await _bl_save_saved()
         if role:
             if top and role >= top:
                 return " (couldn't assign the blacklist role — it's above my highest role)"
@@ -7010,6 +7047,55 @@ async def blacklist_cmd(interaction: discord.Interaction, user: discord.Member):
     }
     first = next(iter(_pf_forms(design)), 1)
     await _pf_open_modal(interaction, "customs-blacklist", design, "Blacklist", first)
+
+
+@bot.tree.command(name="unblacklist", description="Remove a blacklist and restore the member's roles")
+@app_commands.describe(user="The member to unblacklist")
+async def unblacklist_cmd(interaction: discord.Interaction, user: discord.Member):
+    if not interaction.guild:
+        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    if not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message("You need Manage Server to unblacklist.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    me = guild.me
+    top = me.top_role if me else None
+    notes = []
+
+    # 1) Take the blacklist role off.
+    role_id = blacklist_config.get("role_id")
+    role = guild.get_role(int(role_id)) if role_id and str(role_id).isdigit() else None
+    if role and role in user.roles:
+        try:
+            await user.remove_roles(role, reason="Unblacklisted")
+            notes.append(f"removed {role.mention}")
+        except Exception as e:
+            print(f"[Blacklist] unblacklist remove-role failed: {e}")
+
+    # 2) Give back whatever roles were stripped when they were blacklisted.
+    saved = (blacklist_saved.get(str(guild.id)) or {}).pop(str(user.id), None)
+    if saved:
+        to_add = []
+        for rid in saved:
+            r = guild.get_role(int(rid)) if str(rid).isdigit() else None
+            if (r and r != guild.default_role and not r.managed
+                    and (top and r < top) and r not in user.roles):
+                to_add.append(r)
+        if to_add:
+            try:
+                await user.add_roles(*to_add, reason="Unblacklisted — restored roles")
+                notes.append(f"restored {len(to_add)} role(s)")
+            except discord.Forbidden:
+                notes.append("couldn't restore roles (missing Manage Roles)")
+            except Exception as e:
+                print(f"[Blacklist] restore roles failed: {e}")
+                notes.append("couldn't restore some roles")
+        await _bl_save_saved()
+    else:
+        notes.append("no saved roles on file to restore")
+
+    tail = (" — " + ", ".join(notes)) if notes else ""
+    await interaction.followup.send(f"Unblacklisted {user.mention}{tail}.", ephemeral=True)
 
 
 # ===================== Automated package announcements =====================
