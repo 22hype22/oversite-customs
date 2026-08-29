@@ -1417,6 +1417,10 @@ async def on_ready():
         print(f"[Announce] load failed: {e}")
     if not announce_tick.is_running():
         announce_tick.start()
+    try:
+        await _load_ticket_autoclose()
+    except Exception as e:
+        print(f"[Ticket] autoclose state load failed: {e}")
     if not ticket_inactivity_tick.is_running():
         ticket_inactivity_tick.start()
     if not econ_autosave.is_running():
@@ -6895,7 +6899,39 @@ async def _announce_before():
 # bot substitutes it wherever that system message would otherwise be hardcoded.
 small_ui_config = {}
 ticket_autoclose_config = {"enabled": True, "warn_hours": 24, "close_hours": 24}
-_ticket_warned = {}  # channel_id -> ts we posted the inactivity warning
+# channel_id -> unix ts we posted the inactivity warning. Persisted to bot_config
+# so a redeploy doesn't forget (and re-warn) tickets it already warned.
+_ticket_warned = {}
+_ticket_ac_loaded = False
+
+
+async def _load_ticket_autoclose():
+    """Load the persisted 'already warned' map so a redeploy doesn't re-warn
+    tickets or restart their 24h clock."""
+    global _ticket_ac_loaded
+    ok, cfg = await _durable_config_get("ticket-autoclose-state")
+    if not ok:
+        print("[Ticket] autoclose state load failed — inactivity checks paused "
+              "this session to avoid false warnings.")
+        return
+    warned = cfg.get("warned") if isinstance(cfg, dict) else None
+    if isinstance(warned, dict):
+        for k, v in warned.items():
+            try:
+                _ticket_warned[str(k)] = float(v)
+            except Exception:
+                pass
+    _ticket_ac_loaded = True
+    print(f"[Ticket] autoclose state loaded — {len(_ticket_warned)} warned ticket(s)")
+
+
+async def _save_ticket_autoclose():
+    if not _ticket_ac_loaded:
+        return
+    try:
+        await _bot_config_upsert("ticket-autoclose-state", {"warned": _ticket_warned})
+    except Exception as e:
+        print(f"[Ticket] autoclose state save failed: {e}")
 
 
 def _small_ui(key):
@@ -6937,14 +6973,16 @@ async def _ui_channel_or_embed(interaction, key, mapping, title, desc,
 
 
 async def _ticket_last_activity(ch):
-    mid = getattr(ch, "last_message_id", None)
-    if mid:
-        try:
-            msg = await ch.fetch_message(mid)
+    """Timestamp of the ticket's most recent message. Returns None if it can't be
+    read right now — we must never guess an old time (e.g. the channel's creation
+    date), or a long-open ticket would get a false inactivity warning on the very
+    next tick, especially right after a redeploy when the cache is cold."""
+    try:
+        async for msg in ch.history(limit=1):
             return msg.created_at.timestamp()
-        except Exception:
-            pass
-    return ch.created_at.timestamp()
+        return ch.created_at.timestamp()  # genuinely empty channel
+    except Exception:
+        return None
 
 
 async def _ticket_warn_msg(ch, opener):
@@ -6970,32 +7008,41 @@ async def _ticket_warn_msg(ch, opener):
 async def ticket_inactivity_tick():
     if not ticket_autoclose_config.get("enabled", True):
         return
+    # Never act on incomplete state — if the persisted 'already warned' map didn't
+    # load, we could re-warn tickets we already warned. Wait for a good load.
+    if not _ticket_ac_loaded:
+        return
     warn_after = int(ticket_autoclose_config.get("warn_hours") or 24) * 3600
     close_after = int(ticket_autoclose_config.get("close_hours") or 24) * 3600
     now = time.time()
+    dirty = False
+    live_ids = set()
     for guild in list(bot.guilds):
         for ch in list(getattr(guild, "text_channels", [])):
             topic = getattr(ch, "topic", "") or ""
             if not topic.startswith("ticket|"):
                 continue
-            try:
-                last_ts = await _ticket_last_activity(ch)
-            except Exception:
-                continue
             wid = str(ch.id)
+            live_ids.add(wid)
+            last_ts = await _ticket_last_activity(ch)
+            if last_ts is None:
+                continue  # couldn't read history this tick — retry next time
             warned_at = _ticket_warned.get(wid)
             if warned_at:
                 if last_ts > warned_at + 2:  # someone replied after the warning
                     _ticket_warned.pop(wid, None)
+                    dirty = True
                     continue
                 if now - warned_at >= close_after:
                     _ticket_warned.pop(wid, None)
+                    dirty = True
                     try:
                         await _do_close(ch, guild, bot.user, reason="Auto-closed for inactivity")
                     except Exception as e:
                         print(f"[Ticket] auto-close failed: {e}")
             elif now - last_ts >= warn_after:
                 _ticket_warned[wid] = now
+                dirty = True
                 parts = topic.split("|")
                 opener_id = parts[1] if len(parts) > 1 else ""
                 opener = guild.get_member(int(opener_id)) if opener_id.isdigit() else None
@@ -7003,6 +7050,12 @@ async def ticket_inactivity_tick():
                     await _ticket_warn_msg(ch, opener)
                 except Exception as e:
                     print(f"[Ticket] warn failed: {e}")
+    # Forget warned entries for tickets that no longer exist (closed/deleted).
+    for gone in [w for w in _ticket_warned if w not in live_ids]:
+        _ticket_warned.pop(gone, None)
+        dirty = True
+    if dirty:
+        await _save_ticket_autoclose()
 
 
 @ticket_inactivity_tick.before_loop
