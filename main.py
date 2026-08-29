@@ -7322,6 +7322,39 @@ async def ticket_claim_toggle(interaction, claimed):
     await _do_claim_toggle(channel, member, claimed, msg)
 
 
+# Only re-ping the ticket's roles on unclaim if it was actually held for at
+# least this long — a quick claim-then-unclaim shouldn't ping anyone.
+CLAIM_REPING_AFTER = 60  # seconds
+
+
+def _ticket_reping_roles(channel):
+    """The roles to notify when a ticket becomes available again: the roles
+    selected for THIS ticket (they hold a view overwrite on the channel),
+    preferring the per-ticket access roles over the global 'see all' support
+    roles, and falling back to the global support roles if that's all there is."""
+    guild = channel.guild
+    global_support = set(str(x) for x in (ticket_config.get("support_role_ids") or []))
+    access, support = [], []
+    for target, ow in channel.overwrites.items():
+        if isinstance(target, discord.Role) and target != guild.default_role and ow.view_channel is True:
+            (support if str(target.id) in global_support else access).append(target)
+    return access or support
+
+
+async def _ticket_reping(channel):
+    roles = _ticket_reping_roles(channel)
+    if not roles:
+        return
+    mention = " ".join(r.mention for r in roles)
+    # Clean V2 container (no accent side line, no emoji) — exactly the text asked.
+    await send_v2_message(
+        channel,
+        [{"type": "container", "children": [
+            {"type": "text", "text": f"{mention} This commission is back available."}]}],
+        allowed_mentions={"roles": [str(r.id) for r in roles]},
+    )
+
+
 async def _do_claim_toggle(channel, member, claimed, msg):
     # Toggle the Claim/Unclaim button on the ticket message (if we have it).
     if msg is not None:
@@ -7342,26 +7375,35 @@ async def _do_claim_toggle(channel, member, claimed, msg):
         cat = parts[2] if len(parts) > 2 else "support"
         base = parts[3] if len(parts) > 3 and parts[3] else _san_name(getattr(channel, "name", "ticket"))
         if claimed:
-            saved_pos = getattr(channel, "position", 0)
+            # Stamp the claim time in the topic (slot 5) so a later unclaim \u2014 even
+            # after a redeploy \u2014 can tell a quick claim/unclaim from a real hold.
             new_name = f"\U0001F7E2\u30FB{_san_name(member.name)}"[:90]
-            new_topic = f"ticket|{opener_id}|{cat}|{base}|{saved_pos}"
+            new_topic = f"ticket|{opener_id}|{cat}|{base}|{int(time.time())}"
             await channel.edit(name=new_name, topic=new_topic, reason=f"Ticket claimed by {member}")
             try:
                 await channel.move(beginning=True, category=channel.category, sync_permissions=False, reason="Claimed ticket to top")
             except Exception as e:
                 print(f"[Tickets] move-to-top failed: {e}")
         else:
-            saved_pos = None
-            if len(parts) > 4 and parts[4].strip().lstrip("-").isdigit():
-                saved_pos = int(parts[4])
+            claim_ts = 0
+            if len(parts) > 4 and parts[4].strip().isdigit():
+                claim_ts = int(parts[4])
             new_name = f"\U0001F534\u30FB{base}"[:90]
             new_topic = f"ticket|{opener_id}|{cat}|{base}"
             await channel.edit(name=new_name, topic=new_topic, reason=f"Ticket unclaimed by {member}")
-            if saved_pos is not None:
+            # Drop the ticket to the very bottom of its category.
+            try:
+                await channel.move(end=True, category=channel.category, sync_permissions=False, reason="Unclaimed ticket to bottom")
+            except Exception as e:
+                print(f"[Tickets] move-to-bottom failed: {e}")
+            # Only re-ping if it was genuinely held for a while (not an instant
+            # claim -> unclaim).
+            held = int(time.time()) - claim_ts if claim_ts else 0
+            if claim_ts and held >= CLAIM_REPING_AFTER:
                 try:
-                    await channel.edit(position=saved_pos)
+                    await _ticket_reping(channel)
                 except Exception as e:
-                    print(f"[Tickets] restore-position failed: {e}")
+                    print(f"[Tickets] reping failed: {e}")
     except Exception as e:
         print(f"[Tickets] rename/reorder failed: {e}")
 
