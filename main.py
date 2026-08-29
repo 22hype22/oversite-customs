@@ -6362,6 +6362,67 @@ def _pf_config_for(feature):
     return prompt_forms_config.get(feature) or {}
 
 
+# /suggestion and /reportbug are the Discord twins of the website "Custom
+# feature" / "Report a bug" forms. The owner configures those (channel + design)
+# in the dashboard's hidden Extras editor, which saves a GLOBAL row in
+# platform_settings. If the per-bot prompt-form config isn't set, fall back to
+# that global setting so the slash command works with no separate setup.
+_PF_PLATFORM_KEY = {
+    "customs-suggestions": "extras-customfeature",
+    "customs-reportbug": "extras-reportbug",
+}
+_PF_BUILTIN_DESIGN = {
+    "customs-suggestions": [{"type": "text", "text": (
+        "## Oversite Customs | Custom Feature\n**User:** {user}\n"
+        "{Question: **Feature Title:**}\n{Question: **Description:**}\n{File: **Example:**}")}],
+    "customs-reportbug": [{"type": "text", "text": (
+        "## Oversite Customs | Bug Report\n**User:** {user}\n"
+        "{Question: **What happened:**}\n{Question: **Steps to reproduce:**}\n{File: **Screenshot:**}")}],
+}
+
+
+async def _platform_setting_get(key):
+    """Read one global platform_settings row (its `value` jsonb) via REST.
+    Returns {} on any failure. Lets the bot pick up the owner-only Extras config
+    (Custom Feature / Report a Bug channel) the dashboard stores globally."""
+    if not (SUPABASE_URL and SUPABASE_KEY):
+        return {}
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/platform_settings?key=eq.{key}&select=value"
+        headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            rows = r.json()
+            if rows and isinstance(rows[0].get("value"), dict):
+                return rows[0]["value"]
+        else:
+            print(f"[PromptForm] platform setting '{key}' — HTTP {r.status_code}")
+    except Exception as e:
+        print(f"[PromptForm] platform setting '{key}' read failed: {e}")
+    return {}
+
+
+async def _pf_platform_fallback(feature):
+    """When a prompt form has no per-bot dashboard config, use the global Extras
+    setting: the owner-picked channel + a built-in form design. Populates
+    prompt_forms_config so the rest of the flow is unchanged. Returns True if a
+    usable channel was found."""
+    key = _PF_PLATFORM_KEY.get(feature)
+    if not key:
+        return False
+    val = await _platform_setting_get(key)
+    ch = str(val.get("channel_id") or "")
+    if not ch:
+        return False
+    prompt_forms_config[feature] = {
+        "design": [dict(c) for c in (_PF_BUILTIN_DESIGN.get(feature) or [])],
+        "channel_id": ch,
+        "title": _PF_TITLES.get(feature) or "Submit",
+    }
+    return True
+
+
 async def _pf_command(interaction, feature):
     """Slash-command entry point: open the form, or (if the design has no input
     tokens) post the designed message straight away."""
@@ -6382,6 +6443,14 @@ async def _pf_command(interaction, feature):
                 cfg = _pf_config_for(feature)
         except Exception as e:
             print(f"[PromptForm] on-demand config refresh failed for {feature}: {e}")
+        # Still nothing? Fall back to the global Extras channel (Custom Feature /
+        # Report a Bug) so the command works without a per-bot dashboard save.
+        if not cfg.get("channel_id") or not cfg.get("design"):
+            try:
+                if await _pf_platform_fallback(feature):
+                    cfg = _pf_config_for(feature)
+            except Exception as e:
+                print(f"[PromptForm] platform fallback failed for {feature}: {e}")
 
     channel_id = cfg.get("channel_id")
     design = cfg.get("design") or []
@@ -11951,6 +12020,15 @@ async def load_all_configs():
             await apply_config(feature, cfg)
         else:
             print(f"[Config] {feature} — none saved")
+    # /suggestion and /reportbug: if no per-bot config was saved, use the owner's
+    # global Custom Feature / Report a Bug channel so the command still works.
+    for feature in ("customs-suggestions", "customs-reportbug"):
+        if not _pf_config_for(feature).get("channel_id"):
+            try:
+                if await _pf_platform_fallback(feature):
+                    print(f"[Config] {feature} — using global Extras channel (fallback)")
+            except Exception as e:
+                print(f"[Config] {feature} extras fallback failed: {e}")
 
 
 async def complete_command(command_id, status="done", error=None):
