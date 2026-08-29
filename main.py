@@ -6330,17 +6330,6 @@ async def _pf_command(interaction, feature):
     """Slash-command entry point: open the form, or (if the design has no input
     tokens) post the designed message straight away."""
     cfg = _pf_config_for(feature)
-    # Self-heal: if it looks unconfigured in memory, pull the latest saved config
-    # straight from the dashboard now (covers the case where a live apply command
-    # never reached the bot). One quick attempt so the interaction stays snappy.
-    if not cfg.get("channel_id") or not cfg.get("design"):
-        try:
-            fresh = await fetch_config(feature, attempts=1)
-            if fresh:
-                await apply_config(feature, fresh)
-                cfg = _pf_config_for(feature)
-        except Exception as e:
-            print(f"[PromptForm] lazy config refresh failed for {feature}: {e}")
     channel_id = cfg.get("channel_id")
     design = cfg.get("design") or []
     # Specific diagnostics so it's clear which piece is missing.
