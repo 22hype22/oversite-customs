@@ -6669,7 +6669,8 @@ async def _pf_submit(interaction, feature, form_num=1):
                 await _post_form_files(ch, files)
             except Exception as e:
                 print(f"[PromptForm] file post failed: {e}")
-        return await interaction.followup.send("Blacklist entry logged.", ephemeral=True)
+        extra = await _bl_apply_punishment(member)
+        return await interaction.followup.send(f"Blacklist entry logged{extra}.", ephemeral=True)
 
     if not ch:
         return await interaction.response.send_message("Couldn't find the destination channel.", ephemeral=True)
@@ -6904,7 +6905,7 @@ async def freerelease_cmd(interaction: discord.Interaction):
 # ===================== Blacklist logs =====================
 # `/blacklist` posts the log message designed in the dashboard, filling tokens
 # from the command's user + reason arguments.
-blacklist_config = {"design": [], "channel_id": ""}
+blacklist_config = {"design": [], "channel_id": "", "apply_role": False, "role_id": "", "strip_roles": True}
 
 # Auto tokens the moderator does NOT type — the bot fills them from the chosen
 # member: {username} -> server nickname, {discord} -> @mention,
@@ -6931,6 +6932,37 @@ def _bl_auto_fill(design, member, roblox_url):
         return json.loads(raw)
     except Exception:
         return design or []
+
+
+async def _bl_apply_punishment(member):
+    """If enabled in the dashboard, strip the member's roles and give them the
+    chosen blacklist role — a soft alternative to banning. Returns a short status
+    string for the confirmation, or ''. Best-effort: never blocks the log post."""
+    if not member or not blacklist_config.get("apply_role"):
+        return ""
+    guild = member.guild
+    role_id = blacklist_config.get("role_id")
+    role = guild.get_role(int(role_id)) if role_id and str(role_id).isdigit() else None
+    me = guild.me
+    top = me.top_role if me else None
+    try:
+        if blacklist_config.get("strip_roles", True):
+            removable = [r for r in member.roles
+                         if r != guild.default_role and not r.managed and (top and r < top) and r != role]
+            if removable:
+                await member.remove_roles(*removable, reason="Blacklisted")
+        if role:
+            if top and role >= top:
+                return " (couldn't assign the blacklist role — it's above my highest role)"
+            if role not in member.roles:
+                await member.add_roles(role, reason="Blacklisted")
+            return f" and applied {role.mention}"
+        return " and removed their roles"
+    except discord.Forbidden:
+        return " (I'm missing the Manage Roles permission)"
+    except Exception as e:
+        print(f"[Blacklist] role change failed: {e}")
+        return " (couldn't change their roles)"
 
 
 async def _bl_roblox_url(member):
@@ -6969,7 +7001,8 @@ async def blacklist_cmd(interaction: discord.Interaction, user: discord.Member):
             return await interaction.followup.send("The blacklist log channel wasn't found.", ephemeral=True)
         out = _pf_render(_bl_auto_fill(design, user, roblox_url), interaction.user.id, [])
         await send_v2_message(ch, out, allowed_mentions={"parse": []})
-        return await interaction.followup.send(f"Logged a blacklist entry for {user.mention}.", ephemeral=True)
+        extra = await _bl_apply_punishment(user)
+        return await interaction.followup.send(f"Logged a blacklist entry for {user.mention}{extra}.", ephemeral=True)
     # Ask the form questions; the auto tokens resolve from `user` at submit time.
     _pf_pending[("customs-blacklist", interaction.user.id)] = {
         "design": design, "title": "Blacklist", "channel_id": channel_id,
@@ -9613,8 +9646,14 @@ async def apply_config(feature, cfg, post_panel=False):
             channel_id = str(m0.get("channel_id") or "")
         blacklist_config["design"] = design if isinstance(design, list) else []
         blacklist_config["channel_id"] = str(cfg.get("channel_id") or channel_id)
+        # Optional enforcement: on /blacklist, strip the member's roles and give
+        # them a chosen "blacklisted" role (so staff don't have to ban/lose them).
+        blacklist_config["apply_role"] = bool(cfg.get("apply_role"))
+        blacklist_config["role_id"] = str(cfg.get("role_id") or cfg.get("blacklist_role_id") or "")
+        blacklist_config["strip_roles"] = bool(cfg.get("strip_roles", True))
         _register_eph_from_tree(blacklist_config["design"])
-        print(f"[Config] customs-blacklist — channel {blacklist_config['channel_id'] or '(none)'}")
+        print(f"[Config] customs-blacklist — channel {blacklist_config['channel_id'] or '(none)'} "
+              f"| role {'on '+blacklist_config['role_id'] if blacklist_config['apply_role'] else 'off'}")
     elif feature in ("customs-announce",):
         raw = cfg.get("messages")
         msgs = []
