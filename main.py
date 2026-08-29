@@ -8651,6 +8651,16 @@ async def on_message(message):
     await bot.process_commands(message)
 
 
+@bot.event
+async def on_command_error(ctx, error):
+    # Every prefix message is handled by our own dispatchers (economy `!…`,
+    # ticket `-…`) or as a slash command; process_commands still runs afterward,
+    # so a plain "command not found" is expected noise — swallow just that.
+    if isinstance(error, commands.CommandNotFound):
+        return
+    print(f"[Command] error: {error}")
+
+
 # Preferred: a single form (modal) with the Instant/Manual dropdown inside it.
 # Dropdowns inside modals require discord.py 2.6+ (discord.ui.Label). Where the
 # runtime supports it this is what the user sees; otherwise ticket_close_prompt
