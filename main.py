@@ -1423,6 +1423,8 @@ async def on_ready():
         print(f"[Ticket] autoclose state load failed: {e}")
     if not ticket_inactivity_tick.is_running():
         ticket_inactivity_tick.start()
+    if not wavelink_watchdog.is_running():
+        wavelink_watchdog.start()
     if not econ_autosave.is_running():
         econ_autosave.start()
     await refresh_status()
@@ -14191,6 +14193,80 @@ async def setup_wavelink():
         print(f"[Music] Lavalink connect failed: {e}")
 
 
+def _wl_nodes():
+    try:
+        nodes = wavelink.Pool.nodes
+        return list(nodes.values()) if isinstance(nodes, dict) else list(nodes)
+    except Exception:
+        return []
+
+
+def _wl_has_connected_node():
+    """True if at least one Lavalink node is currently CONNECTED."""
+    for n in _wl_nodes():
+        try:
+            st = getattr(n, "status", None)
+            if st is not None and "CONNECTED" in str(getattr(st, "name", st)).upper():
+                return True
+        except Exception:
+            pass
+    return False
+
+
+async def _wl_reconnect():
+    """Re-establish the Lavalink connection when the pool has no live node. Free
+    public nodes drop often (502 / closed), and without this TTS and music can't
+    join. Closes any dead nodes so their identifiers are free, then reconnects."""
+    if wavelink is None or not (LAVALINK_URI and LAVALINK_PASSWORD):
+        return False
+    for n in _wl_nodes():
+        try:
+            await n.close()
+        except Exception:
+            pass
+    try:
+        uris = [u.strip() for u in LAVALINK_URI.split(",") if u.strip()]
+        pws = [p.strip() for p in LAVALINK_PASSWORD.split(",")]
+        nodes = [wavelink.Node(uri=u, password=(pws[i] if i < len(pws) and pws[i] else pws[0]))
+                 for i, u in enumerate(uris)]
+        await wavelink.Pool.connect(nodes=nodes, client=bot, cache_capacity=100)
+        print("[Music] reconnect attempt issued")
+        return True
+    except Exception as e:
+        print(f"[Music] reconnect failed: {e}")
+        return False
+
+
+async def _wl_ensure_ready(timeout=6.0):
+    """Make sure a Lavalink node is connected, reconnecting on demand. Returns
+    True if one is live within `timeout` seconds."""
+    if _wl_has_connected_node():
+        return True
+    await _wl_reconnect()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _wl_has_connected_node():
+            return True
+        await asyncio.sleep(0.4)
+    return _wl_has_connected_node()
+
+
+@tasks.loop(seconds=45)
+async def wavelink_watchdog():
+    """Keep a Lavalink node alive so /join (TTS) and music stay working even when
+    the public node drops out mid-session."""
+    if wavelink is None or not (LAVALINK_URI and LAVALINK_PASSWORD):
+        return
+    if not _wl_has_connected_node():
+        print("[Music] watchdog: no connected node — reconnecting")
+        await _wl_reconnect()
+
+
+@wavelink_watchdog.before_loop
+async def _wl_watchdog_before():
+    await bot.wait_until_ready()
+
+
 # Chain node connect + DJ clip server into setup_hook without clobbering existing.
 _prev_setup_hook = bot.setup_hook
 
@@ -14478,6 +14554,14 @@ async def join_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     import wavelink as _wl
     gid = interaction.guild.id
+    # TTS plays through Lavalink — if the node dropped, reconnect before joining
+    # (public nodes go down often). Give a clear message if it can't recover.
+    if not await _wl_ensure_ready():
+        await interaction.followup.send(embed=error_embed(
+            "Voice server unavailable",
+            "The voice backend just dropped and is reconnecting — try `/join` again in a few seconds."),
+            ephemeral=True)
+        return
     vc = interaction.guild.voice_client
     try:
         if vc and vc.channel and vc.channel.id != ch.id:
