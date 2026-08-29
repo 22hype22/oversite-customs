@@ -6330,32 +6330,58 @@ async def _pf_command(interaction, feature):
     """Slash-command entry point: open the form, or (if the design has no input
     tokens) post the designed message straight away."""
     cfg = _pf_config_for(feature)
+    deferred = False
+    # If it isn't in memory (the bot may not be applying config live), ACK first
+    # so we don't blow Discord's 3s window, then pull the saved config on demand.
+    if not cfg.get("channel_id") or not cfg.get("design"):
+        try:
+            await interaction.response.defer(ephemeral=True)
+            deferred = True
+        except Exception:
+            pass
+        try:
+            fresh = await fetch_config(feature)
+            if fresh:
+                await apply_config(feature, fresh)
+                cfg = _pf_config_for(feature)
+        except Exception as e:
+            print(f"[PromptForm] on-demand config refresh failed for {feature}: {e}")
+
     channel_id = cfg.get("channel_id")
     design = cfg.get("design") or []
+
     # Specific diagnostics so it's clear which piece is missing.
-    if not cfg:
-        return await interaction.response.send_message(
-            "This isn't loaded on the bot yet. Save it in the dashboard, then **redeploy the bot** "
-            "so it picks up the change (your bot isn't applying config live right now).", ephemeral=True)
-    if not design and not channel_id:
-        return await interaction.response.send_message(
-            "This isn't set up yet — design the message and pick a channel in the Suggestions block, save, "
-            "then redeploy the bot.", ephemeral=True)
-    if not channel_id:
-        return await interaction.response.send_message(
-            "Almost there — the message is designed but **no destination channel** is set. Pick a channel "
-            "in the Suggestions block, save, then redeploy the bot.", ephemeral=True)
-    if not design:
-        return await interaction.response.send_message(
-            "Almost there — a channel is set but the **message design is empty**. Add your message (with the "
-            "`{Question:}` / `{File:}` tokens) in the Suggestions block, save, then redeploy the bot.", ephemeral=True)
+    msg = None
+    if not channel_id and not design:
+        msg = "This isn't set up yet — add a message and pick a channel in the dashboard, then Save."
+    elif not channel_id:
+        msg = "Almost there — no destination **channel** is set. Pick one in the dashboard and Save."
+    elif not design:
+        msg = ("Almost there — the **message is empty**. Add it (with the `{Question:}` / `{File:}` "
+               "tokens) in the dashboard and Save.")
+    if msg:
+        if deferred:
+            return await interaction.followup.send(msg, ephemeral=True)
+        return await interaction.response.send_message(msg, ephemeral=True)
+
     title = cfg.get("title") or _PF_TITLES.get(feature) or "Submit"
-    if not _pf_inputs(design):
+    inputs = _pf_inputs(design)
+
+    # We can only open a modal as the FIRST response — if we already deferred to
+    # load the config, ask the user to run it once more (now it's in memory).
+    if deferred and inputs:
+        return await interaction.followup.send(
+            "✅ Loaded your latest setup — run the command once more to open the form.", ephemeral=True)
+
+    if not inputs:
         ch = await resolve_channel(channel_id)
         if ch:
             await send_v2_message(ch, _pf_render(design, interaction.user.id, []),
                                   allowed_mentions={"parse": []})
-        return await interaction.response.send_message("✅ Submitted — thank you!", ephemeral=True)
+        text = "✅ Submitted — thank you!"
+        return await (interaction.followup.send(text, ephemeral=True) if deferred
+                      else interaction.response.send_message(text, ephemeral=True))
+
     await _pf_open_modal(interaction, feature, design, title)
 
 
