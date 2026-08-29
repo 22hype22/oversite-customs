@@ -6734,8 +6734,14 @@ async def _ui_channel_or_embed(interaction, key, mapping, title, desc,
                               content=content, buttons=buttons,
                               allowed_mentions={"parse": ["users"]})
     else:
-        await interaction.response.send_message(content=content, embed=info_embed(title, desc),
-                                                view=fallback_view)
+        # discord.py distinguishes MISSING from None — passing view=None crashes
+        # send_message, so only include it when there actually is one.
+        kwargs = {"embed": info_embed(title, desc)}
+        if content:
+            kwargs["content"] = content
+        if fallback_view is not None:
+            kwargs["view"] = fallback_view
+        await interaction.response.send_message(**kwargs)
 
 
 async def _ticket_last_activity(ch):
@@ -6755,14 +6761,16 @@ async def _ticket_warn_msg(ch, opener):
         await send_v2_message(ch, _ui_render(design, {"user": opener.mention if opener else "there"}),
                               allowed_mentions={"parse": ["users"]})
     else:
-        # Clean Components V2 container (no accent side color, no emoji).
+        # Clean Components V2 container (no accent side color, no emoji). A V2
+        # message can't use a top-level content field, so the opener ping lives
+        # inside the text.
+        ping = f"{opener.mention} " if opener else ""
         await send_v2_message(
             ch,
             [{"type": "container", "children": [{"type": "text", "text": (
-                "**Inactivity warning**\nThis ticket has been quiet for 24 hours. "
+                f"{ping}**Inactivity warning**\nThis ticket has been quiet for 24 hours. "
                 "If there's no reply in the next 24 hours it will be closed automatically."
             )}]}],
-            content=(opener.mention if opener else None),
             allowed_mentions={"parse": ["users"]})
 
 
@@ -8640,6 +8648,13 @@ async def send_v2_message(channel, components_v2, content=None, interaction=None
     _guild = getattr(channel, "guild", None)
 
     built = [b for b in (_build_v2(c, _guild) for c in components_v2) if b]
+    # A Components V2 message may NOT carry a top-level `content` field (Discord
+    # rejects it with a 400). If a caller passes content (usually a ping), render
+    # it as a leading text component instead so the message still posts and any
+    # mention still fires via allowed_mentions.
+    if content:
+        built = [{"type": 10, "content": str(content)}] + built
+        content = None
     if not built and not extra_rows:
         return False
     # These component types are all valid at the top level of a Components V2
