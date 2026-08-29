@@ -1346,6 +1346,19 @@ async def on_ready():
     except Exception as e:
         print(f"[Startup] config load failed: {e}")
 
+    # On every redeploy: re-apply the global support roles to all tickets that
+    # are already open, so newly-added staff can see existing tickets without
+    # the owner touching each one. Runs in the background so boot isn't blocked.
+    async def _boot_ticket_perm_sync():
+        try:
+            n = len(ticket_config.get("support_role_ids") or [])
+            if n:
+                print(f"[Boot] applying {n} support role(s) to open tickets…")
+                await _resync_ticket_support_perms(ticket_config)
+        except Exception as e:
+            print(f"[Startup] ticket perm resync failed: {e}")
+    asyncio.create_task(_boot_ticket_perm_sync())
+
     try:
         await seed_secret_slots()
     except Exception as e:
@@ -8906,7 +8919,7 @@ async def _resync_ticket_support_perms(config):
     role_ids = [str(x) for x in (config.get("support_role_ids") or []) if x]
     if not role_ids:
         return
-    updated = 0
+    updated, tickets = 0, 0
     for guild in list(bot.guilds):
         roles = [r for r in (guild.get_role(int(rid)) for rid in role_ids) if r]
         if not roles:
@@ -8915,6 +8928,7 @@ async def _resync_ticket_support_perms(config):
             topic = getattr(ch, "topic", "") or ""
             if not topic.startswith("ticket|"):
                 continue
+            tickets += 1
             for role in roles:
                 try:
                     ow = ch.overwrites_for(role)
@@ -8924,8 +8938,8 @@ async def _resync_ticket_support_perms(config):
                         updated += 1
                 except Exception as e:
                     print(f"[Tickets] perm sync failed on #{getattr(ch, 'name', ch.id)}: {e}")
-    if updated:
-        print(f"[Tickets] synced support-role access on {updated} ticket/role pair(s)")
+    print(f"[Tickets] support-role sync: checked {tickets} open ticket(s), "
+          f"granted access on {updated} ticket/role pair(s)")
 
 
 async def resolve_channel(channel_id):
@@ -8977,14 +8991,13 @@ async def apply_config(feature, cfg, post_panel=False):
         ticket_config["panel_components"] = edited_panel.get("components", [])
         _ticket_sources["tickets"] = {"panels": panels, "types": _parse_ticket_types(cfg)}
         _rebuild_ticket_registry()
-        # Make sure the (possibly newly-added) support roles can see tickets that
-        # already exist, not just future ones. Runs in the background so it never
-        # blocks config apply / boot.
-        asyncio.create_task(_resync_ticket_support_perms(ticket_config))
         print(f"[Config] tickets — category {ticket_config['category_id']} roles {ticket_config['support_role_ids']} panel_ch {ticket_config['panel_channel_id']} panel {len(ticket_config['panel_components'])} types {len(ticket_config['types'])}")
         # Post/refresh ONLY the panel being edited on a save (not on boot, and
-        # not the other panels — those stay put).
+        # not the other panels — those stay put). On a save we also re-apply the
+        # support roles to every open ticket (boot does this separately, in
+        # on_ready, so it always runs on a redeploy).
         if post_panel:
+            asyncio.create_task(_resync_ticket_support_perms(ticket_config))
             await post_ticket_panel(only_channel_id=edited_ch or None)
     elif feature in ("marketplace", "customs-marketplace"):
         # An independent second ticket system with its own category/roles/log.
