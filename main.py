@@ -6480,14 +6480,14 @@ async def _pf_command(interaction, feature):
     # load the config, ask the user to run it once more (now it's in memory).
     if deferred and inputs:
         return await interaction.followup.send(
-            "✅ Loaded your latest setup — run the command once more to open the form.", ephemeral=True)
+            "Loaded your latest setup — run the command once more to open the form.", ephemeral=True)
 
     if not inputs:
         ch = await resolve_channel(channel_id)
         if ch:
             await send_v2_message(ch, _pf_render(design, interaction.user.id, []),
                                   allowed_mentions={"parse": []})
-        text = "✅ Submitted — thank you!"
+        text = "Submitted. Our team will look into it!"
         return await (interaction.followup.send(text, ephemeral=True) if deferred
                       else interaction.response.send_message(text, ephemeral=True))
 
@@ -6511,7 +6511,7 @@ async def _pf_submit(interaction, feature):
     ch = await resolve_channel(cfg.get("channel_id"))
     if not ch:
         return await interaction.response.send_message("Couldn't find the destination channel.", ephemeral=True)
-    await interaction.response.send_message("✅ Submitted — thank you!", ephemeral=True)
+    await interaction.response.send_message("Submitted. Our team will look into it!", ephemeral=True)
     out = _pf_render(design, interaction.user.id, answers)
     await send_v2_message(ch, out, allowed_mentions={"parse": []})
     if files:
