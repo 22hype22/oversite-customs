@@ -6330,11 +6330,36 @@ async def _pf_command(interaction, feature):
     """Slash-command entry point: open the form, or (if the design has no input
     tokens) post the designed message straight away."""
     cfg = _pf_config_for(feature)
+    # Self-heal: if it looks unconfigured in memory, pull the latest saved config
+    # straight from the dashboard now (covers the case where a live apply command
+    # never reached the bot). One quick attempt so the interaction stays snappy.
+    if not cfg.get("channel_id") or not cfg.get("design"):
+        try:
+            fresh = await fetch_config(feature, attempts=1)
+            if fresh:
+                await apply_config(feature, fresh)
+                cfg = _pf_config_for(feature)
+        except Exception as e:
+            print(f"[PromptForm] lazy config refresh failed for {feature}: {e}")
     channel_id = cfg.get("channel_id")
     design = cfg.get("design") or []
-    if not channel_id or not design:
+    # Specific diagnostics so it's clear which piece is missing.
+    if not cfg:
         return await interaction.response.send_message(
-            "This isn't set up yet — an admin needs to configure it in the dashboard.", ephemeral=True)
+            "This isn't loaded on the bot yet. Save it in the dashboard, then **redeploy the bot** "
+            "so it picks up the change (your bot isn't applying config live right now).", ephemeral=True)
+    if not design and not channel_id:
+        return await interaction.response.send_message(
+            "This isn't set up yet — design the message and pick a channel in the Suggestions block, save, "
+            "then redeploy the bot.", ephemeral=True)
+    if not channel_id:
+        return await interaction.response.send_message(
+            "Almost there — the message is designed but **no destination channel** is set. Pick a channel "
+            "in the Suggestions block, save, then redeploy the bot.", ephemeral=True)
+    if not design:
+        return await interaction.response.send_message(
+            "Almost there — a channel is set but the **message design is empty**. Add your message (with the "
+            "`{Question:}` / `{File:}` tokens) in the Suggestions block, save, then redeploy the bot.", ephemeral=True)
     title = cfg.get("title") or _PF_TITLES.get(feature) or "Submit"
     if not _pf_inputs(design):
         ch = await resolve_channel(channel_id)
