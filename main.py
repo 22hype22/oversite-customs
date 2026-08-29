@@ -6418,15 +6418,10 @@ def _pf_config_for(feature):
     return prompt_forms_config.get(feature) or {}
 
 
-# /suggestion and /reportbug are the Discord twins of the website "Custom
-# feature" / "Report a bug" forms. The owner configures those (channel + design)
-# in the dashboard's hidden Extras editor, which saves a GLOBAL row in
-# platform_settings. If the per-bot prompt-form config isn't set, fall back to
-# that global setting so the slash command works with no separate setup.
-_PF_PLATFORM_KEY = {
-    "customs-suggestions": "extras-customfeature",
-    "customs-reportbug": "extras-reportbug",
-}
+# /suggestion is its own feature (the Suggestions block), NOT linked to the
+# website "Custom feature" form — those are separate. No prompt-form command
+# falls back to a global Extras setting anymore.
+_PF_PLATFORM_KEY = {}
 _PF_BUILTIN_DESIGN = {
     "customs-suggestions": [{"type": "text", "text": (
         "## Oversite Customs | Custom Feature\n**User:** {user}\n"
