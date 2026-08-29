@@ -5665,7 +5665,13 @@ async def on_interaction(interaction: discord.Interaction):
     if interaction.type == discord.InteractionType.modal_submit:
         cid = (interaction.data or {}).get("custom_id", "")
         if cid.startswith("pf:"):
-            await _pf_submit(interaction, cid.split(":", 1)[1])
+            rest = cid.split(":", 1)[1]
+            # "feature" or "feature:formnum" (feature names contain hyphens, not colons)
+            feat, _, fnum = rest.rpartition(":")
+            if feat and fnum.isdigit():
+                await _pf_submit(interaction, feat, int(fnum))
+            else:
+                await _pf_submit(interaction, rest, 1)
         elif cid.startswith("freerelform:"):
             await _frel_form_submit(interaction, cid.split(":", 1)[1])
         elif cid.startswith("ticketform:"):
@@ -6253,9 +6259,15 @@ def _apply_answers(open_comps, mapping):
 #   {file: Name}                       -> file upload (attached to the posted message)
 # custom_id namespace for the modal is "pf:<feature>".
 prompt_forms_config = {}  # feature -> {"design": [...], "channel_id": "...", "title": "..."}
+# Answers collected so far for a multi-form submission, keyed by (feature, uid):
+# {"design", "title", "channel_id", "answers": {gidx: str}, "files": {gidx: [file]}}
+_pf_pending = {}
 
+# A trailing number groups a token into a form "page": {Question:} / {File:} are
+# form 1; {Question2:} / {File2:} are form 2, and so on. Discord caps a modal at 5
+# inputs, so >5 questions are split across forms shown one after another.
 _PF_TOKEN_RE = re.compile(
-    r"\{(user|long\s*question|question|drop\s*down|dropdown|select|file)\s*(?::\s*(.*?))?\}",
+    r"\{(user|long\s*question|question|drop\s*down|dropdown|select|file)\s*(\d*)\s*(?::\s*(.*?))?\}",
     re.IGNORECASE,
 )
 
@@ -6270,18 +6282,39 @@ def _pf_norm_kind(raw_kind):
 
 
 def _pf_tokens(design):
-    """Every token in a design, in document order: [{kind, content}]."""
+    """Every token in a design, in document order: [{kind, content, form}].
+    `form` is the group number (1 unless the token has a trailing number)."""
     raw = json.dumps(design or [])
     toks = []
     for m in _PF_TOKEN_RE.finditer(raw):
-        toks.append({"kind": _pf_norm_kind(m.group(1)), "content": (m.group(2) or "").strip()})
+        num = m.group(2)
+        toks.append({
+            "kind": _pf_norm_kind(m.group(1)),
+            "content": (m.group(3) or "").strip(),
+            "form": int(num) if num else 1,
+        })
     return toks
 
 
 def _pf_inputs(design):
-    """Just the tokens that need a modal input (everything except {user}),
-    capped at Discord's 5-per-modal limit."""
-    return [t for t in _pf_tokens(design) if t["kind"] != "user"][:5]
+    """Every token that needs a modal input (all except {user}), across all
+    forms — used to tell whether the design collects anything at all."""
+    return [t for t in _pf_tokens(design) if t["kind"] != "user"]
+
+
+def _pf_forms(design):
+    """Ordered {form_number: [(global_input_index, token), ...]}. The global
+    index is the token's position among ALL inputs in document order, so the
+    collected answers line up with _pf_render's in-order substitution. Each form
+    is capped at Discord's 5-input limit."""
+    forms = {}
+    for gidx, t in enumerate(_pf_inputs(design)):
+        forms.setdefault(int(t.get("form") or 1), []).append((gidx, t))
+    return {n: forms[n][:5] for n in sorted(forms)}
+
+
+def _pf_form_numbers(design):
+    return list(_pf_forms(design).keys())
 
 
 def _pf_dropdown_parts(content):
@@ -6312,11 +6345,20 @@ def _pf_render(design, uid, answers):
     return json.loads(_PF_TOKEN_RE.sub(repl, raw))
 
 
-async def _pf_open_modal(interaction, feature, design, title):
-    inputs = _pf_inputs(design)
+async def _pf_open_modal(interaction, feature, design, title, form_num=None):
+    forms = _pf_forms(design)
+    if form_num is None:
+        form_num = next(iter(forms), 1)
+    entries = forms.get(form_num, [])
+    total_forms = len(forms)
+    # Show "(1/2)" etc. in the title when there's more than one page.
+    ttl = title or "Submit"
+    if total_forms > 1:
+        page = list(forms).index(form_num) + 1 if form_num in forms else 1
+        ttl = f"{ttl} ({page}/{total_forms})"
     components = []
-    for idx, t in enumerate(inputs):
-        cid = f"p{idx}"
+    for gidx, t in entries:
+        cid = f"p{gidx}"
         if t["kind"] == "file":
             label = _clean_label(t["content"]) or "File"
             # Optional: a submitter may not have a file to attach. Discord defaults
@@ -6343,7 +6385,7 @@ async def _pf_open_modal(interaction, feature, design, title):
             components.append({"type": 18, "label": (_clean_label(t["content"]) or "Answer")[:45],
                                "component": {"type": 4, "custom_id": cid, "style": style,
                                              "required": True, "max_length": 1000}})
-    data = {"title": (title or "Submit")[:45], "custom_id": f"pf:{feature}", "components": components}
+    data = {"title": ttl[:45], "custom_id": f"pf:{feature}:{form_num}", "components": components}
     route = discord.http.Route(
         "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
         interaction_id=interaction.id, interaction_token=interaction.token,
@@ -6540,24 +6582,72 @@ async def _pf_command(interaction, feature):
         return await (interaction.followup.send(text, ephemeral=True) if deferred
                       else interaction.response.send_message(text, ephemeral=True))
 
-    await _pf_open_modal(interaction, feature, design, title)
+    # Start a fresh multi-form session and open the first page.
+    _pf_pending[(feature, interaction.user.id)] = {
+        "design": design, "title": title, "channel_id": channel_id,
+        "answers": {}, "files": {},
+    }
+    first = next(iter(_pf_forms(design)), 1)
+    await _pf_open_modal(interaction, feature, design, title, first)
 
 
-async def _pf_submit(interaction, feature):
+class _PFContinueView(discord.ui.View):
+    """The button shown between form pages — Discord can't open a modal straight
+    from a modal submit, so the user clicks Continue to get the next page."""
+    def __init__(self, feature, next_form):
+        super().__init__(timeout=900)
+        self.feature = feature
+        self.next_form = next_form
+
+    @discord.ui.button(label="Continue", style=discord.ButtonStyle.primary)
+    async def _cont(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        pend = _pf_pending.get((self.feature, interaction.user.id))
+        if not pend:
+            return await interaction.response.send_message(
+                "This form expired — run the command again.", ephemeral=True)
+        await _pf_open_modal(interaction, self.feature, pend["design"], pend["title"], self.next_form)
+
+
+async def _pf_submit(interaction, feature, form_num=1):
+    key = (feature, interaction.user.id)
+    pend = _pf_pending.get(key)
     cfg = _pf_config_for(feature)
-    design = cfg.get("design") or []
-    inputs = _pf_inputs(design)
+    # Recover a session lost to a restart from the live config.
+    if not pend:
+        design = cfg.get("design") or []
+        pend = {"design": design, "title": cfg.get("title") or _PF_TITLES.get(feature) or "Submit",
+                "channel_id": cfg.get("channel_id"), "answers": {}, "files": {}}
+        _pf_pending[key] = pend
+    design = pend["design"]
+    forms = _pf_forms(design)
     vals = _modal_values(interaction.data.get("components"))
-    answers, files = [], []
-    for idx, t in enumerate(inputs):
-        cid = f"p{idx}"
+    # Record this page's answers against their global indices.
+    for gidx, t in forms.get(form_num, []):
+        cid = f"p{gidx}"
         if t["kind"] == "file":
             fs = _modal_uploaded_files(interaction, cid)
-            files.extend(fs)
-            answers.append(", ".join((f.get("filename") or "file") for f in fs) if fs else "")
+            pend["files"][gidx] = fs
+            pend["answers"][gidx] = ", ".join((f.get("filename") or "file") for f in fs) if fs else ""
         else:
-            answers.append(vals.get(cid, ""))
-    ch = await resolve_channel(cfg.get("channel_id"))
+            pend["answers"][gidx] = vals.get(cid, "")
+
+    form_nums = list(forms)
+    remaining = [n for n in form_nums if form_nums.index(n) > form_nums.index(form_num)]
+    if remaining:
+        nxt = remaining[0]
+        page = form_nums.index(nxt) + 1
+        return await interaction.response.send_message(
+            f"Saved. Click **Continue** for the rest ({page}/{len(form_nums)}).",
+            view=_PFContinueView(feature, nxt), ephemeral=True)
+
+    # Last page — assemble every answer in document order and post.
+    _pf_pending.pop(key, None)
+    total = len(_pf_inputs(design))
+    answers = [pend["answers"].get(i, "") for i in range(total)]
+    files = []
+    for i in range(total):
+        files.extend(pend["files"].get(i, []))
+    ch = await resolve_channel(pend.get("channel_id"))
     if not ch:
         return await interaction.response.send_message("Couldn't find the destination channel.", ephemeral=True)
     await interaction.response.send_message("Submitted. Our team will look into it!", ephemeral=True)
