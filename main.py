@@ -6383,6 +6383,39 @@ _PF_BUILTIN_DESIGN = {
         "## Oversite Customs | Bug Report\n**User:** {user}\n"
         "{Question: **What happened:**}\n{Question: **Steps to reproduce:**}\n{File: **Screenshot:**}")}],
 }
+# The dashboard's Custom Feature / Report a Bug editor uses value tokens
+# ({title}, {description}, {example}, …). Map each to a prompt-form token so the
+# same engine asks that question and renders the OWNER'S design with the answer
+# filled in where the token was. {user} is left as-is (rendered as the mention).
+_EXTRAS_TOKEN_MAP = {
+    "customs-suggestions": {
+        "title": "{question: Feature Title}",
+        "description": "{long question: Description}",
+        "example": "{file: Example}",
+    },
+    "customs-reportbug": {
+        "title": "{question: Bug Title}",
+        "description": "{long question: What happened}",
+        "steps": "{long question: Steps to reproduce}",
+        "priority": "{question: Priority}",
+        "proof": "{file: Proof}",
+        "screenshot": "{file: Screenshot}",
+    },
+}
+
+
+def _extras_design_to_pf(feature, design):
+    """Convert an Extras design's value tokens into prompt-form tokens so the
+    form engine can drive it. Returns the converted design (owner's layout)."""
+    mapping = _EXTRAS_TOKEN_MAP.get(feature) or {}
+    raw = json.dumps(design or [])
+    for tok, pf in mapping.items():
+        raw = re.sub(r"\{\s*" + re.escape(tok) + r"\s*\}", lambda _m, _pf=pf: _pf,
+                     raw, flags=re.IGNORECASE)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return design or []
 
 
 async def _platform_setting_get(key):
@@ -6419,8 +6452,18 @@ async def _pf_platform_fallback(feature):
     ch = str(val.get("channel_id") or "")
     if not ch:
         return False
+    # Use the OWNER'S designed message (converted to form tokens); only fall back
+    # to the built-in template if they haven't designed one / it has no fields.
+    design = None
+    components = val.get("components")
+    if isinstance(components, list) and components:
+        converted = _extras_design_to_pf(feature, components)
+        if _pf_inputs(converted):
+            design = converted
+    if design is None:
+        design = [dict(c) for c in (_PF_BUILTIN_DESIGN.get(feature) or [])]
     prompt_forms_config[feature] = {
-        "design": [dict(c) for c in (_PF_BUILTIN_DESIGN.get(feature) or [])],
+        "design": design,
         "channel_id": ch,
         "title": _PF_TITLES.get(feature) or "Submit",
     }
