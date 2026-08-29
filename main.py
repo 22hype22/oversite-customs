@@ -6648,6 +6648,29 @@ async def _pf_submit(interaction, feature, form_num=1):
     for i in range(total):
         files.extend(pend["files"].get(i, []))
     ch = await resolve_channel(pend.get("channel_id"))
+
+    # Blacklist: fill the auto tokens (nickname / @ / Roblox link) from the
+    # chosen member. The Roblox lookup hits the network, so defer first.
+    member_id = pend.get("blacklist_member_id")
+    if member_id:
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except Exception:
+            pass
+        member = interaction.guild.get_member(int(member_id)) if interaction.guild else None
+        roblox_url = await _bl_roblox_url(member) if member else ""
+        design = _bl_auto_fill(design, member, roblox_url)
+        if not ch:
+            return await interaction.followup.send("Couldn't find the blacklist channel.", ephemeral=True)
+        await send_v2_message(ch, _pf_render(design, interaction.user.id, answers),
+                              allowed_mentions={"parse": []})
+        if files:
+            try:
+                await _post_form_files(ch, files)
+            except Exception as e:
+                print(f"[PromptForm] file post failed: {e}")
+        return await interaction.followup.send("Blacklist entry logged.", ephemeral=True)
+
     if not ch:
         return await interaction.response.send_message("Couldn't find the destination channel.", ephemeral=True)
     await interaction.response.send_message("Submitted. Our team will look into it!", ephemeral=True)
@@ -6882,47 +6905,78 @@ async def freerelease_cmd(interaction: discord.Interaction):
 # `/blacklist` posts the log message designed in the dashboard, filling tokens
 # from the command's user + reason arguments.
 blacklist_config = {"design": [], "channel_id": ""}
-_BL_TOKEN_RE = re.compile(r"\{(user|reason|moderator|mod|staff|id|username)\}", re.IGNORECASE)
+
+# Auto tokens the moderator does NOT type — the bot fills them from the chosen
+# member: {username} -> server nickname, {discord} -> @mention,
+# {roblox} / {roblox profile} / {roblox group} -> a View Profile link built from
+# their verified Roblox id. Everything else uses the {Question:} form tokens.
+_BL_USERNAME_RE = re.compile(r"\{\s*username\s*\}", re.IGNORECASE)
+_BL_DISCORD_RE = re.compile(r"\{\s*discord\s*\}", re.IGNORECASE)
+_BL_ROBLOX_RE = re.compile(r"\{\s*roblox(?:\s+profile|\s+group)?\s*\}", re.IGNORECASE)
 
 
-def _bl_render(design, target, moderator, reason):
+def _bl_auto_fill(design, member, roblox_url):
     raw = json.dumps(design or [])
+    nickname = member.display_name if member else ""
+    mention = member.mention if member else ""
+    profile = f"[View Profile]({roblox_url})" if roblox_url else "Not verified"
 
-    def repl(m):
-        k = m.group(1).lower()
-        if k == "user":
-            out = target.mention
-        elif k in ("moderator", "mod", "staff"):
-            out = moderator.mention
-        elif k == "reason":
-            out = reason or "—"
-        elif k == "id":
-            out = str(target.id)
-        elif k == "username":
-            out = target.display_name
-        else:
-            out = ""
-        return json.dumps(str(out))[1:-1]
+    def esc(v):
+        return json.dumps(str(v))[1:-1]
 
-    return json.loads(_BL_TOKEN_RE.sub(repl, raw))
+    raw = _BL_USERNAME_RE.sub(lambda m: esc(nickname), raw)
+    raw = _BL_DISCORD_RE.sub(lambda m: esc(mention), raw)
+    raw = _BL_ROBLOX_RE.sub(lambda m: esc(profile), raw)
+    try:
+        return json.loads(raw)
+    except Exception:
+        return design or []
+
+
+async def _bl_roblox_url(member):
+    """The target's Roblox profile URL from their verification, or '' if none."""
+    if not member:
+        return ""
+    try:
+        res = await _robux_locker_call("roblox_by_discord", discord_user_id=str(member.id))
+        rid = (res or {}).get("roblox_id")
+        if rid:
+            return f"https://www.roblox.com/users/{rid}/profile"
+    except Exception as e:
+        print(f"[Blacklist] roblox lookup failed: {e}")
+    return ""
 
 
 @bot.tree.command(name="blacklist", description="Log a blacklist entry")
-@app_commands.describe(user="The member to blacklist", reason="Why they're being blacklisted")
-async def blacklist_cmd(interaction: discord.Interaction, user: discord.Member, reason: str = "No reason provided"):
+@app_commands.describe(user="The member to blacklist")
+async def blacklist_cmd(interaction: discord.Interaction, user: discord.Member):
     if not interaction.guild:
         return await interaction.response.send_message("Use this in a server.", ephemeral=True)
     if not interaction.user.guild_permissions.manage_guild:
         return await interaction.response.send_message("You need Manage Server to blacklist.", ephemeral=True)
-    if not blacklist_config.get("channel_id") or not blacklist_config.get("design"):
+    design = blacklist_config.get("design") or []
+    channel_id = blacklist_config.get("channel_id")
+    if not channel_id or not design:
         return await interaction.response.send_message(
             "Blacklist logging isn't set up in the dashboard yet.", ephemeral=True)
-    ch = await resolve_channel(blacklist_config["channel_id"])
-    if not ch:
-        return await interaction.response.send_message("The blacklist log channel wasn't found.", ephemeral=True)
-    out = _bl_render(blacklist_config["design"], user, interaction.user, reason)
-    await send_v2_message(ch, out, allowed_mentions={"parse": []})
-    await interaction.response.send_message(f"✅ Logged a blacklist entry for {user.mention}.", ephemeral=True)
+    inputs = _pf_inputs(design)
+    if not inputs:
+        # No questions to ask — resolve auto tokens and post immediately.
+        await interaction.response.defer(ephemeral=True)
+        roblox_url = await _bl_roblox_url(user)
+        ch = await resolve_channel(channel_id)
+        if not ch:
+            return await interaction.followup.send("The blacklist log channel wasn't found.", ephemeral=True)
+        out = _pf_render(_bl_auto_fill(design, user, roblox_url), interaction.user.id, [])
+        await send_v2_message(ch, out, allowed_mentions={"parse": []})
+        return await interaction.followup.send(f"Logged a blacklist entry for {user.mention}.", ephemeral=True)
+    # Ask the form questions; the auto tokens resolve from `user` at submit time.
+    _pf_pending[("customs-blacklist", interaction.user.id)] = {
+        "design": design, "title": "Blacklist", "channel_id": channel_id,
+        "answers": {}, "files": {}, "blacklist_member_id": user.id,
+    }
+    first = next(iter(_pf_forms(design)), 1)
+    await _pf_open_modal(interaction, "customs-blacklist", design, "Blacklist", first)
 
 
 # ===================== Automated package announcements =====================
