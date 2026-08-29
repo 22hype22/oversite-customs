@@ -6313,9 +6313,12 @@ async def _pf_open_modal(interaction, feature, design, title):
         cid = f"p{idx}"
         if t["kind"] == "file":
             label = _clean_label(t["content"]) or "File"
-            # Optional: a submitter may not have a file to attach.
+            # Optional: a submitter may not have a file to attach. Discord defaults
+            # `required` to True, and required + min_values:0 is rejected — so make
+            # it explicitly not required to match min_values:0.
             components.append({"type": 18, "label": label[:45],
-                               "component": {"type": 19, "custom_id": cid, "min_values": 0, "max_values": 5}})
+                               "component": {"type": 19, "custom_id": cid, "required": False,
+                                             "min_values": 0, "max_values": 5}})
         elif t["kind"] == "dropdown":
             name, opts = _pf_dropdown_parts(t["content"])
             seen, options = set(), []
@@ -6345,8 +6348,9 @@ async def _pf_open_modal(interaction, feature, design, title):
         print(f"[PromptForm] modal open failed for {feature}: {e}")
         try:
             await interaction.response.send_message(
-                "Couldn't open the form — an admin should double-check the form design "
-                "(each dropdown option must be unique).", ephemeral=True)
+                "Couldn't open the form right now — please try again in a moment. "
+                "If it keeps happening, an admin should re-check the form design.",
+                ephemeral=True)
         except Exception:
             pass
 
