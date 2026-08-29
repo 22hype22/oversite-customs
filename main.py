@@ -8897,6 +8897,37 @@ async def handle_post(channel, payload):
             await channel.send(extra)
 
 
+async def _resync_ticket_support_perms(config):
+    """Grant the configured 'global support roles' view access on EVERY existing
+    open ticket channel. Discord applies permission overwrites only at channel
+    creation, so a support role added after some tickets already exist wouldn't
+    be able to see those older tickets without this. Only touches a channel when
+    the overwrite is actually missing, so it's cheap once everything is in sync."""
+    role_ids = [str(x) for x in (config.get("support_role_ids") or []) if x]
+    if not role_ids:
+        return
+    updated = 0
+    for guild in list(bot.guilds):
+        roles = [r for r in (guild.get_role(int(rid)) for rid in role_ids) if r]
+        if not roles:
+            continue
+        for ch in list(getattr(guild, "text_channels", [])):
+            topic = getattr(ch, "topic", "") or ""
+            if not topic.startswith("ticket|"):
+                continue
+            for role in roles:
+                try:
+                    ow = ch.overwrites_for(role)
+                    if ow.view_channel is not True:
+                        await ch.set_permissions(role, view_channel=True, send_messages=True,
+                                                 reason="Sync global support role access")
+                        updated += 1
+                except Exception as e:
+                    print(f"[Tickets] perm sync failed on #{getattr(ch, 'name', ch.id)}: {e}")
+    if updated:
+        print(f"[Tickets] synced support-role access on {updated} ticket/role pair(s)")
+
+
 async def resolve_channel(channel_id):
     if not channel_id:
         return None
@@ -8946,6 +8977,10 @@ async def apply_config(feature, cfg, post_panel=False):
         ticket_config["panel_components"] = edited_panel.get("components", [])
         _ticket_sources["tickets"] = {"panels": panels, "types": _parse_ticket_types(cfg)}
         _rebuild_ticket_registry()
+        # Make sure the (possibly newly-added) support roles can see tickets that
+        # already exist, not just future ones. Runs in the background so it never
+        # blocks config apply / boot.
+        asyncio.create_task(_resync_ticket_support_perms(ticket_config))
         print(f"[Config] tickets — category {ticket_config['category_id']} roles {ticket_config['support_role_ids']} panel_ch {ticket_config['panel_channel_id']} panel {len(ticket_config['panel_components'])} types {len(ticket_config['types'])}")
         # Post/refresh ONLY the panel being edited on a save (not on boot, and
         # not the other panels — those stay put).
