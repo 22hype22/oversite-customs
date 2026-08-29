@@ -6657,7 +6657,11 @@ async def _pf_submit(interaction, feature, form_num=1):
         except Exception:
             pass
         member = interaction.guild.get_member(int(member_id)) if interaction.guild else None
-        roblox_url = await _bl_roblox_url(member) if member else ""
+        rid = await _bl_roblox_id(member) if member else ""
+        roblox_url = _bl_roblox_url_from_id(rid)
+        if rid and member:
+            _bl_mark_roblox(member.guild.id, rid, member.id)
+            await _bl_save_saved()
         design = _bl_auto_fill(design, member, roblox_url)
         if not ch:
             return await interaction.followup.send("Couldn't find the blacklist channel.", ephemeral=True)
@@ -6909,7 +6913,20 @@ blacklist_config = {"design": [], "channel_id": "", "apply_role": False, "role_i
 # Roles removed when a member was blacklisted, so /unblacklist can restore them.
 # guild_id(str) -> { user_id(str): [role_id(str), ...] }. Persisted to bot_config.
 blacklist_saved = {}
+# Blacklisted Roblox accounts, so a ban-evader who links the same Roblox to a
+# new Discord gets the blacklist role at verify time.
+# guild_id(str) -> { roblox_id(str): discord_id(str) }.
+blacklist_roblox = {}
 _bl_saved_loaded = False
+
+
+def _bl_mark_roblox(guild_id, roblox_id, discord_id):
+    if roblox_id:
+        blacklist_roblox.setdefault(str(guild_id), {})[str(roblox_id)] = str(discord_id)
+
+
+def _bl_is_roblox_blacklisted(guild_id, roblox_id):
+    return bool(roblox_id) and str(roblox_id) in (blacklist_roblox.get(str(guild_id)) or {})
 
 
 async def _bl_load_saved():
@@ -6923,16 +6940,23 @@ async def _bl_load_saved():
         for gid, users in g.items():
             if isinstance(users, dict):
                 blacklist_saved[str(gid)] = {str(u): [str(x) for x in (v or [])] for u, v in users.items()}
+    rb = (cfg or {}).get("roblox")
+    if isinstance(rb, dict):
+        for gid, ids in rb.items():
+            if isinstance(ids, dict):
+                blacklist_roblox[str(gid)] = {str(k): str(v) for k, v in ids.items()}
     _bl_saved_loaded = True
     n = sum(len(u) for u in blacklist_saved.values())
-    print(f"[Blacklist] restored {n} saved role set(s)")
+    nr = sum(len(u) for u in blacklist_roblox.values())
+    print(f"[Blacklist] restored {n} saved role set(s), {nr} blacklisted Roblox account(s)")
 
 
 async def _bl_save_saved():
     if not _bl_saved_loaded:
         return
     try:
-        await _bot_config_upsert("blacklist-data", {"guilds": blacklist_saved})
+        await _bot_config_upsert("blacklist-data",
+                                 {"guilds": blacklist_saved, "roblox": blacklist_roblox})
     except Exception as e:
         print(f"[Blacklist] saved-roles save failed: {e}")
 
@@ -6997,18 +7021,26 @@ async def _bl_apply_punishment(member):
         return " (couldn't change their roles)"
 
 
-async def _bl_roblox_url(member):
-    """The target's Roblox profile URL from their verification, or '' if none."""
+async def _bl_roblox_id(member):
+    """The target's linked Roblox user id from their verification, or '' if none."""
     if not member:
         return ""
     try:
         res = await _robux_locker_call("roblox_by_discord", discord_user_id=str(member.id))
         rid = (res or {}).get("roblox_id")
-        if rid:
-            return f"https://www.roblox.com/users/{rid}/profile"
+        return str(rid) if rid else ""
     except Exception as e:
         print(f"[Blacklist] roblox lookup failed: {e}")
     return ""
+
+
+def _bl_roblox_url_from_id(rid):
+    return f"https://www.roblox.com/users/{rid}/profile" if rid else ""
+
+
+async def _bl_roblox_url(member):
+    """The target's Roblox profile URL from their verification, or '' if none."""
+    return _bl_roblox_url_from_id(await _bl_roblox_id(member))
 
 
 @bot.tree.command(name="blacklist", description="Log a blacklist entry")
@@ -7027,7 +7059,11 @@ async def blacklist_cmd(interaction: discord.Interaction, user: discord.Member):
     if not inputs:
         # No questions to ask — resolve auto tokens and post immediately.
         await interaction.response.defer(ephemeral=True)
-        roblox_url = await _bl_roblox_url(user)
+        rid = await _bl_roblox_id(user)
+        roblox_url = _bl_roblox_url_from_id(rid)
+        if rid:
+            _bl_mark_roblox(interaction.guild.id, rid, user.id)
+            await _bl_save_saved()
         ch = await resolve_channel(channel_id)
         if not ch:
             return await interaction.followup.send("The blacklist log channel wasn't found.", ephemeral=True)
@@ -7085,9 +7121,25 @@ async def unblacklist_cmd(interaction: discord.Interaction, user: discord.Member
             except Exception as e:
                 print(f"[Blacklist] restore roles failed: {e}")
                 notes.append("couldn't restore some roles")
-        await _bl_save_saved()
     else:
         notes.append("no saved roles on file to restore")
+
+    # 3) Clear their Roblox account from the blacklist so re-verifying is clean.
+    rid = await _bl_roblox_id(user)
+    rmap = blacklist_roblox.get(str(guild.id)) or {}
+    removed_rb = False
+    if rid and rid in rmap:
+        rmap.pop(rid, None)
+        removed_rb = True
+    else:
+        # Fall back to clearing by the linked discord id if the roblox lookup failed.
+        for k, v in list(rmap.items()):
+            if str(v) == str(user.id):
+                rmap.pop(k, None)
+                removed_rb = True
+    await _bl_save_saved()
+    if removed_rb:
+        notes.append("cleared Roblox blacklist")
 
     tail = (" — " + ", ".join(notes)) if notes else ""
     await interaction.followup.send(f"Unblacklisted {user.mention}{tail}.", ephemeral=True)
@@ -12223,6 +12275,26 @@ async def apply_roblox_verification(payload):
         except Exception as e:
             notes.append(f"• Couldn't remove roles, {e}")
             print(f"[Verify] remove roles failed: {e}")
+
+    # Ban-evasion guard: if this Roblox account was blacklisted, apply the
+    # blacklist role to whatever (possibly brand-new) Discord account linked it.
+    try:
+        rid = str(payload.get("roblox_id") or "") or await _bl_roblox_id(member)
+        if (rid and _bl_is_roblox_blacklisted(guild.id, rid)
+                and blacklist_config.get("apply_role")):
+            extra = await _bl_apply_punishment(member)
+            print(f"[Blacklist] verify-time enforcement on {member} (roblox {rid}){extra}")
+            bch = await resolve_channel(blacklist_config.get("channel_id"))
+            if bch:
+                try:
+                    await bch.send(embed=error_embed(
+                        "Blacklisted account re-verified",
+                        f"{member.mention} verified a **blacklisted Roblox account** "
+                        f"([profile]({_bl_roblox_url_from_id(rid)})) — blacklist role applied."))
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"[Blacklist] verify enforcement failed: {e}")
 
     # Report the outcome to the log channel so the owner can see it in Discord.
     log_id = str(roblox_config.get("log_channel_id") or "").strip()
