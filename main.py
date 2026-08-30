@@ -2,6 +2,7 @@ import os
 import io
 import re
 import json
+import tempfile
 import hashlib
 import signal
 import asyncio
@@ -13126,6 +13127,21 @@ def get_player(guild):
     return guild.voice_client
 
 
+async def _ensure_wl_player(guild, channel):
+    """Music needs a wavelink Player. If the guild's current voice client is the
+    native TTS VoiceClient, replace it; otherwise reuse/connect as usual."""
+    vc = guild.voice_client
+    if vc is not None and wavelink is not None and not isinstance(vc, wavelink.Player):
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+        vc = None
+    if not vc:
+        vc = await channel.connect(cls=wavelink.Player)
+    return vc
+
+
 def is_dj(member: discord.Member) -> bool:
     """DJ = Administrator, or a configured DJ role. No DJ roles set = everyone."""
     try:
@@ -14335,17 +14351,73 @@ def _gtts_chunks(text, limit=200):
     return chunks or [(text or "")[:limit]]
 
 
-async def _gtts_clip(text):
-    """Fetch Google Translate TTS (the reference bot's default voice), stitch the
-    chunks into one MP3, and serve it via the DJ clip server for Lavalink."""
-    if not DJ_PUBLIC_URL:
-        return None
+# TTS is played NATIVELY (discord.py VoiceClient + FFmpeg) with locally
+# synthesized audio — the architecture of the reference TTS bot (Serenity +
+# Songbird, no Lavalink): synthesize an mp3, play the bytes through the
+# library's own voice stack. No external audio server to drop.
+_TTS_TMP_DIR = os.path.join(tempfile.gettempdir(), "oversite_tts")
+
+# Edge-TTS voices matched to the old gTTS "accent" setting, overridable via env.
+_TTS_EDGE_VOICES = {
+    "co.uk": "en-GB-SoniaNeural", "com": "en-US-JennyNeural",
+    "com.au": "en-AU-NatashaNeural", "ca": "en-CA-ClaraNeural",
+    "ie": "en-IE-EmilyNeural", "co.in": "en-IN-NeerjaNeural",
+}
+TTS_EDGE_VOICE = os.getenv("TTS_EDGE_VOICE", "")
+
+
+def _tts_edge_voice():
+    return TTS_EDGE_VOICE or _TTS_EDGE_VOICES.get(tts_config["accent"], "en-GB-SoniaNeural")
+
+
+def _tts_edge_rate():
+    """tts speed (e.g. 1.15) -> edge-tts rate string ('+15%')."""
+    pct = int(round((float(tts_config["speed"]) - 1.0) * 100))
+    return f"{'+' if pct >= 0 else ''}{pct}%"
+
+
+async def _tts_synth(text):
+    """Synthesize `text` to a local mp3 and return its path (None on failure).
+    ElevenLabs when configured, else edge-tts (free, no key), else the raw
+    Google Translate TTS endpoint as a last resort."""
+    os.makedirs(_TTS_TMP_DIR, exist_ok=True)
     import uuid
+    path = os.path.join(_TTS_TMP_DIR, f"{uuid.uuid4().hex}.mp3")
+
+    if tts_config["engine"] == "eleven" and ELEVEN_API_KEY and tts_config["voice_id"]:
+        try:
+            voice_settings = {"stability": 0.5, "similarity_boost": 0.8,
+                              "speed": max(0.7, min(1.2, float(TTS_SPEED)))}
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    f"https://api.elevenlabs.io/v1/text-to-speech/{tts_config['voice_id']}",
+                    headers={"xi-api-key": ELEVEN_API_KEY},
+                    json={"text": text[:400], "model_id": "eleven_multilingual_v2",
+                          "voice_settings": voice_settings},
+                    timeout=30,
+                )
+            if r.status_code == 200 and r.content:
+                with open(path, "wb") as f:
+                    f.write(r.content)
+                return path
+            print(f"[TTS] elevenlabs HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[TTS] elevenlabs failed: {e}")
+
+    try:
+        import edge_tts
+        await edge_tts.Communicate(text[:600], _tts_edge_voice(), rate=_tts_edge_rate()).save(path)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+    except Exception as e:
+        print(f"[TTS] edge-tts failed: {e}")
+
+    # Last resort: raw Google Translate TTS chunks stitched into one file.
     import urllib.parse
     data = b""
     try:
         async with httpx.AsyncClient() as client:
-            for ch in _gtts_chunks(text, 200):
+            for ch in _gtts_chunks(text[:600], 200):
                 url = (f"https://translate.google.{tts_config['accent']}/translate_tts?ie=UTF-8&client=tw-ob"
                        f"&tl={urllib.parse.quote(TTS_LANG)}&q={urllib.parse.quote(ch)}")
                 r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
@@ -14353,20 +14425,12 @@ async def _gtts_clip(text):
                     data += r.content
     except Exception as e:
         print(f"[TTS] gTTS fetch failed: {e}")
-        return None
     if not data:
         return None
     try:
-        os.makedirs(_dj_clip_dir, exist_ok=True)
-        name = f"{uuid.uuid4().hex}.mp3"
-        with open(os.path.join(_dj_clip_dir, name), "wb") as f:
+        with open(path, "wb") as f:
             f.write(data)
-        for old in sorted(os.listdir(_dj_clip_dir))[:-30]:
-            try:
-                os.remove(os.path.join(_dj_clip_dir, old))
-            except Exception:
-                pass
-        return f"{DJ_PUBLIC_URL}/dj/{name}"
+        return path
     except Exception as e:
         print(f"[TTS] gTTS save failed: {e}")
         return None
@@ -14494,73 +14558,68 @@ def _tts_format(message):
     return text
 
 
-async def _tts_track(text):
-    import wavelink as _wl
-    import urllib.parse
-    if tts_config["engine"] == "eleven":
-        url = await _dj_make_clip(text[:400], voice_id=tts_config["voice_id"], speed=TTS_SPEED)
-        if not url:
-            return None
-        try:
-            res = await _wl.Playable.search(url, source=None)
-            return res[0] if res else None
-        except Exception as e:
-            print(f"[TTS] search failed: {e}")
-            return None
-    # gTTS: for a short line, let Lavalink fetch Google DIRECTLY (one hop, much
-    # faster) — only fall back to fetch+stitch+serve for long text or on failure.
-    t = text[:600]
-    if len(t) <= 200:
-        direct = (f"https://translate.google.{tts_config['accent']}/translate_tts?ie=UTF-8&client=tw-ob"
-                  f"&tl={urllib.parse.quote(TTS_LANG)}&q={urllib.parse.quote(t)}")
-        try:
-            res = await _wl.Playable.search(direct, source=None)
-            if res:
-                return res[0]
-        except Exception as e:
-            print(f"[TTS] direct gtts failed: {e}")
-    url = await _gtts_clip(t)
-    if not url:
+def _tts_ffmpeg_options(path):
+    """FFmpeg options for a synthesized clip. edge-tts bakes the speed into the
+    audio; the gTTS/ElevenLabs fallbacks get an atempo filter instead."""
+    speed = max(0.5, min(2.0, float(tts_config["speed"])))
+    # Heuristic: edge-tts output already carries the rate — only the fallback
+    # engines need speeding up. gTTS files come from the stitched fetch.
+    if tts_config["engine"] == "eleven" or abs(speed - 1.0) < 0.01:
         return None
-    try:
-        res = await _wl.Playable.search(url, source=None)
-        return res[0] if res else None
-    except Exception as e:
-        print(f"[TTS] search failed: {e}")
-        return None
+    return f'-filter:a "atempo={speed:.2f}"'
 
 
 async def _tts_play_next(vc):
-    """Play the next queued TTS clip, or go idle when the queue is empty."""
+    """Play the next queued TTS clip (a local mp3 path) natively, or go idle."""
     gid = vc.guild.id
     q = _tts_queue.get(gid) or []
     if not q:
         _tts_busy[gid] = False
         return
-    track = q.pop(0)
+    path = q.pop(0)
     _tts_busy[gid] = True
+
+    def _after(err):
+        if err:
+            print(f"[TTS] playback error: {err}")
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        try:
+            asyncio.run_coroutine_threadsafe(_tts_play_next(vc), bot.loop)
+        except Exception as e:
+            print(f"[TTS] next-clip schedule failed: {e}")
+
     try:
-        await vc.play(track)
+        opts = _tts_ffmpeg_options(path)
+        src = discord.FFmpegOpusAudio(path, options=opts) if opts else discord.FFmpegOpusAudio(path)
+        vc.play(src, after=_after)
     except Exception as e:
         print(f"[TTS] play failed: {e}")
+        try:
+            os.remove(path)
+        except Exception:
+            pass
         await _tts_play_next(vc)
 
 
 async def _tts_handle(message):
-    """A message was sent in a joined VC's chat — speak it."""
+    """A message was sent in a joined VC's chat — synthesize locally and speak it
+    through the native voice connection."""
     gid = message.guild.id
     vc = message.guild.voice_client
-    if not vc:
+    if not vc or not vc.is_connected():
         _tts_channels.pop(gid, None)
         return
     text = _tts_format(message)
     if not text:
         return
-    track = await _tts_track(text)
-    if not track:
+    path = await _tts_synth(text)
+    if not path:
         return
-    _tts_queue.setdefault(gid, []).append(track)
-    if not _tts_busy.get(gid):
+    _tts_queue.setdefault(gid, []).append(path)
+    if not _tts_busy.get(gid) and not vc.is_playing():
         await _tts_play_next(vc)
 
 
@@ -15133,9 +15192,7 @@ async def _resume_one_guild(gid, st):
     if not track:
         print(f"[Music] resume: couldn't re-resolve '{st.get('track_title','?')}' in {gid}")
         return
-    vc = guild.voice_client
-    if not vc:
-        vc = await vch.connect(cls=wavelink.Player)
+    vc = await _ensure_wl_player(guild, vch)
     tch_id = st.get("text_channel_id")
     if tch_id:
         try:
@@ -15213,32 +15270,29 @@ async def join_cmd(interaction: discord.Interaction):
         return
     ch = interaction.user.voice.channel
     await interaction.response.defer(ephemeral=True)
-    import wavelink as _wl
     gid = interaction.guild.id
-    # TTS plays through Lavalink — if the node dropped, reconnect before joining
-    # (public nodes go down often). Give a clear message if it can't recover.
-    if not await _wl_ensure_ready():
-        await interaction.followup.send(embed=error_embed(
-            "Voice server unavailable",
-            "The voice backend just dropped and is reconnecting — try `/join` again in a few seconds."),
-            ephemeral=True)
-        return
+    # TTS plays NATIVELY (no Lavalink) — synthesize locally, play through the
+    # bot's own voice connection. Nothing external to be "down".
     vc = interaction.guild.voice_client
     try:
+        # A leftover music (wavelink) player can't play native sources — replace
+        # it with a plain VoiceClient.
+        if vc and not isinstance(vc, discord.VoiceClient):
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+            vc = None
         if vc and vc.channel and vc.channel.id != ch.id:
             await vc.move_to(ch)
         elif not vc:
-            vc = await ch.connect(cls=_wl.Player)
+            vc = await ch.connect(self_deaf=True)
     except Exception as e:
         await interaction.followup.send(embed=error_embed("Couldn't join", str(e)[:200]), ephemeral=True)
         return
     # Override music: stop playback, drop its queue and any auto/DJ session.
     try:
-        vc.queue.clear()
-    except Exception:
-        pass
-    try:
-        await vc.stop()
+        vc.stop()
     except Exception:
         pass
     auto_music_sessions.pop(gid, None)
@@ -15248,7 +15302,6 @@ async def join_cmd(interaction: discord.Interaction):
     _tts_queue[gid] = []
     _tts_busy[gid] = False
     _tts_announce.pop(gid, None)
-    await _tts_set_speed(vc, tts_config["speed"])
     body = (tts_config.get("join_message") or "").strip()
     if body:
         body = body.replace("{channel}", ch.mention).replace("{user}", interaction.user.mention)
@@ -15339,9 +15392,7 @@ async def music_play(interaction: discord.Interaction, query: str):
     if not music_config.get("everyone_can_queue", True) and not is_dj(interaction.user):
         await interaction.followup.send(embed=error_embed("DJ only", "Only a DJ can add songs right now."))
         return
-    vc = get_player(interaction.guild)
-    if not vc:
-        vc = await interaction.user.voice.channel.connect(cls=wavelink.Player)
+    vc = await _ensure_wl_player(interaction.guild, interaction.user.voice.channel)
 
     _was_dj = interaction.guild.id in _dj_mode
     if _was_dj:
@@ -15575,9 +15626,7 @@ async def setmusic_command(interaction: discord.Interaction, genre: str):
     if not interaction.user.voice:
         await interaction.followup.send(embed=error_embed("Not in voice", "Join a voice channel first."))
         return
-    vc = get_player(interaction.guild)
-    if not vc:
-        vc = await interaction.user.voice.channel.connect(cls=wavelink.Player)
+    vc = await _ensure_wl_player(interaction.guild, interaction.user.voice.channel)
     try:
         vc.queue.clear()
     except Exception:
@@ -15657,9 +15706,7 @@ async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
             "Radio not supported here",
             "The music node this bot is connected to has direct radio streams turned off, so `/radio` can't run. `/play` and the DJ still work. To get radio back, point the bot at a node with the HTTP source enabled (your own node has it on)."))
         return
-    vc = get_player(interaction.guild)
-    if not vc:
-        vc = await interaction.user.voice.channel.connect(cls=wavelink.Player)
+    vc = await _ensure_wl_player(interaction.guild, interaction.user.voice.channel)
     station, stream_url = _radio_stream_for(genre or auto_radio_config.get("genre") or "lofi")
     results = None
     try:

@@ -1,3 +1,6 @@
-# The bot delegates all audio to a shared Lavalink node (wavelink client), so it
-# no longer needs FFmpeg / libopus / PyNaCl on the host. Nixpacks auto-detects
-# Python from requirements.txt.
+# TTS plays NATIVELY (discord.py voice + FFmpeg) with locally synthesized audio
+# — the architecture of the reference TTS bot (no external audio server for
+# TTS). Music still uses the shared Lavalink node. Native voice needs the
+# ffmpeg binary (opus encoding happens in ffmpeg) and PyNaCl (in requirements).
+[phases.setup]
+nixPkgs = ["...", "ffmpeg"]
