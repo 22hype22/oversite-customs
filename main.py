@@ -14439,16 +14439,26 @@ def _tts_edge_rate():
     return f"{'+' if pct >= 0 else ''}{pct}%"
 
 
+# The accent is carried by the LANGUAGE CODE (tl=en-AU etc). The old host-TLD
+# trick (translate.google.com.au) no longer changes the voice — com and com.au
+# return byte-identical audio; tl=en-AU / en-GB genuinely differ.
+_GTTS_ACCENT_LANG = {
+    "com.au": "en-AU", "co.uk": "en-GB", "com": "en",
+    "ca": "en-CA", "ie": "en-IE", "co.in": "en-IN",
+}
+
+
 async def _gtts_fetch(text, path):
-    """Google Translate TTS — the reference TTS bot's default voice (mode gTTS,
-    voice 'en', no speed change). Chunks >200 chars are stitched into one mp3."""
+    """Google Translate TTS — the reference TTS bot's voice (mode gTTS, no speed
+    change), accent via tl=en-AU/en-GB/…. Chunks >200 chars are stitched."""
     import urllib.parse
+    tl = _GTTS_ACCENT_LANG.get(tts_config["accent"], TTS_LANG)
     data = b""
     try:
         async with httpx.AsyncClient() as client:
             for ch in _gtts_chunks(text, 200):
-                url = (f"https://translate.google.{tts_config['accent']}/translate_tts?ie=UTF-8&client=tw-ob"
-                       f"&tl={urllib.parse.quote(TTS_LANG)}&q={urllib.parse.quote(ch)}")
+                url = (f"https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob"
+                       f"&tl={urllib.parse.quote(tl)}&q={urllib.parse.quote(ch)}")
                 r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
                 if r.status_code == 200 and r.content:
                     data += r.content
