@@ -15195,6 +15195,7 @@ class NativeTrack:
         self.is_stream = bool(is_stream)
         self.user_agent = user_agent or ""
         self.view_count = 0
+        self.protocol = ""
         self.identifier = self.uri
         self.source = "native"
 
@@ -15203,7 +15204,7 @@ class NativeTrack:
 
 
 _YTDLP_BASE = {
-    "format": "bestaudio[acodec=opus]/bestaudio/best",
+    "format": "bestaudio[protocol^=http][acodec=opus]/bestaudio[protocol^=http]/bestaudio/best",
     "quiet": True, "no_warnings": True, "noprogress": True,
     "nocheckcertificate": True, "socket_timeout": 15,
     "skip_download": True, "ignoreerrors": True,
@@ -15225,6 +15226,7 @@ def _nt_from_info(info):
         user_agent=(info.get("http_headers") or {}).get("User-Agent", ""),
     )
     t.view_count = int(info.get("view_count") or 0)
+    t.protocol = str(info.get("protocol") or "")
     return t
 
 
@@ -15325,6 +15327,13 @@ async def _music_download(track):
                                 raise RuntimeError("too large")
                             f.write(chunk)
             if size > 0:
+                with open(path, "rb") as f:
+                    head = f.read(16)
+                if head.startswith(b"#EXTM3U"):
+                    # HLS playlist slipped through — mark it so play() streams it.
+                    track.protocol = "m3u8"
+                    os.remove(path)
+                    return None
                 return path
         except Exception as e:
             print(f"[Music] download failed (try {attempt}): {e}")
@@ -15398,8 +15407,8 @@ class NativePlayer(discord.VoiceClient):
         opts = "-vn" + (f" -filter:a volume={vol / 100:.2f}" if vol != 100 else "")
         local_path = None
         try:
-            if track.is_stream:
-                # Live radio: stream through ffmpeg with reconnect flags.
+            if track.is_stream or "m3u8" in (track.protocol or "") or "hls" in (track.protocol or ""):
+                # Live radio + HLS playlists: stream through ffmpeg directly.
                 before = _FFMPEG_BEFORE_STREAM
                 if track.user_agent:
                     before += f' -user_agent "{track.user_agent.replace(chr(34), "")}"'
@@ -15887,13 +15896,20 @@ async def music_play(interaction: discord.Interaction, query: str):
         return
     if isinstance(tracks, wavelink.Playlist):
         tracks = tracks.tracks
-    # Pick the MOST PLAYED result (highest view count); fall back to the
-    # fuzzy title match when no counts are available.
-    counted = [t for t in tracks if getattr(t, "view_count", 0) > 0]
-    if counted:
-        track = max(counted, key=lambda t: t.view_count)
-    else:
-        track = best_track(tracks, query) or tracks[0]
+    # Pick the version people actually play: filter to results that MATCH the
+    # query as well as the best textual match (keeps the real artist, drops
+    # rips/covers), then take the most played among them.
+    top = best_track(tracks, query) or tracks[0]
+    try:
+        q_words = set(query.lower().split())
+        def _overlap(t):
+            words = set(t.title.lower().split()) | set((t.author or "").lower().split())
+            return len(q_words & words)
+        base = _overlap(top)
+        peers = [t for t in tracks if _overlap(t) >= max(1, base) and getattr(t, "view_count", 0) > 0]
+        track = max(peers, key=lambda t: t.view_count) if peers else top
+    except Exception:
+        track = top
     _adjust_taste(interaction.guild.id, getattr(track, "author", None), 3.0)
     was_playing = vc.playing
     await vc.queue.put_wait(track)
