@@ -14363,9 +14363,9 @@ TTS_LANG = os.getenv("TTS_LANG", "en")
 # (com.au) — hardcoded default; co.uk = British, com = US, ca = Canadian,
 # ie = Irish, co.in = Indian remain available via env or the dashboard block.
 TTS_TLD = os.getenv("TTS_TLD", "com.au")
-# Playback speed (1.0 = normal). The reference TTS bot plays gTTS with NO speed
-# change, so 1.0 matches it exactly.
-TTS_PLAYBACK_SPEED = float(os.getenv("TTS_PLAYBACK_SPEED", "1.0"))
+# Playback speed (1.0 = normal). Sped up via an ffmpeg atempo filter — the raw
+# Google voice reads slowly.
+TTS_PLAYBACK_SPEED = float(os.getenv("TTS_PLAYBACK_SPEED", "1.25"))
 
 # Live TTS settings, overridable from the dashboard "Text-to-Speech" block.
 tts_config = {
