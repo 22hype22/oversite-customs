@@ -7021,7 +7021,14 @@ async def _frel_form_submit(interaction, key):
     pref = await _frel_stash_file(preview[0])
     dref = await _frel_stash_file(download[0])
     rid = secrets.token_hex(6)
+    # Post in whatever channel the command was run in.
     channel = interaction.channel
+    if channel is None and interaction.channel_id:
+        channel = await resolve_channel(interaction.channel_id)
+    if channel is None:
+        return await interaction.followup.send(
+            "Couldn't tell which channel to post in — run /freerelease in the channel you want it in.",
+            ephemeral=True)
     rel = {
         "id": rid, "channel_id": str(channel.id), "guild_id": str(interaction.guild_id or ""),
         "message_id": None, "goal": goal, "title": title, "poster_id": str(interaction.user.id),
