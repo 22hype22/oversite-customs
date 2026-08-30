@@ -15226,6 +15226,54 @@ _YTDLP_BASE = {
     "extractor_args": {"youtube": {"player_client": ["android", "web", "tv"]}},
 }
 
+# Optional: YouTube cookies dodge the datacenter bot-check for good. Set
+# YTDLP_COOKIES_B64 (base64 of a Netscape cookies.txt export) on the host.
+def _ytdlp_cookiefile():
+    b64 = os.getenv("YTDLP_COOKIES_B64", "")
+    if not b64:
+        return None
+    path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+    if not os.path.exists(path):
+        try:
+            import base64
+            with open(path, "wb") as f:
+                f.write(base64.b64decode(b64))
+        except Exception as e:
+            print(f"[Music] cookie decode failed: {e}")
+            return None
+    return path
+
+
+_ck = _ytdlp_cookiefile()
+if _ck:
+    _YTDLP_BASE["cookiefile"] = _ck
+    print("[Music] YouTube cookies loaded")
+
+
+def _clean_song_query(title, author=""):
+    """'Song [Official Music Video] (4K)' -> 'Song' — for cross-source lookups."""
+    t = re.sub(r"[\[(][^\])]*[\])]", " ", title or "")
+    t = re.sub(r"\s+", " ", t).strip()
+    return f"{t} {author or ''}".strip()
+
+
+async def _resolve_stream(track):
+    """Fill track.stream_url: try its own URL (YouTube), and when that's blocked
+    by the bot-check, pull the SAME SONG's audio from SoundCloud instead."""
+    res = await _ytdlp_extract(track.uri or f"ytsearch1:{track.title} {track.author}")
+    if not res:
+        q = _clean_song_query(track.title, track.author)
+        print(f"[Music] YouTube stream blocked — trying SoundCloud for {q!r}")
+        res = await _ytdlp_extract(f"scsearch1:{q}")
+    if res:
+        track.stream_url = res[0].stream_url
+        track.user_agent = res[0].user_agent or track.user_agent
+        track.protocol = res[0].protocol or track.protocol
+        track.artwork = track.artwork or res[0].artwork
+        if res[0].length and not track.length:
+            track.length = res[0].length
+    return bool(track.stream_url)
+
 
 def _nt_from_info(info):
     if not isinstance(info, dict):
@@ -15398,10 +15446,7 @@ async def _music_download(track):
             if attempt == 1:
                 # Stream URL likely expired — re-resolve once and retry.
                 track.stream_url = None
-                res = await _ytdlp_extract(track.uri or f"ytsearch1:{track.title} {track.author}")
-                if res:
-                    track.stream_url = res[0].stream_url
-                    track.user_agent = res[0].user_agent or track.user_agent
+                await _resolve_stream(track)
     try:
         os.remove(path)
     except Exception:
@@ -15454,16 +15499,10 @@ class NativePlayer(discord.VoiceClient):
             if old is not None:
                 bot.dispatch("wavelink_track_end", _NativePayload(self, old, "replaced"))
         # Resolve (or refresh) the stream URL — flat-search tracks resolve here,
-        # and prefetched tracks already carry a local file.
+        # and prefetched tracks already carry a local file. Falls back to
+        # SoundCloud when YouTube bot-checks the host.
         if not track.stream_url and not track.local_path:
-            res = await _ytdlp_extract(track.uri or f"ytsearch1:{track.title} {track.author}")
-            if res:
-                track.stream_url = res[0].stream_url
-                track.user_agent = res[0].user_agent or track.user_agent
-                track.protocol = res[0].protocol or track.protocol
-                track.artwork = track.artwork or res[0].artwork
-                if res[0].length:
-                    track.length = res[0].length
+            await _resolve_stream(track)
         if not track.stream_url and not track.local_path:
             self.current = None
             bot.dispatch("wavelink_track_end", _NativePayload(self, track, "loadFailed"))
@@ -15531,11 +15570,7 @@ class NativePlayer(discord.VoiceClient):
             if nxt is None or nxt.is_stream or nxt.local_path:
                 return
             if not nxt.stream_url:
-                res = await _ytdlp_extract(nxt.uri or f"ytsearch1:{nxt.title} {nxt.author}")
-                if res:
-                    nxt.stream_url = res[0].stream_url
-                    nxt.user_agent = res[0].user_agent or nxt.user_agent
-                    nxt.protocol = res[0].protocol or nxt.protocol
+                await _resolve_stream(nxt)
             if nxt.stream_url and "m3u8" not in (nxt.protocol or "") and "hls" not in (nxt.protocol or ""):
                 nxt.local_path = await _music_download(nxt)
         except Exception as e:
