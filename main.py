@@ -7497,6 +7497,8 @@ ticket_autoclose_config = {"enabled": True, "warn_hours": 24, "close_hours": 24}
 # channel_id -> unix ts we posted the inactivity warning. Persisted to bot_config
 # so a redeploy doesn't forget (and re-warn) tickets it already warned.
 _ticket_warned = {}
+# Tickets exempted from the inactivity warn/close (-inactive hold). Persisted.
+_ticket_ac_hold = set()
 _ticket_ac_loaded = False
 
 
@@ -7516,15 +7518,19 @@ async def _load_ticket_autoclose():
                 _ticket_warned[str(k)] = float(v)
             except Exception:
                 pass
+    held = cfg.get("held") if isinstance(cfg, dict) else None
+    if isinstance(held, list):
+        _ticket_ac_hold.update(str(x) for x in held)
     _ticket_ac_loaded = True
-    print(f"[Ticket] autoclose state loaded — {len(_ticket_warned)} warned ticket(s)")
+    print(f"[Ticket] autoclose state loaded — {len(_ticket_warned)} warned, {len(_ticket_ac_hold)} held ticket(s)")
 
 
 async def _save_ticket_autoclose():
     if not _ticket_ac_loaded:
         return
     try:
-        await _bot_config_upsert("ticket-autoclose-state", {"warned": _ticket_warned})
+        await _bot_config_upsert("ticket-autoclose-state",
+                                 {"warned": _ticket_warned, "held": sorted(_ticket_ac_hold)})
     except Exception as e:
         print(f"[Ticket] autoclose state save failed: {e}")
 
@@ -7643,6 +7649,8 @@ async def ticket_inactivity_tick():
                 continue
             wid = str(ch.id)
             live_ids.add(wid)
+            if wid in _ticket_ac_hold:
+                continue  # -inactive hold — never warn/close this ticket
             last_ts = await _ticket_last_activity(ch)
             if last_ts is None:
                 continue  # couldn't read history this tick — retry next time
@@ -7669,9 +7677,12 @@ async def ticket_inactivity_tick():
                     await _ticket_warn_msg(ch, opener)
                 except Exception as e:
                     print(f"[Ticket] warn failed: {e}")
-    # Forget warned entries for tickets that no longer exist (closed/deleted).
+    # Forget warned/held entries for tickets that no longer exist (closed/deleted).
     for gone in [w for w in _ticket_warned if w not in live_ids]:
         _ticket_warned.pop(gone, None)
+        dirty = True
+    for gone in [w for w in _ticket_ac_hold if w not in live_ids]:
+        _ticket_ac_hold.discard(gone)
         dirty = True
     if dirty:
         await _save_ticket_autoclose()
@@ -9260,6 +9271,41 @@ async def on_message(message):
         cmd = parts[0].lower() if parts else ""
         if cmd == "-reroll":
             await _cmd_reroll(message)
+            return
+        if cmd == "-inactive":
+            topic = getattr(message.channel, "topic", "") or ""
+            if not topic.startswith("ticket|"):
+                await message.channel.send(embed=error_embed("Not a ticket", "This command only works inside a ticket channel."), delete_after=10)
+                return
+            if not _is_ticket_staff(message.author, message.channel):
+                await message.channel.send(embed=error_embed("No permission", "Only staff can change a ticket's inactivity check."), delete_after=10)
+                return
+            arg = (parts[1] if len(parts) > 1 else "").strip().lower()
+            wid = str(message.channel.id)
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            if arg in ("hold", "off", "pause", "stop"):
+                _ticket_ac_hold.add(wid)
+                _ticket_warned.pop(wid, None)  # clear a pending warning too
+                await _save_ticket_autoclose()
+                await message.channel.send(embed=success_embed(
+                    "Inactivity check held",
+                    "This ticket won't get inactivity warnings or auto-close. Run `-inactive resume` to turn it back on."))
+            elif arg in ("resume", "on", "start"):
+                _ticket_ac_hold.discard(wid)
+                await _save_ticket_autoclose()
+                await message.channel.send(embed=success_embed(
+                    "Inactivity check resumed",
+                    "This ticket is back on the normal inactivity timer."))
+            else:
+                held = wid in _ticket_ac_hold
+                await message.channel.send(embed=info_embed(
+                    "Inactivity check",
+                    f"Currently **{'held' if held else 'active'}** for this ticket.\n"
+                    "`-inactive hold` — stop inactivity warnings/auto-close here\n"
+                    "`-inactive resume` — turn them back on"), delete_after=20)
             return
         if cmd in ("-claim", "-unclaim", "-close"):
             topic = getattr(message.channel, "topic", "") or ""
