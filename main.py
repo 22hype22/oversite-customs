@@ -7347,20 +7347,42 @@ def _ui_render(design, mapping):
     return json.loads(raw)
 
 
+async def _delete_message_later(channel, message_id, delay):
+    """Delete a posted channel message after `delay` seconds (best-effort)."""
+    try:
+        await asyncio.sleep(delay)
+        msg = await channel.fetch_message(int(message_id))
+        await msg.delete()
+    except Exception:
+        pass
+
+
+async def _delete_response_later(interaction, delay):
+    """Delete an interaction's original response after `delay` seconds."""
+    try:
+        await asyncio.sleep(delay)
+        await interaction.delete_original_response()
+    except Exception:
+        pass
+
+
 async def _ui_channel_or_embed(interaction, key, mapping, title, desc,
-                               buttons=None, content=None, fallback_view=None):
+                               buttons=None, content=None, fallback_view=None,
+                               delete_after=None):
     """Respond to an interaction with the admin's designed system message for
     `key` (posted in-channel, keeping any required buttons), or fall back to the
-    built-in embed."""
+    built-in embed. delete_after removes the message after that many seconds."""
     design = _small_ui(key)
     if design:
         try:
             await interaction.response.defer()
         except Exception:
             pass
-        await send_v2_message(interaction.channel, _ui_render(design, mapping),
-                              content=content, buttons=buttons,
-                              allowed_mentions={"parse": ["users"]})
+        mid = await send_v2_message(interaction.channel, _ui_render(design, mapping),
+                                    content=content, buttons=buttons,
+                                    allowed_mentions={"parse": ["users"]})
+        if delete_after and isinstance(mid, str):
+            asyncio.create_task(_delete_message_later(interaction.channel, mid, delete_after))
     else:
         # discord.py distinguishes MISSING from None — passing view=None crashes
         # send_message, so only include it when there actually is one.
@@ -7370,6 +7392,8 @@ async def _ui_channel_or_embed(interaction, key, mapping, title, desc,
         if fallback_view is not None:
             kwargs["view"] = fallback_view
         await interaction.response.send_message(**kwargs)
+        if delete_after:
+            asyncio.create_task(_delete_response_later(interaction, delete_after))
 
 
 async def _ticket_last_activity(ch):
@@ -7963,7 +7987,8 @@ async def ticket_claim_toggle(interaction, claimed):
     title = "Order claimed" if claimed else "Order unclaimed"
     verb = "claimed" if claimed else "unclaimed"
     await _ui_channel_or_embed(interaction, key, {"user": member.mention},
-                               title, f"{member.mention} {verb} this order.")
+                               title, f"{member.mention} {verb} this order.",
+                               delete_after=6)
     await _do_claim_toggle(channel, member, claimed, msg)
 
 
@@ -8062,7 +8087,8 @@ async def _cmd_claim(message, claimed):
         return
     msg = await _find_claim_message(channel)
     verb = "claimed" if claimed else "unclaimed"
-    await channel.send(embed=info_embed(f"Order {verb}", f"{member.mention} {verb} this order."))
+    await channel.send(embed=info_embed(f"Order {verb}", f"{member.mention} {verb} this order."),
+                       delete_after=6)
     await _do_claim_toggle(channel, member, claimed, msg)
 
 
