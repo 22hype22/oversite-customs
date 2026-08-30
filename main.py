@@ -15194,6 +15194,7 @@ class NativeTrack:
         self.stream_url = stream_url
         self.is_stream = bool(is_stream)
         self.user_agent = user_agent or ""
+        self.view_count = 0
         self.identifier = self.uri
         self.source = "native"
 
@@ -15206,14 +15207,14 @@ _YTDLP_BASE = {
     "quiet": True, "no_warnings": True, "noprogress": True,
     "nocheckcertificate": True, "socket_timeout": 15,
     "skip_download": True, "ignoreerrors": True,
-    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    "extractor_args": {"youtube": {"player_client": ["android", "web", "tv"]}},
 }
 
 
 def _nt_from_info(info):
     if not isinstance(info, dict):
         return None
-    return NativeTrack(
+    t = NativeTrack(
         title=info.get("title"),
         author=info.get("uploader") or info.get("channel") or info.get("artist") or "",
         length=int((info.get("duration") or 0) * 1000),
@@ -15223,6 +15224,8 @@ def _nt_from_info(info):
         is_stream=bool(info.get("is_live")),
         user_agent=(info.get("http_headers") or {}).get("User-Agent", ""),
     )
+    t.view_count = int(info.get("view_count") or 0)
+    return t
 
 
 def _ytdlp_extract_sync(target, playlist_limit=25):
@@ -15293,6 +15296,52 @@ class _NativePayload:
 
 _FFMPEG_BEFORE_STREAM = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
 
+_MUSIC_TMP_DIR = os.path.join(tempfile.gettempdir(), "oversite_music")
+_MUSIC_MAX_BYTES = 80 * 1024 * 1024  # refuse absurdly large downloads
+
+
+async def _music_download(track):
+    """Download a track's audio to a temp file (reference-bot style: fetch the
+    bytes, play locally). Refreshes an expired stream URL once. Returns the
+    local path or None."""
+    os.makedirs(_MUSIC_TMP_DIR, exist_ok=True)
+    import uuid
+    path = os.path.join(_MUSIC_TMP_DIR, f"{uuid.uuid4().hex}.audio")
+    for attempt in (1, 2):
+        url = track.stream_url
+        if not url:
+            return None
+        headers = {"User-Agent": track.user_agent or "Mozilla/5.0"}
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
+                async with client.stream("GET", url, headers=headers) as r:
+                    if r.status_code != 200:
+                        raise RuntimeError(f"HTTP {r.status_code}")
+                    size = 0
+                    with open(path, "wb") as f:
+                        async for chunk in r.aiter_bytes(1 << 16):
+                            size += len(chunk)
+                            if size > _MUSIC_MAX_BYTES:
+                                raise RuntimeError("too large")
+                            f.write(chunk)
+            if size > 0:
+                return path
+        except Exception as e:
+            print(f"[Music] download failed (try {attempt}): {e}")
+            if attempt == 1:
+                # Stream URL likely expired — re-resolve once and retry.
+                track.stream_url = None
+                res = await _ytdlp_extract(track.uri or f"ytsearch1:{track.title} {track.author}")
+                if res:
+                    track.stream_url = res[0].stream_url
+                    track.user_agent = res[0].user_agent or track.user_agent
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+    return None
+
+
 
 class NativePlayer(discord.VoiceClient):
     """Wavelink-shaped native player: yt-dlp resolves, FFmpeg streams."""
@@ -15347,15 +15396,24 @@ class NativePlayer(discord.VoiceClient):
             return
         vol = max(0, min(200, int(self.volume or 100)))
         opts = "-vn" + (f" -filter:a volume={vol / 100:.2f}" if vol != 100 else "")
-        # Stream URLs are bound to the requesting client — send the same
-        # User-Agent yt-dlp used or YouTube's CDN answers 403.
-        before = _FFMPEG_BEFORE_STREAM
-        if track.user_agent:
-            ua = track.user_agent.replace('"', "")
-            before += f' -user_agent "{ua}"'
+        local_path = None
         try:
-            src = discord.FFmpegOpusAudio(track.stream_url, executable=_ffmpeg_exe(),
-                                          before_options=before, options=opts)
+            if track.is_stream:
+                # Live radio: stream through ffmpeg with reconnect flags.
+                before = _FFMPEG_BEFORE_STREAM
+                if track.user_agent:
+                    before += f' -user_agent "{track.user_agent.replace(chr(34), "")}"'
+                src = discord.FFmpegOpusAudio(track.stream_url, executable=_ffmpeg_exe(),
+                                              before_options=before, options=opts)
+            else:
+                # Normal track: DOWNLOAD the audio (reference-bot style), then
+                # play the local file — the proven-stable path on this host.
+                local_path = await _music_download(track)
+                if not local_path:
+                    self.current = None
+                    bot.dispatch("wavelink_track_end", _NativePayload(self, track, "loadFailed"))
+                    return
+                src = discord.FFmpegOpusAudio(local_path, executable=_ffmpeg_exe(), options=opts)
         except Exception as e:
             print(f"[Music] source build failed: {e}")
             self.current = None
@@ -15366,9 +15424,14 @@ class NativePlayer(discord.VoiceClient):
         self._pause_total = 0.0
         self._paused_at = None
 
-        def _after(err, g=gen, t=track):
+        def _after(err, g=gen, t=track, lp=local_path):
             if err:
                 print(f"[Music] playback error: {err}")
+            if lp:
+                try:
+                    os.remove(lp)
+                except Exception:
+                    pass
             if g != self._gen:
                 return  # replaced by a newer play() — its end event already fired
             def _fire():
@@ -15824,7 +15887,13 @@ async def music_play(interaction: discord.Interaction, query: str):
         return
     if isinstance(tracks, wavelink.Playlist):
         tracks = tracks.tracks
-    track = best_track(tracks, query) or tracks[0]
+    # Pick the MOST PLAYED result (highest view count); fall back to the
+    # fuzzy title match when no counts are available.
+    counted = [t for t in tracks if getattr(t, "view_count", 0) > 0]
+    if counted:
+        track = max(counted, key=lambda t: t.view_count)
+    else:
+        track = best_track(tracks, query) or tracks[0]
     _adjust_taste(interaction.guild.id, getattr(track, "author", None), 3.0)
     was_playing = vc.playing
     await vc.queue.put_wait(track)
