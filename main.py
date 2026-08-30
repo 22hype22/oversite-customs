@@ -15274,7 +15274,11 @@ async def _resolve_stream(track):
     if not res:
         q = _clean_song_query(track.title, track.author)
         print(f"[Music] YouTube stream blocked — trying SoundCloud for {q!r}")
-        res = await _ytdlp_extract(f"scsearch1:{q}")
+        # Several results: official SC uploads of big releases are often DRM
+        # protected — ignoreerrors drops those, we take the best playable one.
+        cands = await _ytdlp_extract(f"scsearch5:{q}")
+        if cands:
+            res = [best_track(cands, q) or cands[0]]
     if res:
         track.stream_url = res[0].stream_url
         track.user_agent = res[0].user_agent or track.user_agent
