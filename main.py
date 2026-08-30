@@ -6389,6 +6389,22 @@ def _pf_render(design, uid, answers):
     return json.loads(_PF_TOKEN_RE.sub(repl, raw))
 
 
+def _pf_prefill_member(design, text):
+    """Replace every {member:...} token in a design with literal `text`, so that
+    field is no longer collected in the modal. Used when we already know the
+    subject — e.g. a receipt's "Leave a Review" fills the Designer line with the
+    package they bought instead of asking them to pick a member."""
+    raw = json.dumps(design or [])
+    esc = json.dumps(str(text))[1:-1]
+
+    def repl(m):
+        if _pf_norm_kind(m.group(1)) == "member":
+            return esc
+        return m.group(0)
+
+    return json.loads(_PF_TOKEN_RE.sub(repl, raw))
+
+
 async def _pf_open_modal(interaction, feature, design, title, form_num=None):
     forms = _pf_forms(design)
     if form_num is None:
@@ -10854,11 +10870,57 @@ class _PkgReviewModal(discord.ui.Modal):
 
 
 async def _pkg_review(interaction, pkg_msg_id):
-    """Leave a Review button — open the review modal."""
+    """Leave a Review button on a receipt — open the /feedback form, with the
+    Designer field hardcoded to the package they bought (so the buyer only rates
+    and writes feedback; they don't pick a member)."""
+    feature = "customs-feedback"
+    cfg = _pf_config_for(feature)
+    # /feedback config is normally applied at boot; refresh on demand if not.
+    if not cfg.get("channel_id") or not cfg.get("design"):
+        try:
+            fresh = await fetch_config(feature)
+            if fresh:
+                await apply_config(feature, fresh)
+                cfg = _pf_config_for(feature)
+        except Exception as e:
+            print(f"[Package] feedback config refresh failed: {e}")
+        if not cfg.get("channel_id") or not cfg.get("design"):
+            try:
+                if await _pf_platform_fallback(feature):
+                    cfg = _pf_config_for(feature)
+            except Exception:
+                pass
+    design = cfg.get("design") or []
+    channel_id = cfg.get("channel_id")
+    if not design or not channel_id:
+        return await interaction.response.send_message(
+            "Reviews aren't set up yet — an admin needs to configure /feedback.", ephemeral=True)
+
+    # Hardcode the Designer (member) field to the package from the receipt.
     try:
-        await interaction.response.send_modal(_PkgReviewModal(pkg_msg_id))
-    except Exception as e:
-        print(f"[Package] review modal failed: {e}")
+        rec = await _pkg_files_get(pkg_msg_id)
+        pkg_name = str((rec or {}).get("product") or "").strip()
+    except Exception:
+        pkg_name = ""
+    if pkg_name:
+        design = _pf_prefill_member(design, pkg_name)
+
+    title = cfg.get("title") or _PF_TITLES.get(feature) or "Leave a Review"
+    inputs = _pf_inputs(design)
+    if not inputs:
+        # Nothing left to ask — post the review straight away.
+        ch = await resolve_channel(channel_id)
+        if ch:
+            await send_v2_message(ch, _pf_render(design, interaction.user.id, []),
+                                  allowed_mentions={"parse": []})
+        return await interaction.response.send_message("Thanks for your review!", ephemeral=True)
+
+    _pf_pending[(feature, interaction.user.id)] = {
+        "design": design, "title": title, "channel_id": channel_id,
+        "answers": {}, "files": {},
+    }
+    first = next(iter(_pf_forms(design)), 1)
+    await _pf_open_modal(interaction, feature, design, title, first)
 
 
 # ---------------- Advertisement claim -> approval -> posting ----------------
