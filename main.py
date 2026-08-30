@@ -13190,17 +13190,17 @@ def get_player(guild):
 
 
 async def _ensure_wl_player(guild, channel):
-    """Music needs a wavelink Player. If the guild's current voice client is the
-    native TTS VoiceClient, replace it; otherwise reuse/connect as usual."""
+    """Music needs a NativePlayer. If the guild's current voice client is the
+    plain TTS VoiceClient (or an old wavelink player), replace it."""
     vc = guild.voice_client
-    if vc is not None and wavelink is not None and not isinstance(vc, wavelink.Player):
+    if vc is not None and not isinstance(vc, NativePlayer):
         try:
             await vc.disconnect(force=True)
         except Exception:
             pass
         vc = None
     if not vc:
-        vc = await channel.connect(cls=wavelink.Player)
+        vc = await channel.connect(cls=NativePlayer)
     return vc
 
 
@@ -15169,33 +15169,256 @@ async def _probe_music_sources():
     print(f"[MusicProbe] usable search sources: {working if working else 'NONE — this node cannot search anything'}")
 
 
+# ===================== Native music engine (yt-dlp + FFmpeg) =====================
+# Music is played NATIVELY — the same architecture as TTS: resolve the audio
+# ourselves (yt-dlp), play the stream through the bot's own voice connection
+# (FFmpeg -> opus). No Lavalink node in the path, nothing external to break.
+# The player mimics the wavelink API surface this file already uses
+# (queue.put_wait/get/clear, current, playing, paused, position, play, skip,
+# pause, set_volume) and dispatches the same wavelink_track_start/track_end
+# events, so the Now Playing cards, DJ mode, and queue logic run unchanged.
+try:
+    import yt_dlp as _ytdlp
+except Exception:
+    _ytdlp = None
+
+
+class NativeTrack:
+    def __init__(self, *, title, author="", length=0, uri="", artwork=None,
+                 stream_url=None, is_stream=False, user_agent=""):
+        self.title = title or "Unknown"
+        self.author = author or ""
+        self.length = int(length or 0)   # ms
+        self.uri = uri or ""
+        self.artwork = artwork
+        self.stream_url = stream_url
+        self.is_stream = bool(is_stream)
+        self.user_agent = user_agent or ""
+        self.identifier = self.uri
+        self.source = "native"
+
+    def __repr__(self):
+        return f"<NativeTrack {self.title!r}>"
+
+
+_YTDLP_BASE = {
+    "format": "bestaudio[acodec=opus]/bestaudio/best",
+    "quiet": True, "no_warnings": True, "noprogress": True,
+    "nocheckcertificate": True, "socket_timeout": 15,
+    "skip_download": True, "ignoreerrors": True,
+    "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+}
+
+
+def _nt_from_info(info):
+    if not isinstance(info, dict):
+        return None
+    return NativeTrack(
+        title=info.get("title"),
+        author=info.get("uploader") or info.get("channel") or info.get("artist") or "",
+        length=int((info.get("duration") or 0) * 1000),
+        uri=info.get("webpage_url") or info.get("original_url") or info.get("url") or "",
+        artwork=info.get("thumbnail"),
+        stream_url=info.get("url"),
+        is_stream=bool(info.get("is_live")),
+        user_agent=(info.get("http_headers") or {}).get("User-Agent", ""),
+    )
+
+
+def _ytdlp_extract_sync(target, playlist_limit=25):
+    opts = dict(_YTDLP_BASE)
+    if ":" not in target.split("//", 1)[0] or target.startswith(("http://", "https://")):
+        opts["noplaylist"] = False
+        opts["playlistend"] = playlist_limit
+    with _ytdlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(target, download=False)
+    if isinstance(info, dict) and info.get("_type") == "playlist":
+        out = []
+        for e in (info.get("entries") or []):
+            t = _nt_from_info(e)
+            if t and t.stream_url:
+                out.append(t)
+        return out
+    t = _nt_from_info(info)
+    return [t] if (t and t.stream_url) else []
+
+
+async def _ytdlp_extract(target, playlist_limit=25):
+    if _ytdlp is None:
+        return []
+    try:
+        return await asyncio.to_thread(_ytdlp_extract_sync, target, playlist_limit)
+    except Exception as e:
+        print(f"[Music] yt-dlp failed for {str(target)[:80]!r}: {e}")
+        return []
+
+
+class NativeQueue:
+    def __init__(self):
+        self._items = []
+
+    async def put_wait(self, item):
+        self._items.append(item)
+
+    def put(self, item):
+        self._items.append(item)
+
+    def get(self):
+        return self._items.pop(0)
+
+    def clear(self):
+        self._items.clear()
+
+    def shuffle(self):
+        random.shuffle(self._items)
+
+    def __len__(self):
+        return len(self._items)
+
+    def __bool__(self):
+        return bool(self._items)
+
+    def __iter__(self):
+        return iter(list(self._items))
+
+
+class _NativePayload:
+    """Shim matching the wavelink event payload attrs the handlers read."""
+    def __init__(self, player, track, reason=None):
+        self.player = player
+        self.track = track
+        self.original = track
+        self.reason = reason
+
+
+_FFMPEG_BEFORE_STREAM = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
+
+
+class NativePlayer(discord.VoiceClient):
+    """Wavelink-shaped native player: yt-dlp resolves, FFmpeg streams."""
+
+    def __init__(self, client, channel):
+        super().__init__(client, channel)
+        self.queue = NativeQueue()
+        self.current = None
+        self.volume = int(music_config.get("volume") or 100)
+        self._gen = 0
+        self._started = 0.0
+        self._pause_total = 0.0
+        self._paused_at = None
+
+    @property
+    def playing(self):
+        return self.is_playing() or self.is_paused()
+
+    @property
+    def paused(self):
+        return self.is_paused()
+
+    @property
+    def position(self):
+        """Track position in ms (what the progress bar reads)."""
+        if not self.current:
+            return 0
+        now = self._paused_at if self._paused_at is not None else time.monotonic()
+        return max(0, int((now - self._started - self._pause_total) * 1000))
+
+    async def play(self, track, **_kw):
+        if track is None:
+            return
+        self._gen += 1
+        gen = self._gen
+        old = self.current
+        if self.is_playing() or self.is_paused():
+            try:
+                discord.VoiceClient.stop(self)
+            except Exception:
+                pass
+            if old is not None:
+                bot.dispatch("wavelink_track_end", _NativePayload(self, old, "replaced"))
+        # Resolve (or refresh) the stream URL — they expire after a while.
+        if not track.stream_url:
+            res = await _ytdlp_extract(track.uri or f"ytsearch1:{track.title} {track.author}")
+            if res:
+                track.stream_url = res[0].stream_url
+        if not track.stream_url:
+            self.current = None
+            bot.dispatch("wavelink_track_end", _NativePayload(self, track, "loadFailed"))
+            return
+        vol = max(0, min(200, int(self.volume or 100)))
+        opts = "-vn" + (f" -filter:a volume={vol / 100:.2f}" if vol != 100 else "")
+        # Stream URLs are bound to the requesting client — send the same
+        # User-Agent yt-dlp used or YouTube's CDN answers 403.
+        before = _FFMPEG_BEFORE_STREAM
+        if track.user_agent:
+            ua = track.user_agent.replace('"', "")
+            before += f' -user_agent "{ua}"'
+        try:
+            src = discord.FFmpegOpusAudio(track.stream_url, executable=_ffmpeg_exe(),
+                                          before_options=before, options=opts)
+        except Exception as e:
+            print(f"[Music] source build failed: {e}")
+            self.current = None
+            bot.dispatch("wavelink_track_end", _NativePayload(self, track, "loadFailed"))
+            return
+        self.current = track
+        self._started = time.monotonic()
+        self._pause_total = 0.0
+        self._paused_at = None
+
+        def _after(err, g=gen, t=track):
+            if err:
+                print(f"[Music] playback error: {err}")
+            if g != self._gen:
+                return  # replaced by a newer play() — its end event already fired
+            def _fire():
+                self.current = None
+                bot.dispatch("wavelink_track_end", _NativePayload(self, t, "finished"))
+            try:
+                bot.loop.call_soon_threadsafe(_fire)
+            except Exception:
+                pass
+
+        discord.VoiceClient.play(self, src, after=_after)
+        bot.dispatch("wavelink_track_start", _NativePayload(self, track))
+
+    async def skip(self, force=True):
+        # Stopping fires the after-callback -> track_end("finished") -> the
+        # existing end handler advances the queue.
+        try:
+            discord.VoiceClient.stop(self)
+        except Exception:
+            pass
+
+    async def pause(self, state):
+        if state and self.is_playing():
+            discord.VoiceClient.pause(self)
+            self._paused_at = time.monotonic()
+        elif not state and self.is_paused():
+            discord.VoiceClient.resume(self)
+            if self._paused_at is not None:
+                self._pause_total += time.monotonic() - self._paused_at
+                self._paused_at = None
+
+    async def set_volume(self, value):
+        # Applied from the next track (opus passthrough can't be re-scaled live).
+        self.volume = max(0, min(200, int(value)))
+
+
 async def search_any(query: str, exclude=None):
-    """Search across every WORKING source in order. Returns (results, prefix)."""
-    if wavelink is None:
+    """Resolve a query/URL to native tracks via yt-dlp. Returns (results, prefix)."""
+    if _ytdlp is None:
         return None, None
     q = (query or "").strip()
     if q.lower().startswith(("http://", "https://")):
-        try:
-            # source=None -> use the query as-is (don't let wavelink prepend a
-            # default ytmsearch: prefix).
-            return await wavelink.Playable.search(q, source=None), "direct"
-        except Exception as e:
-            print(f"[Music] direct load failed: {e}")
-            return None, None
-    order = _music_sources or _SOURCE_CANDIDATES
-    for prefix in order:
+        res = await _ytdlp_extract(q)
+        return (res or None), "direct"
+    for prefix in ("ytsearch", "scsearch"):
         if exclude and prefix in exclude:
             continue
-        try:
-            # source=None is critical: our query already carries its own
-            # "<prefix>:" (dzsearch:/scsearch:/…), and without this wavelink
-            # prepends "ytmsearch:" on top ("ytmsearch:dzsearch:…"), forcing
-            # everything to YouTube Music and ignoring the source we picked.
-            res = await wavelink.Playable.search(f"{prefix}:{q}", source=None)
-            if res:
-                return res, prefix
-        except Exception as e:
-            print(f"[Music] {prefix} search failed: {e}")
+        res = await _ytdlp_extract(f"{prefix}5:{q}")
+        if res:
+            return res, prefix
     return None, None
 
 
@@ -15384,9 +15607,9 @@ async def join_cmd(interaction: discord.Interaction):
     # bot's own voice connection. Nothing external to be "down".
     vc = interaction.guild.voice_client
     try:
-        # A leftover music (wavelink) player can't play native sources — replace
-        # it with a plain VoiceClient.
-        if vc and not isinstance(vc, discord.VoiceClient):
+        # A leftover music player (NativePlayer/wavelink) has its own play()
+        # semantics — TTS needs a PLAIN VoiceClient, so replace anything else.
+        if vc and type(vc) is not discord.VoiceClient:
             try:
                 await vc.disconnect(force=True)
             except Exception:
@@ -15482,7 +15705,7 @@ async def music_play(interaction: discord.Interaction, query: str):
         await interaction.response.defer(ephemeral=True)
     except Exception:
         return
-    if wavelink is None:
+    if _ytdlp is None:
         await interaction.followup.send(embed=error_embed("Music unavailable", "Music isn't configured."))
         return
     # Starting music cleanly exits TTS mode (they're mutually exclusive).
@@ -15810,22 +16033,10 @@ async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
     if not interaction.user.voice:
         await interaction.followup.send(embed=error_embed("Not in voice", "Join a voice channel first."))
         return
-    if not _http_source_ok:
-        await interaction.followup.send(embed=error_embed(
-            "Radio not supported here",
-            "The music node this bot is connected to has direct radio streams turned off, so `/radio` can't run. `/play` and the DJ still work. To get radio back, point the bot at a node with the HTTP source enabled (your own node has it on)."))
-        return
     vc = await _ensure_wl_player(interaction.guild, interaction.user.voice.channel)
     station, stream_url = _radio_stream_for(genre or auto_radio_config.get("genre") or "lofi")
-    results = None
-    try:
-        results = await wavelink.Playable.search(stream_url, source=None)
-    except Exception as e:
-        print(f"[Radio] stream load failed: {e}")
-    track = results[0] if (results and not isinstance(results, wavelink.Playlist)) else None
-    if not track:
-        await interaction.followup.send(embed=error_embed("Radio unavailable", "Couldn't start that stream. Try again in a moment."))
-        return
+    # Direct internet-radio stream, played natively through FFmpeg.
+    track = NativeTrack(title=station, uri=stream_url, stream_url=stream_url, is_stream=True)
     auto_music_sessions.pop(interaction.guild.id, None)
     _dj_mode.discard(interaction.guild.id)
     play_channels[interaction.guild.id] = interaction.channel.id
