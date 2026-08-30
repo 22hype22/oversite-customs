@@ -14365,7 +14365,7 @@ TTS_LANG = os.getenv("TTS_LANG", "en")
 TTS_TLD = os.getenv("TTS_TLD", "co.uk")
 # Playback speed (1.0 = normal). Sped up via an ffmpeg atempo filter — the raw
 # Google voice reads slowly.
-TTS_PLAYBACK_SPEED = float(os.getenv("TTS_PLAYBACK_SPEED", "1.4"))
+TTS_PLAYBACK_SPEED = float(os.getenv("TTS_PLAYBACK_SPEED", "1.2"))
 
 # Live TTS settings, overridable from the dashboard "Text-to-Speech" block.
 tts_config = {
