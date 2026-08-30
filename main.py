@@ -6799,49 +6799,161 @@ free_releases = {}   # id -> {channel_id, message_id, guild_id, goal, title, ent
 _frel_loaded = False
 
 
-def _frel_button(rel):
-    label, emoji = _extract_button_emoji(free_release_config.get("button_label") or "🎉 Enter")
-    btn = {"type": 2, "style": 1, "custom_id": f"frel:{rel['id']}", "disabled": bool(rel.get("released"))}
-    if label:
-        btn["label"] = label[:80]
-    if emoji:
-        btn["emoji"] = emoji
-    return btn
+FREL_REACT_EMOJI = "🎉"
 
 
-def _frel_built(rel, guild):
-    built = [b for b in (_build_v2(c, guild) for c in (free_release_config.get("design") or [])) if b]
-    count, goal = len(rel.get("entrants") or ()), int(rel.get("goal") or 1)
-    status = "🔓 **Released — goal reached!**" if rel.get("released") else f"🎉 **{count}/{goal}** entries — react to unlock"
-    built.append({"type": 17, "components": [{"type": 10, "content": status}]})
-    if not rel.get("released"):
-        built.append({"type": 1, "components": [_frel_button(rel)]})
+def _frel_counter_text(rel, released):
+    goal = int(rel.get("goal") or 1)
+    if released:
+        return f"{FREL_REACT_EMOJI} {goal}/{goal} — goal reached"
+    return f"{FREL_REACT_EMOJI} {len(rel.get('reactors') or ())}/{goal}"
+
+
+def _frel_sub_text(s, rel, released):
+    """Fill the text tokens on a free-release design line: {Question: Title},
+    {reaction goal} (live counter) and {user} (poster)."""
+    out = re.sub(r"\{\s*question\s*\d*\s*(?::[^{}]*)?\}",
+                 lambda _m: rel.get("title") or "Free Release", s, flags=re.IGNORECASE)
+    out = re.sub(r"\{\s*reaction\s*goal\s*\}",
+                 lambda _m: _frel_counter_text(rel, released), out, flags=re.IGNORECASE)
+    out = out.replace("{user}", f"<@{rel.get('poster_id')}>" if rel.get("poster_id") else "")
+    return out
+
+
+def _frel_split_markers(content, rel, released):
+    """Turn one text line into components, swapping standalone {preview}/{download}
+    markers for the media (preview always; download only once released)."""
+    content = _frel_sub_text(content, rel, released)
+    out = []
+    for part in re.split(r"(\{\s*(?:preview|download)\s*\})", content, flags=re.IGNORECASE):
+        if not part:
+            continue
+        low = part.strip().lower()
+        if re.fullmatch(r"\{\s*preview\s*\}", low):
+            out.append({"type": 12, "items": [{"media": {"url": f"attachment://{rel['preview_name']}"}}]})
+        elif re.fullmatch(r"\{\s*download\s*\}", low):
+            if released and rel.get("download_name"):
+                out.append({"type": 13, "file": {"url": f"attachment://{rel['download_name']}"}})
+        elif part.strip():
+            out.append({"type": 10, "content": part})
+    return out
+
+
+def _frel_process(components, rel, released):
+    out = []
+    for c in components:
+        if not isinstance(c, dict):
+            out.append(c)
+            continue
+        c = dict(c)
+        if c.get("type") in (17, 9) and isinstance(c.get("components"), list):
+            c["components"] = _frel_process(c["components"], rel, released)
+            out.append(c)
+        elif c.get("type") == 10 and isinstance(c.get("content"), str):
+            out.extend(_frel_split_markers(c["content"], rel, released))
+        else:
+            out.append(c)
+    return out
+
+
+def _frel_ensure_media(built, rel, released):
+    """A Components-V2 message rejects an attachment no component references, so
+    if the design has no {preview}/{download} marker, append the media."""
+    blob = json.dumps(built)
+    if rel.get("preview_name") and rel["preview_name"] not in blob:
+        built.append({"type": 12, "items": [{"media": {"url": f"attachment://{rel['preview_name']}"}}]})
+    if released and rel.get("download_name") and rel["download_name"] not in blob:
+        built.append({"type": 13, "file": {"url": f"attachment://{rel['download_name']}"}})
     return built
 
 
-async def _frel_send(channel, rel):
-    guild = getattr(channel, "guild", None)
-    payload = {"components": _frel_built(rel, guild), "flags": 1 << 15, "allowed_mentions": {"parse": []}}
-    route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=channel.id)
+def _frel_wrap_top(built):
+    ALLOWED_TOP = {1, 9, 10, 12, 13, 14, 17}
+    if built and not {c.get("type") for c in built}.issubset(ALLOWED_TOP):
+        return [{"type": 17, "components": built}]
+    return built
+
+
+def _frel_components(rel, released):
+    ch_guild = None
+    built = [b for b in (_build_v2(c, ch_guild) for c in (free_release_config.get("design") or [])) if b]
+    built = _frel_ensure_media(_frel_process(built, rel, released), rel, released)
+    return _frel_wrap_top(built) or [{"type": 10, "content": rel.get("title") or "Free Release"}]
+
+
+async def _frel_ref_blob(ref):
+    """Bytes for a stashed release file — the durable vault message first, then a
+    raw URL fallback."""
+    ref = ref or {}
+    if ref.get("channel_id") and ref.get("message_id"):
+        try:
+            ch = await resolve_channel(ref["channel_id"])
+            msg = await ch.fetch_message(int(ref["message_id"])) if ch else None
+            if msg and msg.attachments:
+                return await msg.attachments[0].read()
+        except Exception as e:
+            print(f"[FreeRelease] vault read failed: {e}")
+    if ref.get("url"):
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(ref["url"], timeout=120, follow_redirects=True)
+            if r.status_code == 200:
+                return r.content
+        except Exception as e:
+            print(f"[FreeRelease] blob fetch failed: {e}")
+    return None
+
+
+async def _frel_publish_full(rel, released, first_post=False):
+    """Post (no message_id) or edit (has one) the release, uploading its files —
+    the preview always, plus the download once the goal is reached."""
+    ch = await resolve_channel(rel.get("channel_id"))
+    if not ch:
+        return None
+    built = _frel_components(rel, released)
+    names, dfiles = [], []
+    pb = await _frel_ref_blob(rel.get("preview_ref"))
+    if pb is not None:
+        names.append(rel["preview_name"])
+        dfiles.append(discord.File(io.BytesIO(pb), filename=rel["preview_name"]))
+    if released:
+        db = await _frel_ref_blob(rel.get("download_ref"))
+        if db is not None:
+            names.append(rel["download_name"])
+            dfiles.append(discord.File(io.BytesIO(db), filename=rel["download_name"]))
+    payload = {"components": built, "flags": 1 << 15,
+               "attachments": [{"id": i, "filename": n} for i, n in enumerate(names)],
+               "allowed_mentions": {"parse": ["everyone"]} if first_post else {"parse": []}}
+    form = [{"name": "payload_json", "value": json.dumps(payload)}]
+    for i, fobj in enumerate(dfiles):
+        form.append({"name": f"files[{i}]", "value": fobj.fp,
+                     "filename": names[i], "content_type": "application/octet-stream"})
+    if rel.get("message_id"):
+        route = discord.http.Route("PATCH", "/channels/{channel_id}/messages/{message_id}",
+                                   channel_id=ch.id, message_id=int(rel["message_id"]))
+    else:
+        route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=ch.id)
     try:
-        resp = await bot.http.request(route, json=payload)
-        return str(resp["id"]) if isinstance(resp, dict) and resp.get("id") else None
+        resp = await bot.http.request(route, form=form, files=dfiles)
+        return str(resp["id"]) if isinstance(resp, dict) and resp.get("id") else rel.get("message_id")
     except Exception as e:
-        print(f"[FreeRelease] send failed: {e}")
+        print(f"[FreeRelease] publish failed: {e}")
         return None
 
 
-async def _frel_edit(rel):
+async def _frel_edit_counter(rel):
+    """Cheap JSON-only edit to refresh the live counter before the goal — keeps
+    the already-uploaded preview (attachment id 0), no re-upload."""
     ch = await resolve_channel(rel.get("channel_id"))
     if not ch or not rel.get("message_id"):
         return
-    payload = {"components": _frel_built(rel, getattr(ch, "guild", None)), "flags": 1 << 15}
+    payload = {"components": _frel_components(rel, False), "flags": 1 << 15, "attachments": [{"id": 0}]}
     route = discord.http.Route("PATCH", "/channels/{channel_id}/messages/{message_id}",
                                channel_id=ch.id, message_id=int(rel["message_id"]))
     try:
         await bot.http.request(route, json=payload)
     except Exception as e:
-        print(f"[FreeRelease] edit failed: {e}")
+        print(f"[FreeRelease] counter edit failed: {e}")
 
 
 async def _frel_stash_file(f):
@@ -6868,50 +6980,22 @@ async def _frel_stash_file(f):
     return {"url": f.get("url"), "filename": filename}
 
 
-async def _frel_deliver(rel):
-    ch = await resolve_channel(rel.get("channel_id"))
-    if not ch:
-        return
-    await _frel_edit(rel)  # flip to "Released" + drop the button
-    f = await _pkg_ref_to_file(rel.get("file_ref") or {})
-    title = rel.get("title") or "Free Release"
-    if f:
-        try:
-            await ch.send(content=f"🎉 **{title}** — goal reached! Here's the file:", file=f)
-        except Exception as e:
-            print(f"[FreeRelease] deliver failed: {e}")
-    else:
-        await ch.send(f"🎉 Goal reached for **{title}**, but the file couldn't be retrieved. An admin can re-post it.")
-
-
 async def _frel_enter(interaction, rid):
-    rel = free_releases.get(rid)
-    if not rel or rel.get("released"):
-        return await interaction.response.send_message("This release is already unlocked or closed.", ephemeral=True)
-    uid = interaction.user.id
-    ent = rel.setdefault("entrants", set())
-    if uid in ent:
-        ent.discard(uid)
-        await interaction.response.send_message("You left the release queue.", ephemeral=True)
-    else:
-        ent.add(uid)
-        await interaction.response.send_message("✅ You're in — you'll get the file when the goal is hit.", ephemeral=True)
-    if len(ent) >= int(rel.get("goal") or 1) and not rel.get("released"):
-        rel["released"] = True
-        await _frel_deliver(rel)
-    else:
-        await _frel_edit(rel)
-    await _frel_save()
+    # Legacy Enter button (releases now unlock by reactions, not a button).
+    await interaction.response.send_message(
+        f"This release unlocks by reactions now — just react with {FREL_REACT_EMOJI}.", ephemeral=True)
 
 
 async def _frel_open_modal(interaction):
     components = [
-        {"type": 18, "label": "Release name",
+        {"type": 18, "label": "Release title",
          "component": {"type": 4, "custom_id": "title", "style": 1, "required": True, "max_length": 100}},
-        {"type": 18, "label": "Entry goal (number)",
+        {"type": 18, "label": "Reaction goal (number)",
          "component": {"type": 4, "custom_id": "goal", "style": 1, "required": True, "max_length": 6, "value": "30"}},
-        {"type": 18, "label": "Release file",
-         "component": {"type": 19, "custom_id": "file", "min_values": 1, "max_values": 1}},
+        {"type": 18, "label": "Preview image",
+         "component": {"type": 19, "custom_id": "preview", "min_values": 1, "max_values": 1}},
+        {"type": 18, "label": "Download file (e.g. .zip)",
+         "component": {"type": 19, "custom_id": "download", "min_values": 1, "max_values": 1}},
     ]
     data = {"title": "Free Release", "custom_id": "freerelform:new", "components": components}
     route = discord.http.Route(
@@ -6928,33 +7012,83 @@ async def _frel_form_submit(interaction, key):
         goal = max(1, int(re.sub(r"[^0-9]", "", vals.get("goal") or "30") or "30"))
     except Exception:
         goal = 30
-    files = _modal_uploaded_files(interaction, "file")
-    if not files:
-        return await interaction.response.send_message("You need to attach the release file.", ephemeral=True)
+    preview = _modal_uploaded_files(interaction, "preview")
+    download = _modal_uploaded_files(interaction, "download")
+    if not preview or not download:
+        return await interaction.response.send_message(
+            "Attach both a preview image and the download file.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
-    ref = await _frel_stash_file(files[0])
+    pref = await _frel_stash_file(preview[0])
+    dref = await _frel_stash_file(download[0])
     rid = secrets.token_hex(6)
     channel = interaction.channel
-    rel = {"id": rid, "channel_id": str(channel.id), "guild_id": str(interaction.guild_id or ""),
-           "message_id": None, "goal": goal, "title": title, "entrants": set(),
-           "released": False, "file_ref": ref}
+    rel = {
+        "id": rid, "channel_id": str(channel.id), "guild_id": str(interaction.guild_id or ""),
+        "message_id": None, "goal": goal, "title": title, "poster_id": str(interaction.user.id),
+        "preview_ref": pref, "download_ref": dref,
+        "preview_name": _san_filename(preview[0].get("filename"), "preview.png"),
+        "download_name": _san_filename(download[0].get("filename"), "download.zip"),
+        "reactors": set(), "released": False,
+    }
     free_releases[rid] = rel
-    mid = await _frel_send(channel, rel)
+    mid = await _frel_publish_full(rel, released=False, first_post=True)
     if not mid:
         free_releases.pop(rid, None)
         return await interaction.followup.send("Couldn't post the release in this channel.", ephemeral=True)
     rel["message_id"] = mid
+    try:
+        msg = await channel.fetch_message(int(mid))
+        await msg.add_reaction(FREL_REACT_EMOJI)
+    except Exception as e:
+        print(f"[FreeRelease] add reaction failed: {e}")
     await _frel_save()
-    # If the file was only kept as a raw CDN URL (no durable vault channel), warn:
-    # Discord's upload URLs now expire in ~24h, so a slow-to-fill release could
-    # lose the file. A vault/log channel re-hosts it durably.
-    durable = bool((ref or {}).get("message_id"))
+    # Discord's raw upload URLs expire (~24h); a vault channel re-hosts durably.
+    durable = bool((pref or {}).get("message_id") and (dref or {}).get("message_id"))
     note = ("" if durable else
-            "\n⚠️ No file vault channel is set, so the file is only held via a "
-            "temporary link (~24h). Set a **File vault channel** in the Free Release "
-            "block so releases that take longer to fill still deliver the file.")
+            "\n⚠️ No file vault channel is set, so the files are only held via "
+            "temporary links (~24h). Set a **File vault channel** in the Free Release "
+            "block so slow-to-fill releases still deliver.")
     await interaction.followup.send(
-        f"✅ Free release posted — unlocks at **{goal}** entries.{note}", ephemeral=True)
+        f"✅ Free release posted — unlocks at **{goal}** {FREL_REACT_EMOJI} reactions.{note}", ephemeral=True)
+
+
+async def _frel_reaction(payload, added):
+    """Track the goal emoji on release messages; unlock (reveal the download) when
+    the reaction count hits the goal."""
+    try:
+        emoji = getattr(payload.emoji, "name", None) or str(payload.emoji)
+    except Exception:
+        return
+    if emoji != FREL_REACT_EMOJI:
+        return
+    mid = str(getattr(payload, "message_id", "") or "")
+    uid = getattr(payload, "user_id", None)
+    if not mid or uid is None or (bot.user and uid == bot.user.id):
+        return
+    rel = next((r for r in free_releases.values() if str(r.get("message_id")) == mid), None)
+    if not rel or rel.get("released"):
+        return
+    reactors = rel.setdefault("reactors", set())
+    if added:
+        reactors.add(int(uid))
+    else:
+        reactors.discard(int(uid))
+    if len(reactors) >= int(rel.get("goal") or 1):
+        rel["released"] = True
+        await _frel_publish_full(rel, released=True)
+    else:
+        await _frel_edit_counter(rel)
+    await _frel_save()
+
+
+@bot.event
+async def on_raw_reaction_add(payload):
+    await _frel_reaction(payload, True)
+
+
+@bot.event
+async def on_raw_reaction_remove(payload):
+    await _frel_reaction(payload, False)
 
 
 async def _frel_save():
@@ -6962,8 +7096,8 @@ async def _frel_save():
         return
     data = {}
     for rid, r in free_releases.items():
-        data[rid] = {**{k: v for k, v in r.items() if k != "entrants"},
-                     "entrants": list(r.get("entrants") or ())}
+        data[rid] = {**{k: v for k, v in r.items() if k != "reactors"},
+                     "reactors": list(r.get("reactors") or ())}
     await _bot_config_upsert("freerelease-data", {"releases": data})
 
 
@@ -6979,7 +7113,8 @@ async def _frel_load():
     rels = (cfg or {}).get("releases") or {}
     if isinstance(rels, dict):
         for rid, r in rels.items():
-            r["entrants"] = set(r.get("entrants") or [])
+            r["reactors"] = set(int(x) for x in (r.get("reactors") or []) if str(x).isdigit())
+            r.pop("entrants", None)
             free_releases[rid] = r
         print(f"[FreeRelease] restored {len(free_releases)} release(s)")
 
