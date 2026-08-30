@@ -6345,6 +6345,25 @@ def _pf_dropdown_parts(content):
     return (name or "Choose", opts or ["Yes", "No"])
 
 
+# A dropdown named "Rating" with numeric options renders the picked number as
+# this custom emoji repeated N times plus "(N/max)" — e.g. ✔✔✔✔✔ (5/5).
+RATING_EMOJI = "<:rating:1457205320056049665>"
+
+
+def _pf_render_dropdown(content, val):
+    """How a dropdown answer shows in the posted message. A "Rating" dropdown
+    with numeric options becomes the rating emoji repeated + (N/max); anything
+    else shows the picked value verbatim."""
+    name, opts = _pf_dropdown_parts(content or "")
+    if _clean_label(name).strip().lower() == "rating" and str(val).strip().isdigit():
+        n = int(str(val).strip())
+        nums = [int(o) for o in opts if str(o).strip().isdigit()]
+        mx = max(nums) if nums else n
+        n = max(0, min(n, mx))
+        return (RATING_EMOJI * n) + f" ({n}/{mx})"
+    return val
+
+
 def _pf_render(design, uid, answers):
     """Substitute each token with its collected answer (or the submitter mention
     for {user}) and return the resulting Components-V2 tree."""
@@ -6358,8 +6377,13 @@ def _pf_render(design, uid, answers):
         else:
             val = answers[state["i"]] if state["i"] < len(answers) else ""
             state["i"] += 1
-            # A member pick collects the chosen user's id — render it as a mention.
-            out = (f"<@{val}>" if val else "") if kind == "member" else val
+            if kind == "member":
+                # A member pick collects the chosen user's id — render as a mention.
+                out = f"<@{val}>" if val else ""
+            elif kind == "dropdown":
+                out = _pf_render_dropdown(m.group(3), val)
+            else:
+                out = val
         return json.dumps(str(out))[1:-1]
 
     return json.loads(_PF_TOKEN_RE.sub(repl, raw))
