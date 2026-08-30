@@ -15251,10 +15251,20 @@ if _ck:
 
 
 def _clean_song_query(title, author=""):
-    """'Song [Official Music Video] (4K)' -> 'Song' — for cross-source lookups."""
+    """'Artist - Song [Official Video] | 4K' -> 'Artist - Song' for cross-source
+    lookups. Only appends the uploader when the title lacks an artist ("Song"
+    from a Topic upload) — lyrics/promo channel names would pollute the search."""
     t = re.sub(r"[\[(][^\])]*[\])]", " ", title or "")
+    t = t.split("|")[0]
     t = re.sub(r"\s+", " ", t).strip()
-    return f"{t} {author or ''}".strip()
+    if " - " in t:
+        return t  # already "Artist - Song"
+    a = (author or "").strip()
+    if a.lower().endswith(" - topic"):
+        a = a[: -len(" - Topic")].strip()  # Topic uploader IS the artist
+    elif re.search(r"lyric|clouds|records|promo|charts|music\b", a.lower()):
+        a = ""  # lyrics/promo channel — not the artist
+    return f"{t} {a}".strip()
 
 
 async def _resolve_stream(track):
