@@ -1353,6 +1353,12 @@ async def runtime_rpc(name, payload):
 @bot.event
 async def on_ready():
     print(f"{SERVER_NAME} bot online as {bot.user}")
+    # Rejoin voice + resume playback IMMEDIATELY — before the config marathon —
+    # so a redeploy's silence gap is as short as possible.
+    global _music_restore_done
+    if not _music_restore_done:
+        _music_restore_done = True
+        asyncio.create_task(_restore_music_state())
     print(f"[Boot] bot {BOT_ORDER_ID} using worker token prefix {WORKER_TOKEN[:12] if WORKER_TOKEN else 'MISSING'} (len {len(WORKER_TOKEN) if WORKER_TOKEN else 0})")
     # Dropdown-in-modal (Close Order form) needs discord.py 2.6+ (discord.ui.Label).
     print(f"[Boot] discord.py {discord.__version__} | dropdown-in-modal supported: {hasattr(discord.ui, 'Label')}")
@@ -1415,12 +1421,6 @@ async def on_ready():
         await _load_tts_nicks()
     except Exception as e:
         print(f"[TTS] nick load failed: {e}")
-    # Rejoin voice and resume whatever was playing before the redeploy. Native
-    # playback doesn't need the Lavalink node, so don't wait for node-ready.
-    global _music_restore_done
-    if not _music_restore_done:
-        _music_restore_done = True
-        asyncio.create_task(_restore_music_state())
     # Fill in ephemeral-message content for OLDER posted messages whose keys the
     # fresh configs no longer produce (the design was edited since posting).
     try:
@@ -15756,7 +15756,7 @@ async def _restore_music_state():
     """On boot (node ready), rejoin and resume whatever was playing before."""
     global _music_state_ready
     try:
-        await asyncio.sleep(4)  # let guild/channel cache + voice settle
+        await asyncio.sleep(1.5)  # brief settle for guild/channel cache
         cfg = await _bot_config_get("runtime-music-state")
         guilds = (cfg or {}).get("guilds") or {}
         for gid, st in guilds.items():
