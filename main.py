@@ -3999,13 +3999,15 @@ def _pkg_build_embed(comps):
 
 
 # ===================== Package preview background =====================
-# `/packageback` stores a background image that the next N package-preview
-# uploads get laid onto: the uploaded {SFile} Preview (a uniform with a
-# transparent background) is scaled to fit and centered on top of this
-# background before it posts. Active for a set number of uploads, then it turns
-# itself off. guild_id(str) -> {"ref": {stash ref}, "remaining": int}.
+# `/packageback` stores a background image that package-preview uploads get laid
+# onto: the uploaded {SFile} Preview (a uniform with a transparent background) is
+# scaled to fit and centered on top of this background before it posts. It stays
+# active until `/removepackageback` clears it. The image bytes are stored inline
+# (base64) so there's no vault channel or expiring CDN URL to depend on.
+# guild_id(str) -> {"img": "<base64 png>", "name": str}.
 pkg_backgrounds = {}
 _pkgback_loaded = False
+PKGBACK_MAX_DIM = 2048  # downscale huge backgrounds so the stored config stays small
 
 
 async def _pkgback_load():
@@ -4017,14 +4019,10 @@ async def _pkgback_load():
     g = (cfg or {}).get("guilds")
     if isinstance(g, dict):
         for gid, rec in g.items():
-            if isinstance(rec, dict) and rec.get("ref"):
-                pkg_backgrounds[str(gid)] = {
-                    "ref": rec["ref"],
-                    "remaining": int(rec.get("remaining") or 0),
-                }
+            if isinstance(rec, dict) and rec.get("img"):
+                pkg_backgrounds[str(gid)] = {"img": rec["img"], "name": rec.get("name") or "background.png"}
     _pkgback_loaded = True
-    n = sum(1 for r in pkg_backgrounds.values() if r.get("remaining", 0) > 0)
-    print(f"[PackageBack] restored {n} active background(s)")
+    print(f"[PackageBack] restored {len(pkg_backgrounds)} active background(s)")
 
 
 async def _pkgback_save():
@@ -4037,11 +4035,33 @@ async def _pkgback_save():
 
 
 def _pkgback_active(guild_id):
-    """The active background record for a guild, or None if none / used up."""
+    """The active background record for a guild, or None if none is set."""
     rec = pkg_backgrounds.get(str(guild_id))
-    if rec and int(rec.get("remaining") or 0) > 0 and rec.get("ref"):
+    if rec and rec.get("img"):
         return rec
     return None
+
+
+def _pkgback_prep(raw_bytes):
+    """Normalize an uploaded background to PNG bytes, downscaling anything larger
+    than PKGBACK_MAX_DIM so the base64 kept in config stays small. Returns the raw
+    bytes unchanged if Pillow isn't available or the image can't be read."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return raw_bytes
+    try:
+        img = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
+        w, h = img.size
+        if max(w, h) > PKGBACK_MAX_DIM:
+            r = PKGBACK_MAX_DIM / max(w, h)
+            img = img.resize((max(1, round(w * r)), max(1, round(h * r))), Image.LANCZOS)
+        out = io.BytesIO()
+        img.save(out, "PNG")
+        return out.getvalue()
+    except Exception as e:
+        print(f"[PackageBack] prep failed: {e}")
+        return raw_bytes
 
 
 def _pkgback_compose(bg_bytes, fg_bytes):
@@ -4142,22 +4162,6 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
 
     embed, buttons = _pkg_build_embed(final)
 
-    # A /packageback background, if one is active, gets composited under the
-    # preview inside _banner_file. This flag records that it was used so the
-    # per-guild counter is decremented exactly once after the post lands.
-    bg_used = {"v": False}
-
-    async def _consume_bg():
-        if not bg_used["v"] or not interaction.guild:
-            return
-        rec = pkg_backgrounds.get(str(interaction.guild.id))
-        if not rec:
-            return
-        rec["remaining"] = max(0, int(rec.get("remaining") or 0) - 1)
-        if rec["remaining"] <= 0:
-            pkg_backgrounds.pop(str(interaction.guild.id), None)
-        await _pkgback_save()
-
     # Every package card gets the three purchase buttons. Each one gates the
     # buyer behind Roblox verification, then runs its flow (built in phases).
     view = discord.ui.View(timeout=None)
@@ -4178,12 +4182,15 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
             fname = _san_filename(f.get("filename"), "preview.png")
             rec = _pkgback_active(interaction.guild.id) if interaction.guild else None
             if rec:
-                bg = await _frel_ref_blob(rec.get("ref"))
+                try:
+                    import base64
+                    bg = base64.b64decode(rec["img"])
+                except Exception:
+                    bg = None
                 merged = _pkgback_compose(bg, blob) if bg else None
                 if merged:
                     blob = merged
                     fname = os.path.splitext(fname)[0] + ".png"
-                    bg_used["v"] = True
             return discord.File(io.BytesIO(blob), filename=fname)
         except Exception as e:
             print(f"[Package] preview fetch failed: {e}")
@@ -4230,7 +4237,6 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
                 else:
                     raise
             await _pkg_store_receipt(posted, target, embed, ctx, after_files)
-            await _consume_bg()
             link = f"https://discord.com/channels/{ch.guild.id}/{target.id}"
             await interaction.followup.send(embed=success_embed("Posted", f"Package post created: {link}"), ephemeral=True)
             return
@@ -4244,7 +4250,6 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
         # 3) The {File} Finished Product is NEVER posted publicly — it's stashed
         #    privately and delivered to the buyer on claim.
         await _pkg_store_receipt(posted, ch, embed, ctx, after_files)
-        await _consume_bg()
         await interaction.followup.send(embed=success_embed("Posted", f"Package card posted in {ch.mention}."), ephemeral=True)
     except Exception as e:
         await interaction.followup.send(embed=error_embed("Couldn't post", str(e)[:300]), ephemeral=True)
@@ -4339,12 +4344,9 @@ async def package_cmd(interaction: discord.Interaction, channel: typing.Union[di
     await _open_form_page(interaction, PKG_FORM_KEY, 0)
 
 
-@bot.tree.command(name="packageback", description="Set a background that the next package preview uploads are laid onto")
-@app_commands.describe(
-    background="The background image — your uniform preview is centered on top of it",
-    count="How many package preview uploads it stays active for (0 turns it off)",
-)
-async def packageback_cmd(interaction: discord.Interaction, background: discord.Attachment, count: int):
+@bot.tree.command(name="packageback", description="Set a background that package preview uploads are laid onto")
+@app_commands.describe(background="The background image — your uniform preview is centered on top of it")
+async def packageback_cmd(interaction: discord.Interaction, background: discord.Attachment):
     global _pkgback_loaded
     if not interaction.guild:
         return await interaction.response.send_message("Use this in a server.", ephemeral=True)
@@ -4352,29 +4354,49 @@ async def packageback_cmd(interaction: discord.Interaction, background: discord.
         return await interaction.response.send_message(
             embed=error_embed("No permission", "You need Manage Server to set a package background."),
             ephemeral=True)
-    gid = str(interaction.guild.id)
-    if count <= 0:
-        pkg_backgrounds.pop(gid, None)
-        _pkgback_loaded = True
-        await _pkgback_save()
-        return await interaction.response.send_message(
-            embed=success_embed("Background off", "Package previews will post as-is again."),
-            ephemeral=True)
     if not (background.content_type or "").lower().startswith("image/"):
         return await interaction.response.send_message(
             embed=error_embed("Not an image", "Upload a PNG or JPG image as the background."),
             ephemeral=True)
     await interaction.response.defer(ephemeral=True, thinking=True)
-    ref = await _frel_stash_file({"filename": background.filename or "background.png", "url": background.url})
-    pkg_backgrounds[gid] = {"ref": ref, "remaining": int(count)}
+    try:
+        raw = await background.read()
+    except Exception as e:
+        return await interaction.followup.send(
+            embed=error_embed("Couldn't read that", str(e)[:200]), ephemeral=True)
+    import base64
+    img_b64 = base64.b64encode(_pkgback_prep(raw)).decode()
+    pkg_backgrounds[str(interaction.guild.id)] = {
+        "img": img_b64, "name": background.filename or "background.png"}
     _pkgback_loaded = True
     await _pkgback_save()
-    plural = "upload" if count == 1 else "uploads"
     await interaction.followup.send(
         embed=success_embed(
             "Background set",
-            f"Your next **{count}** package preview {plural} will be centered on this background, "
-            "then it turns itself off. Run `/packageback` with `count: 0` to stop early."),
+            "Package preview uploads will now be centered on top of this background. "
+            "Run `/removepackageback` to turn it off."),
+        ephemeral=True)
+
+
+@bot.tree.command(name="removepackageback", description="Stop laying package previews on a background")
+async def removepackageback_cmd(interaction: discord.Interaction):
+    global _pkgback_loaded
+    if not interaction.guild:
+        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    if not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message(
+            embed=error_embed("No permission", "You need Manage Server to change the package background."),
+            ephemeral=True)
+    gid = str(interaction.guild.id)
+    if gid not in pkg_backgrounds:
+        return await interaction.response.send_message(
+            embed=error_embed("Nothing set", "There's no package background active right now."),
+            ephemeral=True)
+    pkg_backgrounds.pop(gid, None)
+    _pkgback_loaded = True
+    await _pkgback_save()
+    await interaction.response.send_message(
+        embed=success_embed("Background off", "Package previews will post as-is again."),
         ephemeral=True)
 
 
@@ -10099,10 +10121,16 @@ async def _resync_ticket_support_perms(config):
 async def resolve_channel(channel_id):
     if not channel_id:
         return None
-    channel = bot.get_channel(int(channel_id))
+    try:
+        cid = int(channel_id)
+    except (TypeError, ValueError):
+        # A non-numeric id (e.g. a stray "design" from a misconfigured field)
+        # shouldn't crash the caller — just resolve to nothing.
+        return None
+    channel = bot.get_channel(cid)
     if channel is None:
         try:
-            channel = await bot.fetch_channel(int(channel_id))
+            channel = await bot.fetch_channel(cid)
         except Exception:
             channel = None
     return channel
