@@ -13370,7 +13370,9 @@ def best_track(tracks, query: str):
     HARD_FILTER = ["karaoke", "instrumental", "tribute", "made famous", "in the style of",
                    "backing track", "minus one", "no vocal", "sing along", "originally performed",
                    "as made", "nightcore", "cover version", "cover by"]
-    clean = [t for t in tracks if not any(kw in t.title.lower() for kw in HARD_FILTER)]
+    # A filter keyword the user TYPED is what they want — don't filter it away.
+    clean = [t for t in tracks
+             if not any(kw in t.title.lower() and kw not in query_lower for kw in HARD_FILTER)]
     if not clean:
         clean = tracks
 
@@ -13383,8 +13385,10 @@ def best_track(tracks, query: str):
         for w in query_words:
             if len(w) > 3 and w in author_lower:
                 s += 20
-        for kw in ["cover", "sped up", "slowed", "reverb", "lofi", "lo-fi", "workout", "remix", "version", "acoustic"]:
-            if kw in title_lower:
+        for kw in ["cover", "sped up", "slowed", "reverb", "lofi", "lo-fi", "workout", "remix",
+                   "version", "acoustic", "bass boost", "8d", "visualizer", "live", "mashup",
+                   "extended", "loop", "pitched", "chipmunk"]:
+            if kw in title_lower and kw not in query_lower:
                 s -= 15
         # Music videos carry intros/skits/sound effects — prefer pure audio.
         for kw in ["official video", "official music video", "music video",
@@ -16055,7 +16059,16 @@ async def music_play(interaction: discord.Interaction, query: str):
         # not labeled as a video, then — only if nothing else — a music video.
         _VIDEO_KWS = ("official video", "official music video", "music video",
                       "official hd video", "official 4k", "(video", "[video", "m/v")
-        _AUDIO_KWS = ("official audio", "(audio", "[audio", "lyric", "visualizer", "audio)")
+        _AUDIO_KWS = ("official audio", "(audio", "[audio", "lyric", "audio)")
+        # Versions that change the song — filtered out unless the query asks.
+        _ALTERED_KWS = ("bass boost", "sped up", "spedup", "slowed", "reverb", "8d",
+                        "nightcore", "daycore", "remix", "mashup", "cover", "live",
+                        "instrumental", "karaoke", "acoustic", "visualizer", "loop",
+                        "extended", "pitched", "chipmunk")
+        _ql = query.lower()
+        def _is_altered(t):
+            tl = t.title.lower()
+            return any(k in tl and k not in _ql for k in _ALTERED_KWS)
         def _is_video(t):
             tl = t.title.lower()
             return any(k in tl for k in _VIDEO_KWS)
@@ -16063,9 +16076,10 @@ async def music_play(interaction: discord.Interaction, query: str):
             tl = t.title.lower()
             au = (t.author or "").lower()
             return au.endswith(" - topic") or any(k in tl for k in _AUDIO_KWS)
-        audio_first = [t for t in peers if _is_audio(t)]
-        non_video = [t for t in peers if not _is_video(t)]
-        pool = audio_first or non_video or peers
+        unaltered = [t for t in peers if not _is_altered(t)] or peers
+        audio_first = [t for t in unaltered if _is_audio(t)]
+        non_video = [t for t in unaltered if not _is_video(t)]
+        pool = audio_first or non_video or unaltered
         track = max(pool, key=lambda t: t.view_count) if pool else top
     except Exception:
         track = top
