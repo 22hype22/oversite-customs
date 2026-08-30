@@ -9534,10 +9534,14 @@ async def handle_post(channel, payload):
         eb = discord.Embed(color=ACCENT)
         eb.set_image(url=url)
         embeds.append(eb)
+    sent = None
     if embeds:
-        await channel.send(content=content, embeds=embeds[:10])
+        sent = await channel.send(content=content, embeds=embeds[:10])
     elif content:
-        await channel.send(content=content)
+        sent = await channel.send(content=content)
+    if thread_files and sent is not None:
+        tname = _clean_label(thread_files[0].get("label") or "Example") or "Example"
+        await _post_form_files_thread(channel, str(sent.id), thread_files, tname)
     for extra in payload.get("trailing_messages", []) or []:
         if extra:
             await channel.send(extra)
