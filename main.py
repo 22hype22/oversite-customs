@@ -1418,6 +1418,12 @@ async def on_ready():
         await _load_tts_nicks()
     except Exception as e:
         print(f"[TTS] nick load failed: {e}")
+    # Rejoin voice and resume whatever was playing before the redeploy. Native
+    # playback doesn't need the Lavalink node, so don't wait for node-ready.
+    global _music_restore_done
+    if not _music_restore_done:
+        _music_restore_done = True
+        asyncio.create_task(_restore_music_state())
     # Fill in ephemeral-message content for OLDER posted messages whose keys the
     # fresh configs no longer produce (the design was edited since posting).
     try:
@@ -13385,6 +13391,14 @@ def best_track(tracks, query: str):
         for kw in ["cover", "sped up", "slowed", "reverb", "lofi", "lo-fi", "workout", "remix", "version", "acoustic"]:
             if kw in title_lower:
                 s -= 15
+        # Music videos carry intros/skits/sound effects — prefer pure audio.
+        for kw in ["official video", "official music video", "music video",
+                   "official hd video", "official 4k", "(video", "[video", "m/v"]:
+            if kw in title_lower:
+                s -= 25
+                break
+        if "official audio" in title_lower or "lyric" in title_lower or author_lower.endswith(" - topic"):
+            s += 15
         if len(track.title) > 80:
             s -= 10
         return s
@@ -15428,6 +15442,7 @@ class NativePlayer(discord.VoiceClient):
     async def play(self, track, **_kw):
         if track is None:
             return
+        start_ms = int(_kw.get("start") or 0)
         self._gen += 1
         gen = self._gen
         old = self.current
@@ -15472,14 +15487,17 @@ class NativePlayer(discord.VoiceClient):
                     self.current = None
                     bot.dispatch("wavelink_track_end", _NativePayload(self, track, "loadFailed"))
                     return
-                src = discord.FFmpegOpusAudio(local_path, executable=_ffmpeg_exe(), options=opts)
+                seek = f"-ss {start_ms / 1000:.3f}" if start_ms > 0 else None
+                src = discord.FFmpegOpusAudio(local_path, executable=_ffmpeg_exe(),
+                                              before_options=seek, options=opts)
         except Exception as e:
             print(f"[Music] source build failed: {e}")
             self.current = None
             bot.dispatch("wavelink_track_end", _NativePayload(self, track, "loadFailed"))
             return
         self.current = track
-        self._started = time.monotonic()
+        # Position clock accounts for a resumed start offset.
+        self._started = time.monotonic() - (start_ms / 1000.0)
         self._pause_total = 0.0
         self._paused_at = None
 
@@ -15976,7 +15994,16 @@ async def music_play(interaction: discord.Interaction, query: str):
             return len(q_words & words)
         base = _overlap(top)
         peers = [t for t in tracks if _overlap(t) >= max(1, base) and getattr(t, "view_count", 0) > 0]
-        track = max(peers, key=lambda t: t.view_count) if peers else top
+        # Music videos add intros/skits before the song — only use one when
+        # there's no non-video option.
+        _VIDEO_KWS = ("official video", "official music video", "music video",
+                      "official hd video", "official 4k", "(video", "[video", "m/v")
+        def _is_video(t):
+            tl = t.title.lower()
+            return any(k in tl for k in _VIDEO_KWS)
+        audio_peers = [t for t in peers if not _is_video(t)]
+        pool = audio_peers or peers
+        track = max(pool, key=lambda t: t.view_count) if pool else top
     except Exception:
         track = top
     _adjust_taste(interaction.guild.id, getattr(track, "author", None), 3.0)
