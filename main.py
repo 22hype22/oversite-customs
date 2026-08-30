@@ -16691,6 +16691,16 @@ async def before_sync_identity():
 
 async def _shutdown():
     print("[Shutdown] shutting down")
+    # Music FIRST: snapshot the exact playback position before anything else —
+    # if the host kills us mid-shutdown, the resume still lands on the right
+    # second instead of an up-to-15s-stale loop snapshot.
+    if _music_state_ready:
+        try:
+            state = await _snapshot_music_state()
+            await asyncio.wait_for(_bot_config_upsert("runtime-music-state", {"guilds": state}), timeout=6)
+            print(f"[Shutdown] music state saved ({len(state)} guild(s)) at exact position")
+        except Exception as e:
+            print(f"[Shutdown] music flush error: {e}")
     # Flush every active giveaway (entrants + state) BEFORE we exit, so a redeploy
     # never drops anyone — the boot restore puts them all back.
     try:
@@ -16725,15 +16735,6 @@ async def _shutdown():
             print("[Shutdown] economy balances saved")
         except Exception as e:
             print(f"[Shutdown] economy flush error: {e}")
-    # Snapshot live music at the EXACT current position so a redeploy resumes
-    # seamlessly, mid-song, right where it left off.
-    if _music_state_ready:
-        try:
-            state = await _snapshot_music_state()
-            await asyncio.wait_for(_bot_config_upsert("runtime-music-state", {"guilds": state}), timeout=8)
-            print(f"[Shutdown] music state saved ({len(state)} guild(s)) at exact position")
-        except Exception as e:
-            print(f"[Shutdown] music flush error: {e}")
     if SUPABASE_URL and BOT_ORDER_ID:
         try:
             async with httpx.AsyncClient() as client:
