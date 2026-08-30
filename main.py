@@ -15271,18 +15271,58 @@ def _clean_song_query(title, author=""):
     return f"{t} {a}".strip()
 
 
+def _artist_tokens(track):
+    a = (track.author or "").lower().replace(" - topic", "").strip()
+    if not a and " - " in (track.title or ""):
+        a = track.title.lower().split(" - ", 1)[0].strip()
+    return [w for w in re.split(r"[^a-z0-9]+", a) if len(w) > 1]
+
+
+def _sc_match_ok(track, cand):
+    """Is this SoundCloud candidate ACTUALLY the same song? Duration must be
+    close to the original and most title words must appear — otherwise playing
+    it would be a different song entirely."""
+    if track.length and cand.length:
+        if abs(cand.length - track.length) > max(15000, int(track.length * 0.18)):
+            return False
+    # An altered version (remix/sped up/live...) is NOT the same song — reject
+    # unless the original title itself carries the keyword.
+    _ALT = ("remix", "sped up", "spedup", "slowed", "reverb", "8d", "nightcore",
+            "bass boost", "mashup", "cover", "live", "instrumental", "karaoke",
+            "acoustic", "chipmunk", "pitched", "freestyle")
+    tl = (track.title or "").lower()
+    cl = (cand.title or "").lower()
+    if any(k in cl and k not in tl for k in _ALT):
+        return False
+    base = _clean_song_query(track.title, track.author).lower()
+    words = {w for w in re.split(r"[^a-z0-9]+", base) if len(w) > 2}
+    if not words:
+        return True
+    hay = f"{cand.title} {cand.author or ''}".lower()
+    hits = sum(1 for w in words if w in hay)
+    return hits >= max(1, int(len(words) * 0.6))
+
+
 async def _resolve_stream(track):
     """Fill track.stream_url: try its own URL (YouTube), and when that's blocked
-    by the bot-check, pull the SAME SONG's audio from SoundCloud instead."""
+    by the bot-check, pull the SAME SONG's audio from SoundCloud instead —
+    verified by duration + title match, preferring the artist's own account.
+    No trustworthy match -> no stream (skip), never a random other song."""
     res = await _ytdlp_extract(track.uri or f"ytsearch1:{track.title} {track.author}")
     if not res:
         q = _clean_song_query(track.title, track.author)
         print(f"[Music] YouTube stream blocked — trying SoundCloud for {q!r}")
-        # Several results: official SC uploads of big releases are often DRM
-        # protected — ignoreerrors drops those, we take the best playable one.
         cands = await _ytdlp_extract(f"scsearch5:{q}")
-        if cands:
-            res = [best_track(cands, q) or cands[0]]
+        good = [c for c in (cands or []) if _sc_match_ok(track, c)]
+        if good:
+            # The official artist's own upload first, then the best match.
+            arts = _artist_tokens(track)
+            official = [c for c in good
+                        if arts and all(a in (c.author or "").lower() for a in arts)]
+            pick = (best_track(official, q) if official else None) or best_track(good, q) or good[0]
+            res = [pick]
+        elif cands:
+            print(f"[Music] no trustworthy SoundCloud match for {q!r} — skipping rather than playing the wrong song")
     if res:
         track.stream_url = res[0].stream_url
         track.user_agent = res[0].user_agent or track.user_agent
