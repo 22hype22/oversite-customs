@@ -16445,17 +16445,13 @@ async def on_wavelink_track_end(payload):
                 await player.play(player.queue.get())
             return
 
-        # Truly empty: clear card + VC status
+        # Truly empty: stop the progress updates + clear the VC status, but KEEP
+        # the Now Playing card in place — it stays until the next song's card
+        # replaces it (posting a new card deletes the old one).
         _cancel_progress(guild.id)
         if guild.voice_client and guild.voice_client.channel:
             try:
                 await set_vc_status(guild.voice_client.channel, None)
-            except Exception:
-                pass
-        old = now_playing_messages.pop(guild.id, None)
-        if old:
-            try:
-                await old.delete()
             except Exception:
                 pass
     except Exception as e:
