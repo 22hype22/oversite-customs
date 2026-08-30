@@ -1357,13 +1357,10 @@ async def on_ready():
     # Dropdown-in-modal (Close Order form) needs discord.py 2.6+ (discord.ui.Label).
     print(f"[Boot] discord.py {discord.__version__} | dropdown-in-modal supported: {hasattr(discord.ui, 'Label')}")
     # Music is served by a shared Lavalink node (wavelink client). The bot itself
-    # needs no voice deps; playback works as long as LAVALINK_URI/PASSWORD are set
-    # and the node is reachable. Connection is established in setup_hook.
+    # Music + TTS play natively (yt-dlp/edge-tts + FFmpeg) — no Lavalink.
     try:
-        _nodes = getattr(wavelink.Pool, "nodes", {}) if wavelink else {}
-        print(f"[Boot] music — wavelink {'ok' if wavelink else 'MISSING'} | "
-              f"node {'set' if LAVALINK_URI else 'UNSET (LAVALINK_URI)'} | "
-              f"connected nodes: {len(_nodes)}")
+        print(f"[Boot] music — native engine | yt-dlp {'ok' if _ytdlp else 'MISSING'} | "
+              f"ffmpeg {_ffmpeg_exe()}")
     except Exception as _me:
         print(f"[Boot] music status check failed: {_me!r}")
 
@@ -1485,8 +1482,6 @@ async def on_ready():
         print(f"[Blacklist] saved-roles load failed: {e}")
     if not ticket_inactivity_tick.is_running():
         ticket_inactivity_tick.start()
-    if not wavelink_watchdog.is_running():
-        wavelink_watchdog.start()
     if not econ_autosave.is_running():
         econ_autosave.start()
     await refresh_status()
@@ -13158,7 +13153,7 @@ DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://oversite.shop/bot-dashboard"
 ACCENT_COLOR = ACCENT  # customs' accent, reused by the ported UI
 MUSIC_ALERT_CHANNEL = 0  # Utilities-only alert channel; disabled here
 
-music_available = False
+music_available = True  # native engine (yt-dlp + FFmpeg) — always available
 
 # Auto radio config (dashboard "Auto Radio" block).
 auto_radio_config = {
@@ -15123,7 +15118,8 @@ async def _music_setup_hook():
         if _prev_setup_hook:
             await _prev_setup_hook()
     finally:
-        await setup_wavelink()
+        # Lavalink is no longer used — music + TTS both play natively
+        # (yt-dlp/edge-tts + FFmpeg through the bot's own voice connection).
         asyncio.create_task(_dj_serve())
 
 
@@ -15780,14 +15776,20 @@ async def musicdebug_cmd(interaction: discord.Interaction):
         await interaction.response.send_message(embed=error_embed("No permission", "Admins only."), ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    node_uri = LAVALINK_URI or "(not set)"
-    await _probe_music_sources()
+    yt = await _ytdlp_search_flat("ytsearch3:counting stars onerepublic")
+    sc = await _ytdlp_search_flat("scsearch3:counting stars onerepublic")
+    yt_stream = False
+    if yt:
+        probe = NativeTrack(title=yt[0].title, author=yt[0].author, uri=yt[0].uri)
+        res = await _ytdlp_extract(probe.uri)
+        yt_stream = bool(res and res[0].stream_url)
     lines = [
-        f"**Node:** `{node_uri}`",
-        f"**Connected:** {'yes' if getattr(wavelink.Pool, 'nodes', None) else 'NO'}",
-        f"**Probe:** `{_probe_summary}`",
-        f"**Usable sources:** {', '.join(_music_sources) if _music_sources else '**NONE — the node cannot search any source**'}",
-        f"**Radio streams (http):** {'working' if _http_source_ok else 'not working'}",
+        "**Engine:** native (yt-dlp + FFmpeg — no Lavalink)",
+        f"**ffmpeg:** `{_ffmpeg_exe()}`",
+        f"**YouTube search:** {len(yt) if yt else 0} result(s)",
+        f"**YouTube streams:** {'working' if yt_stream else 'BLOCKED (bot-check) — SoundCloud fallback in use'}",
+        f"**SoundCloud search:** {len(sc) if sc else 0} result(s)",
+        f"**YouTube cookies:** {'loaded' if _YTDLP_BASE.get('cookiefile') else 'not set (YTDLP_COOKIES_B64)'}",
     ]
     await interaction.followup.send(embed=info_embed("Music Diagnostics", "\n".join(lines)), ephemeral=True)
 
