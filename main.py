@@ -15610,7 +15610,7 @@ async def search_any(query: str, exclude=None):
     for prefix in ("ytsearch", "scsearch"):
         if exclude and prefix in exclude:
             continue
-        res = await _ytdlp_search_flat(f"{prefix}5:{q}")
+        res = await _ytdlp_search_flat(f"{prefix}8:{q}")
         if res:
             return res, prefix
     return None, None
@@ -16035,15 +16035,23 @@ async def music_play(interaction: discord.Interaction, query: str):
             return len(q_words & words)
         base = _overlap(top)
         peers = [t for t in tracks if _overlap(t) >= max(1, base) and getattr(t, "view_count", 0) > 0]
-        # Music videos add intros/skits before the song — only use one when
-        # there's no non-video option.
+        # Music videos add intros/skits before the song. Official videos are
+        # usually titled plainly, so hunt the EXPLICIT audio version first
+        # (Topic uploads / Official Audio / Lyrics / Visualizer), then anything
+        # not labeled as a video, then — only if nothing else — a music video.
         _VIDEO_KWS = ("official video", "official music video", "music video",
                       "official hd video", "official 4k", "(video", "[video", "m/v")
+        _AUDIO_KWS = ("official audio", "(audio", "[audio", "lyric", "visualizer", "audio)")
         def _is_video(t):
             tl = t.title.lower()
             return any(k in tl for k in _VIDEO_KWS)
-        audio_peers = [t for t in peers if not _is_video(t)]
-        pool = audio_peers or peers
+        def _is_audio(t):
+            tl = t.title.lower()
+            au = (t.author or "").lower()
+            return au.endswith(" - topic") or any(k in tl for k in _AUDIO_KWS)
+        audio_first = [t for t in peers if _is_audio(t)]
+        non_video = [t for t in peers if not _is_video(t)]
+        pool = audio_first or non_video or peers
         track = max(pool, key=lambda t: t.view_count) if pool else top
     except Exception:
         track = top
