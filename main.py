@@ -14620,6 +14620,30 @@ def _tts_format(message):
     return text
 
 
+_FFMPEG_EXE = None
+
+
+def _ffmpeg_exe():
+    """Path to an ffmpeg binary: the system one when present, else the static
+    build bundled by the imageio-ffmpeg pip package (works on any host, no
+    system packages needed)."""
+    global _FFMPEG_EXE
+    if _FFMPEG_EXE:
+        return _FFMPEG_EXE
+    import shutil
+    p = shutil.which("ffmpeg")
+    if not p:
+        try:
+            import imageio_ffmpeg
+            p = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as e:
+            print(f"[TTS] no ffmpeg available: {e}")
+            p = "ffmpeg"
+    _FFMPEG_EXE = p
+    print(f"[TTS] ffmpeg: {p}")
+    return p
+
+
 def _tts_ffmpeg_options(path):
     """FFmpeg options for a synthesized clip. edge-tts bakes the speed into the
     audio; the gTTS/ElevenLabs fallbacks get an atempo filter instead."""
@@ -14655,7 +14679,9 @@ async def _tts_play_next(vc):
 
     try:
         opts = _tts_ffmpeg_options(path)
-        src = discord.FFmpegOpusAudio(path, options=opts) if opts else discord.FFmpegOpusAudio(path)
+        exe = _ffmpeg_exe()
+        src = (discord.FFmpegOpusAudio(path, executable=exe, options=opts) if opts
+               else discord.FFmpegOpusAudio(path, executable=exe))
         vc.play(src, after=_after)
     except Exception as e:
         print(f"[TTS] play failed: {e}")
