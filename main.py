@@ -6257,9 +6257,11 @@ def _apply_answers(open_comps, mapping):
 # dashboard whose text embeds tokens; the tokens define both the modal inputs and
 # where the answers land in the posted message. Supported tokens:
 #   {user}                             -> the submitter's mention (no input)
+#   {member: Label}                    -> pick one server member (renders their mention)
 #   {question: Label}                  -> short text input
-#   {long question: Label}             -> paragraph text input
-#   {drop down: Name Opt1 Opt2 ...}    -> select menu (first word = name)
+#   {long question: Label} / {LQuestion: Label} -> paragraph text input
+#   {drop down: Name Opt1 Opt2 ...}    -> select menu (first word = name;
+#                                          options may be space- or comma-separated)
 #   {file: Name}                       -> file upload (attached to the posted message)
 # custom_id namespace for the modal is "pf:<feature>".
 prompt_forms_config = {}  # feature -> {"design": [...], "channel_id": "...", "title": "..."}
@@ -6271,17 +6273,19 @@ _pf_pending = {}
 # form 1; {Question2:} / {File2:} are form 2, and so on. Discord caps a modal at 5
 # inputs, so >5 questions are split across forms shown one after another.
 _PF_TOKEN_RE = re.compile(
-    r"\{(user|long\s*question|question|drop\s*down|dropdown|select|file)\s*(\d*)\s*(?::\s*(.*?))?\}",
+    r"\{(user|members?|member\s*select|long\s*question|lquestion|drop\s*down|dropdown|select|question|file)\s*(\d*)\s*(?::\s*(.*?))?\}",
     re.IGNORECASE,
 )
 
 
 def _pf_norm_kind(raw_kind):
     k = (raw_kind or "").lower().replace(" ", "")
-    if k == "longquestion":
+    if k in ("longquestion", "lquestion"):
         return "lquestion"
     if k in ("dropdown", "select"):
         return "dropdown"
+    if k in ("member", "members", "memberselect"):
+        return "member"
     return k  # user | question | file
 
 
@@ -6323,12 +6327,22 @@ def _pf_form_numbers(design):
 
 def _pf_dropdown_parts(content):
     """'Priority Low Medium Urgent' -> ('Priority', ['Low','Medium','Urgent']).
-    Options are de-duplicated (Discord rejects a select with repeated values)."""
-    parts = [p.strip(":").strip() for p in (content or "").split() if p.strip(":").strip()]
-    if not parts:
+    The first whitespace-separated token is the name; the rest are options.
+    Options may be separated by spaces AND/OR commas, so 'Rating: 1, 2, 3, 4, 5'
+    yields clean 1..5 (no trailing commas). De-duplicated (Discord rejects a
+    select with repeated values)."""
+    toks = [p for p in re.split(r"\s+", (content or "").strip()) if p]
+    if not toks:
         return ("Choose", ["Yes", "No"])
-    name, opts = parts[0], list(dict.fromkeys(parts[1:]))  # de-dupe, keep order
-    return (name, opts or ["Yes", "No"])
+    name = toks[0].strip(":,").strip()
+    opts = []
+    for p in toks[1:]:
+        for o in re.split(r",+", p):
+            o = o.strip(":,").strip()
+            if o:
+                opts.append(o)
+    opts = list(dict.fromkeys(opts))  # de-dupe, keep order
+    return (name or "Choose", opts or ["Yes", "No"])
 
 
 def _pf_render(design, uid, answers):
@@ -6342,8 +6356,10 @@ def _pf_render(design, uid, answers):
         if kind == "user":
             out = f"<@{uid}>"
         else:
-            out = answers[state["i"]] if state["i"] < len(answers) else ""
+            val = answers[state["i"]] if state["i"] < len(answers) else ""
             state["i"] += 1
+            # A member pick collects the chosen user's id — render it as a mention.
+            out = (f"<@{val}>" if val else "") if kind == "member" else val
         return json.dumps(str(out))[1:-1]
 
     return json.loads(_PF_TOKEN_RE.sub(repl, raw))
@@ -6371,6 +6387,12 @@ async def _pf_open_modal(interaction, feature, design, title, form_num=None):
             components.append({"type": 18, "label": label[:45],
                                "component": {"type": 19, "custom_id": cid, "required": False,
                                              "min_values": 0, "max_values": 5}})
+        elif t["kind"] == "member":
+            # A user-select inside the modal — the submitter picks one member;
+            # it renders as that member's mention in the posted message.
+            components.append({"type": 18, "label": (_clean_label(t["content"]) or "Member")[:45],
+                               "component": {"type": 5, "custom_id": cid, "min_values": 1,
+                                             "max_values": 1}})
         elif t["kind"] == "dropdown":
             name, opts = _pf_dropdown_parts(t["content"])
             seen, options = set(), []
