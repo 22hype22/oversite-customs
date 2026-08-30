@@ -14946,9 +14946,13 @@ async def _dj_start_set(guild, first_activation: bool = False):
         line = await _dj_ai_line(spoken, first_activation) or random.choice(pool).format(vibe=spoken)
         clip = await _dj_make_clip(line)
         if clip:
-            import wavelink as _wl
-            clips = await _wl.Playable.search(clip, source=None)
-            if clips:
+            # The clip is a locally generated mp3 — play the file directly
+            # through the native player (uri keeps the /dj/ URL so
+            # _is_dj_clip still recognizes it).
+            clip_path = os.path.join(_dj_clip_dir, clip.rsplit("/", 1)[-1])
+            if os.path.exists(clip_path):
+                ct = NativeTrack(title="DJ Carla", uri=clip, stream_url=clip)
+                ct.local_path = clip_path
                 try:
                     vc.queue.clear()
                 except Exception:
@@ -14960,7 +14964,7 @@ async def _dj_start_set(guild, first_activation: bool = False):
                     await vc.set_volume(min(300, int(_prev * DJ_VOICE_BOOST)))
                 except Exception:
                     pass
-                await vc.play(clips[0])
+                await vc.play(ct)
                 print(f"[DJ] Speaking: {line}")
                 return
         tracks = await fetch_task
