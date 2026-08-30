@@ -14359,10 +14359,10 @@ TTS_SPEED = float(os.getenv("TTS_SPEED", "1.15"))  # ElevenLabs voice speed (0.7
 # Discord-TTS-Bot uses by default; "eleven" = the ElevenLabs voice above.
 TTS_ENGINE = os.getenv("TTS_ENGINE", "gtts").lower()
 TTS_LANG = os.getenv("TTS_LANG", "en")
-# gTTS accent comes from the Google host TLD: co.uk = British (the voice most
-# TTS-bot servers run), com.au = Australian, com = US, ca = Canadian,
-# ie = Irish, co.in = Indian. Overridable via env or the dashboard TTS block.
-TTS_TLD = os.getenv("TTS_TLD", "co.uk")
+# gTTS accent comes from the Google host TLD. Always the AUSTRALIAN voice
+# (com.au) — hardcoded default; co.uk = British, com = US, ca = Canadian,
+# ie = Irish, co.in = Indian remain available via env or the dashboard block.
+TTS_TLD = os.getenv("TTS_TLD", "com.au")
 # Playback speed (1.0 = normal). The reference TTS bot plays gTTS with NO speed
 # change, so 1.0 matches it exactly.
 TTS_PLAYBACK_SPEED = float(os.getenv("TTS_PLAYBACK_SPEED", "1.0"))
