@@ -983,6 +983,50 @@ def _register_ticket_components(panels):
             walk(tree, 0, source)
     print(f"[Tickets] registry: {len(ticket_msgs)} ticket + {len(form_msgs)} form + {len(eph_msgs)} ephemeral messages")
     print(f"[Tickets] registry built: tickets={{{', '.join(f'{k}:{len(v)}' for k,v in ticket_msgs.items())}}} eph={{{', '.join(f'{k}:{len(v)}' for k,v in eph_msgs.items())}}}")
+    _schedule_eph_save()
+
+
+# ---- Ephemeral-message registry persistence ----
+# The value baked into a posted select option / button is "eph:<key>", where the
+# key is the design component's id or a CONTENT HASH. Editing that option in the
+# dashboard changes the hash, so an already-posted message points at a key the
+# fresh config no longer registers — the click found nothing. Persisting every
+# key->content pair we ever register keeps old posted messages working forever.
+_eph_persist_task = None
+
+
+async def _load_eph_registry():
+    cfg = await _bot_config_get("eph-registry")
+    saved = (cfg or {}).get("messages")
+    if isinstance(saved, dict):
+        n = 0
+        for k, v in saved.items():
+            if isinstance(v, list) and v and k not in eph_msgs:
+                eph_msgs[k] = v
+                n += 1
+        print(f"[Tickets] eph registry: restored {n} entr{'y' if n == 1 else 'ies'} for older posted messages (total {len(eph_msgs)})")
+
+
+def _schedule_eph_save():
+    """Debounced persist of the ephemeral registry (content included)."""
+    global _eph_persist_task
+    if _eph_persist_task and not _eph_persist_task.done():
+        return
+
+    async def _run():
+        await asyncio.sleep(5)
+        try:
+            data = {k: v for k, v in eph_msgs.items() if isinstance(v, list) and v}
+            if len(data) > 300:  # cap defensively; oldest entries drop first
+                data = dict(list(data.items())[-300:])
+            await _bot_config_upsert("eph-registry", {"messages": data})
+        except Exception as e:
+            print(f"[Tickets] eph registry save failed: {e}")
+
+    try:
+        _eph_persist_task = asyncio.create_task(_run())
+    except Exception:
+        pass
 
 
 def _register_eph_from_tree(tree):
@@ -1017,6 +1061,7 @@ def _register_eph_from_tree(tree):
                 _reg(c.get("button") or {})
 
     _walk(tree if isinstance(tree, list) else [], 0)
+    _schedule_eph_save()
 
 
 # Ticket panels can come from more than one dashboard block — the main "Tickets"
@@ -1373,6 +1418,12 @@ async def on_ready():
         await _load_tts_nicks()
     except Exception as e:
         print(f"[TTS] nick load failed: {e}")
+    # Fill in ephemeral-message content for OLDER posted messages whose keys the
+    # fresh configs no longer produce (the design was edited since posting).
+    try:
+        await _load_eph_registry()
+    except Exception as e:
+        print(f"[Tickets] eph registry load failed: {e}")
     try:
         await _load_econ()
     except Exception as e:
@@ -7934,10 +7985,19 @@ async def show_ephemeral(interaction, key):
     print(f"[Tickets] show_ephemeral key={key!r} registered={key in eph_msgs} len={len(comps) if comps else 0} "
           f"all_eph={{{', '.join(f'{k}:{len(v or [])}' for k, v in eph_msgs.items())}}}")
     if not comps:
-        # Option has no content — acknowledge silently instead of posting a
-        # stray "Nothing here" ephemeral next to the real message.
+        # Unknown key — this posted message predates a design edit and its
+        # content isn't in the registry. Say so instead of silently doing
+        # nothing, so it's obvious the panel needs a re-save/re-post.
         try:
-            await interaction.response.defer()  # component ack, nothing shown
+            await interaction.response.send_message(
+                embed=info_embed(
+                    "This option needs a refresh",
+                    "This message is from an older version of its design. "
+                    "An admin can fix it by re-saving that block in the dashboard "
+                    "(or re-posting this message).",
+                ),
+                ephemeral=True,
+            )
         except Exception:
             pass
         return
@@ -9486,6 +9546,7 @@ def _build_v2(comp, guild):
                 has_category = True
                 _ek = _comp_key(opt)
                 eph_msgs[_ek] = opt.get("open_components") or []  # register on any surface
+                _schedule_eph_save()
                 value = f"eph:{_ek}"
             elif category:
                 has_category = True
@@ -9725,6 +9786,7 @@ def build_button(btn, guild):
     if "ephemeral" in btn:
         key = _comp_key(btn)
         eph_msgs[key] = btn.get("open_components") or []  # works on ANY surface, not just ticket panels
+        _schedule_eph_save()
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"eph:{key}"})
     if category:
         return _btn({"type": 2, "label": label[:80], "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": f"ticket_cat:{category[:80]}"})
