@@ -9513,8 +9513,17 @@ def build_embed(data, guild=None):
 
 async def handle_post(channel, payload):
     components_v2 = payload.get("components_v2")
+    # Files the poster wants dropped into a THREAD off the message (e.g. a
+    # custom-feature "Example" upload), rather than inlined on the message
+    # itself. Each entry: {url, filename, label}.
+    thread_files = [f for f in (payload.get("thread_files") or []) if isinstance(f, dict) and f.get("url")]
     if components_v2:
-        await send_v2_message(channel, components_v2, payload.get("content") or None)
+        mid = await send_v2_message(channel, components_v2, payload.get("content") or None)
+        if thread_files and mid:
+            tname = _clean_label(thread_files[0].get("label") or "Example") or "Example"
+            await _post_form_files_thread(
+                channel, mid if isinstance(mid, str) else None, thread_files, tname,
+            )
         return
     embeds_data = payload.get("embeds") or []
     _guild = getattr(channel, "guild", None)
