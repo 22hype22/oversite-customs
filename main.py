@@ -15196,6 +15196,7 @@ class NativeTrack:
         self.user_agent = user_agent or ""
         self.view_count = 0
         self.protocol = ""
+        self.local_path = None
         self.identifier = self.uri
         self.source = "native"
 
@@ -15258,6 +15259,41 @@ async def _ytdlp_extract(target, playlist_limit=25):
         return []
 
 
+def _ytdlp_search_flat_sync(target):
+    """ONE request for a whole search page (no per-video extraction) — titles,
+    uploaders, durations and view counts, ~5x faster than full extraction.
+    stream URLs resolve lazily when a track is actually played."""
+    opts = dict(_YTDLP_BASE)
+    opts["extract_flat"] = True
+    with _ytdlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(target, download=False)
+    out = []
+    for e in ((info or {}).get("entries") or []):
+        if not isinstance(e, dict):
+            continue
+        t = NativeTrack(
+            title=e.get("title"),
+            author=e.get("uploader") or e.get("channel") or "",
+            length=int((e.get("duration") or 0) * 1000),
+            uri=e.get("url") or e.get("webpage_url") or "",
+            artwork=(e.get("thumbnails") or [{}])[-1].get("url") if e.get("thumbnails") else None,
+        )
+        t.view_count = int(e.get("view_count") or 0)
+        if t.uri:
+            out.append(t)
+    return out
+
+
+async def _ytdlp_search_flat(target):
+    if _ytdlp is None:
+        return []
+    try:
+        return await asyncio.to_thread(_ytdlp_search_flat_sync, target)
+    except Exception as e:
+        print(f"[Music] flat search failed for {str(target)[:60]!r}: {e}")
+        return []
+
+
 class NativeQueue:
     def __init__(self):
         self._items = []
@@ -15306,7 +15342,15 @@ async def _music_download(track):
     """Download a track's audio to a temp file (reference-bot style: fetch the
     bytes, play locally). Refreshes an expired stream URL once. Returns the
     local path or None."""
+    if track.local_path and os.path.exists(track.local_path):
+        return track.local_path
     os.makedirs(_MUSIC_TMP_DIR, exist_ok=True)
+    try:
+        files = sorted(os.listdir(_MUSIC_TMP_DIR))
+        for old_f in files[:-20]:
+            os.remove(os.path.join(_MUSIC_TMP_DIR, old_f))
+    except Exception:
+        pass
     import uuid
     path = os.path.join(_MUSIC_TMP_DIR, f"{uuid.uuid4().hex}.audio")
     for attempt in (1, 2):
@@ -15394,12 +15438,18 @@ class NativePlayer(discord.VoiceClient):
                 pass
             if old is not None:
                 bot.dispatch("wavelink_track_end", _NativePayload(self, old, "replaced"))
-        # Resolve (or refresh) the stream URL — they expire after a while.
-        if not track.stream_url:
+        # Resolve (or refresh) the stream URL — flat-search tracks resolve here,
+        # and prefetched tracks already carry a local file.
+        if not track.stream_url and not track.local_path:
             res = await _ytdlp_extract(track.uri or f"ytsearch1:{track.title} {track.author}")
             if res:
                 track.stream_url = res[0].stream_url
-        if not track.stream_url:
+                track.user_agent = res[0].user_agent or track.user_agent
+                track.protocol = res[0].protocol or track.protocol
+                track.artwork = track.artwork or res[0].artwork
+                if res[0].length:
+                    track.length = res[0].length
+        if not track.stream_url and not track.local_path:
             self.current = None
             bot.dispatch("wavelink_track_end", _NativePayload(self, track, "loadFailed"))
             return
@@ -15453,6 +15503,25 @@ class NativePlayer(discord.VoiceClient):
 
         discord.VoiceClient.play(self, src, after=_after)
         bot.dispatch("wavelink_track_start", _NativePayload(self, track))
+        asyncio.create_task(self._prefetch_next())
+
+    async def _prefetch_next(self):
+        """Resolve + download the next queued track while this one plays, so
+        skipping starts the next song immediately."""
+        try:
+            nxt = next(iter(self.queue), None)
+            if nxt is None or nxt.is_stream or nxt.local_path:
+                return
+            if not nxt.stream_url:
+                res = await _ytdlp_extract(nxt.uri or f"ytsearch1:{nxt.title} {nxt.author}")
+                if res:
+                    nxt.stream_url = res[0].stream_url
+                    nxt.user_agent = res[0].user_agent or nxt.user_agent
+                    nxt.protocol = res[0].protocol or nxt.protocol
+            if nxt.stream_url and "m3u8" not in (nxt.protocol or "") and "hls" not in (nxt.protocol or ""):
+                nxt.local_path = await _music_download(nxt)
+        except Exception as e:
+            print(f"[Music] prefetch failed: {e}")
 
     async def skip(self, force=True):
         # Stopping fires the after-callback -> track_end("finished") -> the
@@ -15488,7 +15557,7 @@ async def search_any(query: str, exclude=None):
     for prefix in ("ytsearch", "scsearch"):
         if exclude and prefix in exclude:
             continue
-        res = await _ytdlp_extract(f"{prefix}5:{q}")
+        res = await _ytdlp_search_flat(f"{prefix}5:{q}")
         if res:
             return res, prefix
     return None, None
