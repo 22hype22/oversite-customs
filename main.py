@@ -14359,12 +14359,13 @@ TTS_SPEED = float(os.getenv("TTS_SPEED", "1.15"))  # ElevenLabs voice speed (0.7
 # Discord-TTS-Bot uses by default; "eleven" = the ElevenLabs voice above.
 TTS_ENGINE = os.getenv("TTS_ENGINE", "gtts").lower()
 TTS_LANG = os.getenv("TTS_LANG", "en")
-# gTTS accent comes from the Google host TLD: co.uk = British, com = US,
-# com.au = Australian, ca = Canadian, ie = Irish, co.in = Indian.
-TTS_TLD = os.getenv("TTS_TLD", "co.uk")
-# Playback speed applied via a Lavalink timescale filter (1.0 = normal). gTTS is
-# a bit slow, so speed it up without changing pitch.
-TTS_PLAYBACK_SPEED = float(os.getenv("TTS_PLAYBACK_SPEED", "1.1"))
+# gTTS accent comes from the Google host TLD: com = US (the reference TTS bot's
+# default), co.uk = British, com.au = Australian, ca = Canadian, ie = Irish,
+# co.in = Indian.
+TTS_TLD = os.getenv("TTS_TLD", "com")
+# Playback speed (1.0 = normal). The reference TTS bot plays gTTS with NO speed
+# change, so 1.0 matches it exactly.
+TTS_PLAYBACK_SPEED = float(os.getenv("TTS_PLAYBACK_SPEED", "1.0"))
 
 # Live TTS settings, overridable from the dashboard "Text-to-Speech" block.
 tts_config = {
@@ -14438,10 +14439,37 @@ def _tts_edge_rate():
     return f"{'+' if pct >= 0 else ''}{pct}%"
 
 
+async def _gtts_fetch(text, path):
+    """Google Translate TTS — the reference TTS bot's default voice (mode gTTS,
+    voice 'en', no speed change). Chunks >200 chars are stitched into one mp3."""
+    import urllib.parse
+    data = b""
+    try:
+        async with httpx.AsyncClient() as client:
+            for ch in _gtts_chunks(text, 200):
+                url = (f"https://translate.google.{tts_config['accent']}/translate_tts?ie=UTF-8&client=tw-ob"
+                       f"&tl={urllib.parse.quote(TTS_LANG)}&q={urllib.parse.quote(ch)}")
+                r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                if r.status_code == 200 and r.content:
+                    data += r.content
+    except Exception as e:
+        print(f"[TTS] gTTS fetch failed: {e}")
+    if not data:
+        return None
+    try:
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+    except Exception as e:
+        print(f"[TTS] gTTS save failed: {e}")
+        return None
+
+
 async def _tts_synth(text):
     """Synthesize `text` to a local mp3 and return its path (None on failure).
-    ElevenLabs when configured, else edge-tts (free, no key), else the raw
-    Google Translate TTS endpoint as a last resort."""
+    Engine 'gtts' (default) = the Google Translate voice the reference TTS bot
+    uses; 'eleven' = ElevenLabs; edge-tts is the fallback when the primary
+    engine fails."""
     os.makedirs(_TTS_TMP_DIR, exist_ok=True)
     import uuid
     path = os.path.join(_TTS_TMP_DIR, f"{uuid.uuid4().hex}.mp3")
@@ -14465,7 +14493,12 @@ async def _tts_synth(text):
             print(f"[TTS] elevenlabs HTTP {r.status_code}")
         except Exception as e:
             print(f"[TTS] elevenlabs failed: {e}")
+    else:
+        # Primary: the reference bot's voice — Google Translate TTS.
+        if await _gtts_fetch(text[:600], path):
+            return path
 
+    # Fallback: edge-tts (free, reliable, accent-matched).
     try:
         import edge_tts
         await edge_tts.Communicate(text[:600], _tts_edge_voice(), rate=_tts_edge_rate()).save(path)
@@ -14473,29 +14506,7 @@ async def _tts_synth(text):
             return path
     except Exception as e:
         print(f"[TTS] edge-tts failed: {e}")
-
-    # Last resort: raw Google Translate TTS chunks stitched into one file.
-    import urllib.parse
-    data = b""
-    try:
-        async with httpx.AsyncClient() as client:
-            for ch in _gtts_chunks(text[:600], 200):
-                url = (f"https://translate.google.{tts_config['accent']}/translate_tts?ie=UTF-8&client=tw-ob"
-                       f"&tl={urllib.parse.quote(TTS_LANG)}&q={urllib.parse.quote(ch)}")
-                r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-                if r.status_code == 200 and r.content:
-                    data += r.content
-    except Exception as e:
-        print(f"[TTS] gTTS fetch failed: {e}")
-    if not data:
-        return None
-    try:
-        with open(path, "wb") as f:
-            f.write(data)
-        return path
-    except Exception as e:
-        print(f"[TTS] gTTS save failed: {e}")
-        return None
+    return None
 
 _TTS_ACRONYMS = {
     "iirc": "if I recall correctly", "afaik": "as far as I know",
