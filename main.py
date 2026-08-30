@@ -13386,7 +13386,7 @@ def best_track(tracks, query: str):
             if len(w) > 3 and w in author_lower:
                 s += 20
         for kw in ["cover", "sped up", "slowed", "reverb", "lofi", "lo-fi", "workout", "remix",
-                   "version", "acoustic", "bass boost", "8d", "visualizer", "live", "mashup",
+                   "version", "acoustic", "bass boost", "8d", "live", "mashup",
                    "extended", "loop", "pitched", "chipmunk"]:
             if kw in title_lower and kw not in query_lower:
                 s -= 15
@@ -16059,11 +16059,11 @@ async def music_play(interaction: discord.Interaction, query: str):
         # not labeled as a video, then — only if nothing else — a music video.
         _VIDEO_KWS = ("official video", "official music video", "music video",
                       "official hd video", "official 4k", "(video", "[video", "m/v")
-        _AUDIO_KWS = ("official audio", "(audio", "[audio", "lyric", "audio)")
+        _AUDIO_KWS = ("official audio", "(audio", "[audio", "lyric", "audio)", "visualizer")
         # Versions that change the song — filtered out unless the query asks.
         _ALTERED_KWS = ("bass boost", "sped up", "spedup", "slowed", "reverb", "8d",
                         "nightcore", "daycore", "remix", "mashup", "cover", "live",
-                        "instrumental", "karaoke", "acoustic", "visualizer", "loop",
+                        "instrumental", "karaoke", "acoustic", "loop",
                         "extended", "pitched", "chipmunk")
         _ql = query.lower()
         def _is_altered(t):
