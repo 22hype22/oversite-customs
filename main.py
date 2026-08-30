@@ -6036,9 +6036,10 @@ FORM_PAGE_SIZE = 5
 FORM_MAX_QUESTIONS = 10
 
 
-async def _post_form_files(channel, files):
-    """Upload collected form files into a channel, each labelled by its field.
-    (Fallback for when files can't be embedded inline in the message.)"""
+async def _post_form_files(channel, files, label=True):
+    """Upload collected form files into a channel. With label=True each file gets
+    a bold header naming its field; with label=False just the file is posted (no
+    words), e.g. a suggestion's image sitting bare in its thread."""
     for f in files or []:
         try:
             async with httpx.AsyncClient() as client:
@@ -6046,7 +6047,8 @@ async def _post_form_files(channel, files):
                 if r.status_code != 200:
                     continue
                 blob = r.content
-            await channel.send(content=f"**{_clean_label(f.get('label') or 'File')}**",
+            content = f"**{_clean_label(f.get('label') or 'File')}**" if label else None
+            await channel.send(content=content,
                                file=discord.File(io.BytesIO(blob), filename=f.get("filename") or "file"))
         except Exception as e:
             print(f"[Form] file post failed: {e}")
@@ -6115,9 +6117,10 @@ async def _send_v2_with_files(channel, components_v2, files, allowed_mentions=No
         return False
 
 
-async def _post_form_files_thread(channel, opening_message_id, files, thread_name="References"):
+async def _post_form_files_thread(channel, opening_message_id, files, thread_name="References", label=True):
     """Post the uploaded form files into a THREAD off the ticket's opening
-    message (falls back to a standalone thread, then to the channel itself)."""
+    message (falls back to a standalone thread, then to the channel itself).
+    label=False posts the files bare (no field header)."""
     name = (thread_name or "References")[:100]
     thread = None
     if opening_message_id:
@@ -6132,9 +6135,9 @@ async def _post_form_files_thread(channel, opening_message_id, files, thread_nam
         except Exception as e:
             print(f"[Form] standalone thread failed: {e}")
     if thread is None:
-        await _post_form_files(channel, files)  # last resort: post in the channel
+        await _post_form_files(channel, files, label=label)  # last resort: post in the channel
         return None
-    await _post_form_files(thread, files)
+    await _post_form_files(thread, files, label=label)
     return thread
 
 
@@ -6403,6 +6406,15 @@ def _pf_prefill_member(design, text):
         return m.group(0)
 
     return json.loads(_PF_TOKEN_RE.sub(repl, raw))
+
+
+def _pf_strip_file_lines(design):
+    """Remove any "**Label:** {File:…}" segment (with its leading newline) from a
+    design, so an uploaded file leaves no text on the posted message — the upload
+    lives in a thread instead."""
+    raw = json.dumps(design or [])
+    raw = re.sub(r'(?:\\n)?[^"\\{}]*\{\s*file\s*\d*\s*(?::\s*[^{}]*?)?\s*\}', "", raw, flags=re.IGNORECASE)
+    return json.loads(raw)
 
 
 async def _pf_open_modal(interaction, feature, design, title, form_num=None):
@@ -6740,13 +6752,27 @@ async def _pf_submit(interaction, feature, form_num=1):
     if not ch:
         return await interaction.response.send_message("Couldn't find the destination channel.", ephemeral=True)
     await interaction.response.send_message("Submitted. Our team will look into it!", ephemeral=True)
-    out = _pf_render(design, interaction.user.id, answers)
-    await send_v2_message(ch, out, allowed_mentions={"parse": []})
+
+    # An uploaded file goes into a THREAD off the message with no text on the
+    # message itself: strip the {File:} line and drop its answer slot, so the
+    # remaining answers still line up, then post the file bare in the thread.
+    toks = _pf_inputs(design)
+    answers_nofile, file_label = [], "Attachment"
+    for i, t in enumerate(toks):
+        if t["kind"] == "file":
+            if t.get("content"):
+                file_label = _clean_label(t["content"]) or file_label
+        else:
+            answers_nofile.append(pend["answers"].get(i, ""))
+    out = _pf_render(_pf_strip_file_lines(design), interaction.user.id, answers_nofile)
+    mid = await send_v2_message(ch, out, allowed_mentions={"parse": []})
     if files:
         try:
-            await _post_form_files(ch, files)
+            await _post_form_files_thread(
+                ch, mid if isinstance(mid, str) else None, files, file_label, label=False,
+            )
         except Exception as e:
-            print(f"[PromptForm] file post failed: {e}")
+            print(f"[PromptForm] file thread post failed: {e}")
 
 
 @bot.tree.command(name="suggestion", description="Share a suggestion")
