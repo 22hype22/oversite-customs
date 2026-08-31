@@ -1434,6 +1434,8 @@ async def on_ready():
         except Exception as e:
             print(f"[Startup] ticket perm resync failed: {e}")
     asyncio.create_task(_boot_ticket_perm_sync())
+    # Older pending ad-approval cards predate the Delay button — add it to them.
+    asyncio.create_task(_ads_retrofit_delay_buttons())
 
     try:
         await seed_secret_slots()
@@ -12037,6 +12039,42 @@ def _ads_parse_delay_date(raw):
         return int(datetime.datetime(y, mo, d, 16, 0, tzinfo=datetime.timezone.utc).timestamp())
     except ValueError:
         return None
+
+
+async def _ads_retrofit_delay_buttons():
+    """One-shot boot pass: any 'Ad awaiting approval' card posted before the
+    Delay feature shipped only has Approve/Deny — edit those messages to add
+    the Delay button so staff can schedule ads that were already pending."""
+    ch = await resolve_channel(ads_config.get("approval_channel_id"))
+    if not ch:
+        return
+    fixed = 0
+    try:
+        async for msg in ch.history(limit=100):
+            if msg.author.id != (bot.user.id if bot.user else 0) or not msg.embeds:
+                continue
+            if "awaiting approval" not in ((msg.embeds[0].title or "").lower()):
+                continue  # already approved/denied cards have a different title
+            ids = [c.custom_id for row in msg.components for c in getattr(row, "children", []) if getattr(c, "custom_id", None)]
+            if not ids or any(i.startswith("ad_delay:") for i in ids):
+                continue  # no buttons left, or already retrofitted
+            ok = next((i for i in ids if i.startswith("ad_ok:")), None)
+            if not ok:
+                continue
+            ad_id = ok.split(":", 1)[1]
+            view = discord.ui.View(timeout=None)
+            view.add_item(discord.ui.Button(label="Approve", style=discord.ButtonStyle.success, custom_id=f"ad_ok:{ad_id}"))
+            view.add_item(discord.ui.Button(label="Deny", style=discord.ButtonStyle.danger, custom_id=f"ad_no:{ad_id}"))
+            view.add_item(discord.ui.Button(label="Delay", style=discord.ButtonStyle.secondary, custom_id=f"ad_delay:{ad_id}"))
+            try:
+                await msg.edit(view=view)
+                fixed += 1
+            except Exception as e:
+                print(f"[Ads] delay-button retrofit edit failed: {e}")
+    except Exception as e:
+        print(f"[Ads] delay-button retrofit scan failed: {e}")
+    if fixed:
+        print(f"[Ads] added Delay button to {fixed} pending approval card(s)")
 
 
 class AdDelayModal(discord.ui.Modal):
