@@ -13297,14 +13297,17 @@ async def seed_secret_slots():
     }, {
         "addon_id": "customs",
         "key": "ROBLOX_DEVPRODUCT_PLACE_ID",
-        "label": "Store experience ID",
-        "description": ("The Roblox experience where Purchase dev products are created. Paste "
-                        "either its place ID (roblox.com/games/<ID>/…) OR its experience ID (the "
+        "label": "Store experience ID(s)",
+        "description": ("The Roblox experience(s) where Purchase dev products are created. Paste "
+                        "either a place ID (roblox.com/games/<ID>/…) OR an experience ID (the "
                         "number in the Creator Dashboard URL, create.roblox.com/dashboard/"
-                        "creations/experiences/<ID>/overview) — both work. It MUST be an "
-                        "experience your Open Cloud API key is authorized for (add it to the key "
-                        "with developer-product write). Leave blank to use the default store."),
-        "placeholder": "e.g. 10357040169 (experience ID) or a place ID",
+                        "creations/experiences/<ID>/overview) — both work. Have more than one "
+                        "game? List several separated by commas — new items fill the first "
+                        "experience, and once it's full they roll over into the next one "
+                        "automatically. Each MUST be authorized for your Open Cloud API key (add "
+                        "it to the key with developer-product write). Leave blank for the default "
+                        "store."),
+        "placeholder": "e.g. 10357040169, 128739314806275  (one or more, comma-separated)",
         "required": False,
         "sort_order": 2,
     }]
