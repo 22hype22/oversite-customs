@@ -3050,23 +3050,78 @@ async def _giveaway_send(channel, g, gid):
 
 
 async def _giveaway_patch(g, payload):
+    """PATCH the giveaway message. Returns Discord's error code on failure
+    (e.g. 30046 = edit cap on messages older than 1h), else None."""
     try:
         route = discord.http.Route(
             "PATCH", "/channels/{channel_id}/messages/{message_id}",
             channel_id=int(g["channel_id"]), message_id=int(g["message_id"]),
         )
         await bot.http.request(route, json=payload)
+        return None
+    except discord.HTTPException as e:
+        print(f"[Giveaway] edit failed: {e}")
+        return getattr(e, "code", None)
     except Exception as e:
         print(f"[Giveaway] edit failed: {e}")
+        return None
+
+
+# Live-count repaints are throttled: entries can burst (dozens of clicks in
+# seconds) and Discord both rate-limits PATCH and hard-caps total edits to
+# messages older than an hour (error 30046 — this produced a 51-line 429 storm
+# in production). Entries themselves are never throttled — only how often the
+# on-message counter repaints. One worker per giveaway coalesces bursts into
+# one edit per window; hitting 30046 pauses repaints for 30 minutes (the final
+# ended-state edit is separate and unaffected).
+_gw_refresh_state = {}  # gid -> {"dirty","task","last","block_until"}
+
+
+def _gw_msg_age_seconds(g):
+    try:
+        mid = int(g.get("message_id") or 0)
+        posted = ((mid >> 22) + 1420070400000) / 1000  # snowflake -> unix secs
+        return max(0.0, time.time() - posted)
+    except Exception:
+        return 0.0
+
+
+async def _gw_refresh_worker(gid):
+    st = _gw_refresh_state.get(gid)
+    while st and st.get("dirty"):
+        g = active_giveaways.get(gid)
+        if not g or g.get("ended"):
+            st["dirty"] = False
+            return
+        now = time.time()
+        if now < st.get("block_until", 0):
+            st["dirty"] = False
+            return
+        # Young messages repaint quickly; past the 1-hour mark Discord caps
+        # total edits, so pace right down and let one edit carry the burst.
+        min_gap = 8.0 if _gw_msg_age_seconds(g) < 3600 else 90.0
+        wait = st.get("last", 0.0) + min_gap - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+            continue  # re-check dirty/ended after the nap
+        st["dirty"] = False
+        st["last"] = time.time()
+        channel = await resolve_channel(g["channel_id"])
+        guild = getattr(channel, "guild", None) if channel else None
+        code = await _giveaway_patch(g, _giveaway_payload(g, gid, guild, ended=False, for_edit=True))
+        if code == 30046:
+            st["block_until"] = time.time() + 1800
+            st["dirty"] = False
+            print(f"[Giveaway] {gid}: Discord's old-message edit cap hit — pausing live count repaints for 30 min")
+            return
 
 
 async def _giveaway_refresh_count(gid):
-    g = active_giveaways.get(gid)
-    if not g or g.get("ended"):
+    st = _gw_refresh_state.setdefault(gid, {"dirty": False, "task": None, "last": 0.0, "block_until": 0.0})
+    st["dirty"] = True
+    if st["task"] and not st["task"].done():
         return
-    channel = await resolve_channel(g["channel_id"])
-    guild = getattr(channel, "guild", None) if channel else None
-    await _giveaway_patch(g, _giveaway_payload(g, gid, guild, ended=False, for_edit=True))
+    st["task"] = asyncio.create_task(_gw_refresh_worker(gid))
 
 
 def _pick_winners(entrants, count):
@@ -16916,6 +16971,9 @@ async def apply_bot_identity():
 
 _last_bio = None
 _about_me_diag = False
+# Consecutive fetch-failure streak, so a Supabase blip doesn't print a line
+# every 20s tick for its whole duration (it once spammed 26 lines in 25 min).
+_am_fails = 0
 
 
 async def apply_about_me():
@@ -16923,7 +16981,7 @@ async def apply_about_me():
     via PATCH /applications/@me (authorised with the bot's own token). Discord
     supports this now, so there's no manual portal step. Only re-sends when the
     text actually changes."""
-    global _last_bio, _about_me_diag
+    global _last_bio, _about_me_diag, _am_fails
     if not (SUPABASE_URL and BOT_ORDER_ID and TOKEN):
         if not _about_me_diag:
             print(f"[AboutMe] skipped — SUPABASE_URL:{bool(SUPABASE_URL)} BOT_ORDER_ID:{bool(BOT_ORDER_ID)} TOKEN:{bool(TOKEN)}")
@@ -16948,8 +17006,16 @@ async def apply_about_me():
             print(f"[AboutMe] fetch OK — HTTP {status}, bot_bio={'<empty>' if not bio else repr(bio[:60])}")
             _about_me_diag = True
     except Exception as e:
-        print(f"[AboutMe] fetch failed: {e}")
+        # Name the exception type (some, like read timeouts, stringify empty)
+        # and only log the first failure of a streak + every 15th after, so an
+        # upstream blip is one line instead of a line every 20 seconds.
+        _am_fails += 1
+        if _am_fails == 1 or _am_fails % 15 == 0:
+            print(f"[AboutMe] fetch failed ({_am_fails}x): {type(e).__name__}: {e}")
         return
+    if _am_fails:
+        print(f"[AboutMe] fetch recovered after {_am_fails} failure(s)")
+        _am_fails = 0
     if bio is None or bio == "" or bio == _last_bio:
         return
     try:
