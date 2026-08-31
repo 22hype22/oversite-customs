@@ -6152,17 +6152,17 @@ async def on_interaction(interaction: discord.Interaction):
                 except Exception:
                     pass
     elif cid.startswith("pkg_claim:gp:"):
-        parts = cid.split(":")  # pkg_claim:gp:{gpid}:{pkgmsg}:{deliverto}
-        await _pkg_claim_gamepass(interaction, parts[2], parts[3] if len(parts) > 3 else "", parts[4] if len(parts) > 4 else "")
+        parts = cid.split(":")  # pkg_claim:gp:{gpid}:{pkgmsg}:{deliverto}:{perk}
+        await _pkg_claim_gamepass(interaction, parts[2], parts[3] if len(parts) > 3 else "", parts[4] if len(parts) > 4 else "", parts[5] if len(parts) > 5 else "")
     elif cid.startswith("pkg_claim:shirt:"):
-        parts = cid.split(":")  # pkg_claim:shirt:{assetid}:{pkgmsg}:{deliverto}
-        await _pkg_claim_shirt(interaction, parts[2], parts[3] if len(parts) > 3 else "", parts[4] if len(parts) > 4 else "")
+        parts = cid.split(":")  # pkg_claim:shirt:{assetid}:{pkgmsg}:{deliverto}:{perk}
+        await _pkg_claim_shirt(interaction, parts[2], parts[3] if len(parts) > 3 else "", parts[4] if len(parts) > 4 else "", parts[5] if len(parts) > 5 else "")
     elif cid.startswith("pkg_claim:stripe"):
-        parts = cid.split(":")  # pkg_claim:stripe:{pkgmsg}:{deliverto}
-        await _pkg_claim_stripe(interaction, parts[2] if len(parts) > 2 else "", parts[3] if len(parts) > 3 else "")
+        parts = cid.split(":")  # pkg_claim:stripe:{pkgmsg}:{deliverto}:{perk}
+        await _pkg_claim_stripe(interaction, parts[2] if len(parts) > 2 else "", parts[3] if len(parts) > 3 else "", parts[4] if len(parts) > 4 else "")
     elif cid.startswith("pkg_claim:dp:"):
-        parts = cid.split(":")  # pkg_claim:dp:{pkgmsg}:{deliverto}
-        await _pkg_claim_devproduct(interaction, parts[2] if len(parts) > 2 else "", parts[3] if len(parts) > 3 else "")
+        parts = cid.split(":")  # pkg_claim:dp:{pkgmsg}:{deliverto}:{perk}
+        await _pkg_claim_devproduct(interaction, parts[2] if len(parts) > 2 else "", parts[3] if len(parts) > 3 else "", parts[4] if len(parts) > 4 else "")
     elif cid.startswith("pkg_dl:"):
         await _pkg_download(interaction, cid.split(":", 1)[1])
     elif cid.startswith("pkg_review:"):
@@ -11342,7 +11342,7 @@ def _pkg_receipt_embed(roblox_username, roblox_id, price_str, product, product_u
     return e
 
 
-async def _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, product_url, deliver_to=None):
+async def _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, product_url, deliver_to=None, perk_hint=""):
     """DM the Purchase Receipt (Download / Leave a Review / View Package Thread)
     to the buyer, or to `deliver_to` (a Discord user id) for a gift. Returns
     (sent_ok, target_user_or_None)."""
@@ -11360,18 +11360,31 @@ async def _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, product
     # Advertising perk? Grant from the stashed intent first (robust even if the
     # record store failed), else fall back to matching the receipt's product name.
     try:
+        granted = None
         stash = _pending_perk_grant.pop((str(pkg_msg_id), str(interaction.user.id)), None)
         if stash:
             g_id, to_id, perk = stash
             g_id = g_id or (str(interaction.guild.id) if interaction.guild else "")
             if g_id and perk:
                 _ads_grant(g_id, to_id or interaction.user.id, perk)
+                granted = perk
                 print(f"[Ads] granted {perk} to {to_id} (from stash)")
+        elif perk_hint and perk_hint in ADS_PERK_KEYS and interaction.guild:
+            # The perk key rode inside the Claim button's custom_id, so it
+            # survives redeploys and other buyers clobbering the shared record.
+            _ads_grant(interaction.guild.id, deliver_to or interaction.user.id, perk_hint)
+            granted = perk_hint
+            print(f"[Ads] granted {perk_hint} to {deliver_to or interaction.user.id} (from claim button)")
         else:
             perk = _ads_perk_for_name(product)
             if perk and interaction.guild:
                 _ads_grant(interaction.guild.id, deliver_to or interaction.user.id, perk)
+                granted = perk
                 print(f"[Ads] granted {perk} to {deliver_to or interaction.user.id} (from receipt)")
+        if granted:
+            # A purchase must survive an immediate crash or redeploy: snapshot
+            # the inventory NOW instead of waiting out the debounced save.
+            asyncio.create_task(_ads_flush_now(attempts=3))
     except Exception as e:
         print(f"[Ads] grant on receipt failed: {e}")
     embed = _pkg_receipt_embed(acct["roblox_username"], acct.get("roblox_id"), price_str, product, product_url or thread_url, image)
@@ -12648,12 +12661,18 @@ async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to, title=None, p
         title = ((rec.get("product") if rec else "") or "").strip()
         price_field = (rec.get("price_field") if rec else "") or ""
         buy_url = ((rec.get("buy_url") if rec else "") or "").strip()
+    # Bake the ad-perk key into the Claim button itself (via the flows below).
+    # The in-memory stash and the shared pkg record can both be lost or
+    # clobbered before the buyer clicks Claim (a redeploy, or another buyer
+    # starting a different product on the same shop message) — the custom_id
+    # can't, so the right perk is always granted.
+    perk_key = _ads_perk_for_name(title or "") or ""
     if kind in ("devproduct", "gamepass"):
-        await _pkg_flow_devproduct(interaction, title, price_field, pkg_msg_id, deliver_to, buy_url=buy_url)
+        await _pkg_flow_devproduct(interaction, title, price_field, pkg_msg_id, deliver_to, buy_url=buy_url, perk=perk_key)
     elif kind == "select":
-        await _pkg_flow_select(interaction, price_field, pkg_msg_id, deliver_to)
+        await _pkg_flow_select(interaction, price_field, pkg_msg_id, deliver_to, perk=perk_key)
     elif kind == "stripe":
-        await _pkg_flow_stripe(interaction, price_field, pkg_msg_id, deliver_to)
+        await _pkg_flow_stripe(interaction, price_field, pkg_msg_id, deliver_to, perk=perk_key)
     else:
         await interaction.followup.send(embed=error_embed("Unknown option", "That button isn't wired up."), ephemeral=True)
 
@@ -12662,7 +12681,7 @@ def _pkg_gift_note(deliver_to, buyer_id):
     return "" if str(deliver_to) == str(buyer_id) else f"\n\n🎁 This is a gift, the receipt goes to <@{deliver_to}>."
 
 
-async def _pkg_flow_devproduct(interaction, title, price_field, pkg_msg_id, deliver_to, buy_url=None):
+async def _pkg_flow_devproduct(interaction, title, price_field, pkg_msg_id, deliver_to, buy_url=None, perk=""):
     """Hand over the dev product's web buy link + a Claim button. If the Purchase
     card carries a pre-made product's page link (buy_url), use it verbatim — no
     creation needed. Otherwise fall back to find/create by name via the edge
@@ -12694,7 +12713,7 @@ async def _pkg_flow_devproduct(interaction, title, price_field, pkg_msg_id, deli
     view = discord.ui.View(timeout=None)
     if buy:
         view.add_item(discord.ui.Button(label="Buy on Roblox", style=discord.ButtonStyle.link, url=buy))
-    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:dp:{pkg_msg_id}:{deliver_to}"))
+    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:dp:{pkg_msg_id}:{deliver_to}:{perk}"))
     where = "on its product page" if buy_url else "open the **Store** tab and purchase it"
     await interaction.followup.send(embed=info_embed(
         "Your Dev Product",
@@ -12704,7 +12723,7 @@ async def _pkg_flow_devproduct(interaction, title, price_field, pkg_msg_id, deli
         view=view, ephemeral=True)
 
 
-async def _pkg_claim_devproduct(interaction, pkg_msg_id="", deliver_to=""):
+async def _pkg_claim_devproduct(interaction, pkg_msg_id="", deliver_to="", perk=""):
     """Claim for a dev-product purchase. Dev products can't be ownership-checked
     from outside the game, so this is trust-based (like Stripe): DM the receipt;
     the sale shows in the group's Robux transaction history for auditing."""
@@ -12713,11 +12732,11 @@ async def _pkg_claim_devproduct(interaction, pkg_msg_id="", deliver_to=""):
     rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
     robux = _pkg_parse_robux((rec or {}).get("price_field") or "")
     price_str = f"R$ {robux}" if robux else ""
-    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, None, deliver_to)
+    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, None, deliver_to, perk_hint=perk)
     await interaction.followup.send(embed=success_embed("Claimed", _pkg_claimed_msg(dm_ok, target, interaction.user)), ephemeral=True)
 
 
-async def _pkg_flow_gamepass(interaction, title, pkg_msg_id, deliver_to):
+async def _pkg_flow_gamepass(interaction, title, pkg_msg_id, deliver_to, perk=""):
     """Match the package title to a game pass and hand over the buy link + Claim."""
     help_to = _pkg_help_mention(interaction.guild)
     if not title:
@@ -12733,7 +12752,7 @@ async def _pkg_flow_gamepass(interaction, title, pkg_msg_id, deliver_to):
     link = f"https://www.roblox.com/game-pass/{gp['id']}"
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(label="Buy Gamepass", style=discord.ButtonStyle.link, url=link))
-    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:gp:{gp['id']}:{pkg_msg_id}:{deliver_to}"))
+    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:gp:{gp['id']}:{pkg_msg_id}:{deliver_to}:{perk}"))
     await interaction.followup.send(embed=info_embed(
         "Your Gamepass",
         f"Buy **{gp['name']}** (R$ {gp['price']}) with the button below.\nAfter you've bought it, click **Claim Package** and I'll deliver it."
@@ -12741,7 +12760,7 @@ async def _pkg_flow_gamepass(interaction, title, pkg_msg_id, deliver_to):
         view=view, ephemeral=True)
 
 
-async def _pkg_flow_stripe(interaction, price_field, pkg_msg_id, deliver_to):
+async def _pkg_flow_stripe(interaction, price_field, pkg_msg_id, deliver_to, perk=""):
     """Create a Stripe payment link for the package's $ amount and hand it over."""
     dollars = _pkg_parse_usd(price_field)
     help_to = _pkg_help_mention(interaction.guild)
@@ -12757,7 +12776,7 @@ async def _pkg_flow_stripe(interaction, price_field, pkg_msg_id, deliver_to):
         return
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(label="Pay with Stripe", style=discord.ButtonStyle.link, url=res["url"]))
-    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:stripe:{pkg_msg_id}:{deliver_to}"))
+    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:stripe:{pkg_msg_id}:{deliver_to}:{perk}"))
     await interaction.followup.send(embed=info_embed(
         "Your Stripe checkout",
         f"Pay **${dollars:.2f}** with the button below. After paying, click **Claim Package**."
@@ -12765,7 +12784,7 @@ async def _pkg_flow_stripe(interaction, price_field, pkg_msg_id, deliver_to):
         view=view, ephemeral=True)
 
 
-async def _pkg_flow_select(interaction, price_field, pkg_msg_id, deliver_to):
+async def _pkg_flow_select(interaction, price_field, pkg_msg_id, deliver_to, perk=""):
     """Roblox Select: re-price the next shirt slot (1–6) and hand over its
     catalog link + a Claim button."""
     robux = _pkg_parse_robux(price_field)
@@ -12791,7 +12810,7 @@ async def _pkg_flow_select(interaction, price_field, pkg_msg_id, deliver_to):
     asset_id = m.group(1) if m else ""
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(label="Buy Shirt", style=discord.ButtonStyle.link, url=url))
-    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:shirt:{asset_id}:{pkg_msg_id}:{deliver_to}"))
+    view.add_item(discord.ui.Button(label="Claim Package", style=discord.ButtonStyle.success, custom_id=f"pkg_claim:shirt:{asset_id}:{pkg_msg_id}:{deliver_to}:{perk}"))
     await interaction.followup.send(embed=info_embed(
         "Your Roblox Select shirt",
         f"Buy the shirt (R$ {robux}) with the button below.\nAfter you've bought it, click **Claim Package** and I'll deliver it."
@@ -12807,7 +12826,7 @@ def _pkg_claimed_msg(dm_ok, target, buyer):
             else "Purchase confirmed! (I couldn't DM you, enable DMs to get the receipt.)")
 
 
-async def _pkg_claim_stripe(interaction, pkg_msg_id="", deliver_to=""):
+async def _pkg_claim_stripe(interaction, pkg_msg_id="", deliver_to="", perk=""):
     """Claim for a Stripe purchase — Stripe can't be tied to a Roblox account, so
     we simply DM the receipt (the purchase-log poller records the sale)."""
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -12815,11 +12834,11 @@ async def _pkg_claim_stripe(interaction, pkg_msg_id="", deliver_to=""):
     rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
     usd = _pkg_parse_usd((rec or {}).get("price_field") or "")
     price_str = f"${usd:.2f}" if usd else ""
-    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, None, deliver_to)
+    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, None, deliver_to, perk_hint=perk)
     await interaction.followup.send(embed=success_embed("Claimed", _pkg_claimed_msg(dm_ok, target, interaction.user)), ephemeral=True)
 
 
-async def _pkg_claim_shirt(interaction, asset_id, pkg_msg_id="", deliver_to=""):
+async def _pkg_claim_shirt(interaction, asset_id, pkg_msg_id="", deliver_to="", perk=""):
     """Claim for a Roblox Select shirt: confirm the buyer owns the asset, DM them."""
     await interaction.response.defer(ephemeral=True, thinking=True)
     acct = await _pkg_lookup_roblox(interaction.user.id)
@@ -12830,7 +12849,13 @@ async def _pkg_claim_shirt(interaction, asset_id, pkg_msg_id="", deliver_to=""):
     if not asset_id:
         await interaction.followup.send(embed=error_embed("Couldn't verify", f"I lost track of which shirt this was, open a ticket in {help_to}."), ephemeral=True)
         return
-    res = await _robux_locker_call("owns_asset", user_id=acct["roblox_id"], asset_id=str(asset_id))
+    res = None
+    for _attempt in range(3):  # the backend 500s in bursts; retry before failing the buyer
+        res = await _robux_locker_call("owns_asset", user_id=acct["roblox_id"], asset_id=str(asset_id))
+        if isinstance(res, dict) and res.get("ok"):
+            break
+        if _attempt < 2:
+            await asyncio.sleep(1.5 * (_attempt + 1))
     if not (isinstance(res, dict) and res.get("ok")):
         await interaction.followup.send(embed=error_embed("Couldn't verify", f"Roblox didn't answer, try again shortly or open a ticket in {help_to}."), ephemeral=True)
         return
@@ -12845,11 +12870,11 @@ async def _pkg_claim_shirt(interaction, asset_id, pkg_msg_id="", deliver_to=""):
     rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
     robux = _pkg_parse_robux((rec or {}).get("price_field") or "")
     price_str = f"R$ {robux}" if robux else ""
-    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, f"https://www.roblox.com/catalog/{asset_id}", deliver_to)
+    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, f"https://www.roblox.com/catalog/{asset_id}", deliver_to, perk_hint=perk)
     await interaction.followup.send(embed=success_embed("Claimed", _pkg_claimed_msg(dm_ok, target, interaction.user)), ephemeral=True)
 
 
-async def _pkg_claim_gamepass(interaction, gamepass_id, pkg_msg_id="", deliver_to=""):
+async def _pkg_claim_gamepass(interaction, gamepass_id, pkg_msg_id="", deliver_to="", perk=""):
     """Claim button for a gamepass: confirm the buyer now owns it, then DM them."""
     await interaction.response.defer(ephemeral=True, thinking=True)
     acct = await _pkg_lookup_roblox(interaction.user.id)
@@ -12857,7 +12882,13 @@ async def _pkg_claim_gamepass(interaction, gamepass_id, pkg_msg_id="", deliver_t
     if not acct:
         await interaction.followup.send(embed=error_embed("Verify first", f"Link your Roblox account first, then claim. {help_to}"), ephemeral=True)
         return
-    res = await _robux_locker_call("owns_gamepass", user_id=acct["roblox_id"], gamepass_id=str(gamepass_id))
+    res = None
+    for _attempt in range(3):  # the backend 500s in bursts; retry before failing the buyer
+        res = await _robux_locker_call("owns_gamepass", user_id=acct["roblox_id"], gamepass_id=str(gamepass_id))
+        if isinstance(res, dict) and res.get("ok"):
+            break
+        if _attempt < 2:
+            await asyncio.sleep(1.5 * (_attempt + 1))
     if not (isinstance(res, dict) and res.get("ok")):
         await interaction.followup.send(embed=error_embed("Couldn't verify", f"Roblox didn't answer, try again in a moment or open a ticket in {help_to}."), ephemeral=True)
         return
@@ -12872,7 +12903,7 @@ async def _pkg_claim_gamepass(interaction, gamepass_id, pkg_msg_id="", deliver_t
     rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
     robux = _pkg_parse_robux((rec or {}).get("price_field") or "")
     price_str = f"R$ {robux}" if robux else ""
-    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, f"https://www.roblox.com/game-pass/{gamepass_id}", deliver_to)
+    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, f"https://www.roblox.com/game-pass/{gamepass_id}", deliver_to, perk_hint=perk)
     await interaction.followup.send(embed=success_embed("Claimed", _pkg_claimed_msg(dm_ok, target, interaction.user)), ephemeral=True)
 
 
