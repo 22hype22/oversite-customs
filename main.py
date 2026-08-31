@@ -2172,15 +2172,31 @@ def _sub_server_name(text, guild):
 
 
 def _ads_queue_entries(guild):
-    """The queue as [(ad, lane, post_unix_ts)], bypass lane first, with the
-    estimated post time for each position."""
+    """The queue as [(ad, lane, post_unix_ts)] in true posting order. Simulates
+    the drip slot by slot: each slot goes to the first ad (bypass lane first)
+    whose scheduled date has arrived by then — an ad delayed via the Delay
+    button (ad["not_before"]) waits for its day while the ads behind it fill
+    the spots before it, and its shown date never lands before the day staff
+    picked."""
     gd = ads_data.get(str(guild.id)) or {}
     items = [(a, "bypass") for a in (gd.get("bypass") or [])] + [(a, "normal") for a in (gd.get("queue") or [])]
     interval = max(1, int(ads_config.get("interval_minutes") or 60)) * 60
     last = int(gd.get("last_drip", 0))
     now = int(time.time())
-    first = max(now + 30, (last + interval) if last else now + 30)
-    return [(a, lane, first + i * interval) for i, (a, lane) in enumerate(items)]
+    slot = max(now + 30, (last + interval) if last else now + 30)
+    remaining = list(items)
+    out = []
+    while remaining:
+        pick = next((it for it in remaining if int(it[0].get("not_before") or 0) <= slot), None)
+        if pick is None:
+            # Everything left is scheduled beyond this slot — jump to the
+            # soonest scheduled date and continue the drip from there.
+            pick = min(remaining, key=lambda it: int(it[0].get("not_before") or 0))
+            slot = max(slot, int(pick[0].get("not_before") or 0))
+        remaining.remove(pick)
+        out.append((pick[0], pick[1], slot))
+        slot += interval
+    return out
 
 
 def _ads_queue_line(a, lane, ts, n):
@@ -2191,7 +2207,8 @@ def _ads_queue_line(a, lane, ts, n):
         name = a.get("server_name") or "Server"
         link = a.get("server_link") or ""
         title = f"[{name}]({link})" if link else name
-    return f"{star}**{n}.** {title}\nUser: <@{a.get('user_id')}>\nDate: <t:{ts}:f>"
+    sched = " · 📌 scheduled" if int(a.get("not_before") or 0) > int(time.time()) else ""
+    return f"{star}**{n}.** {title}\nUser: <@{a.get('user_id')}>\nDate: <t:{ts}:f>{sched}"
 
 
 def _ads_queue_text(guild):
@@ -6147,6 +6164,8 @@ async def on_interaction(interaction: discord.Interaction):
         await _ads_decide(interaction, cid.split(":", 1)[1], True)
     elif cid.startswith("ad_no:"):
         await _ads_decide(interaction, cid.split(":", 1)[1], False)
+    elif cid.startswith("ad_delay:"):
+        await _ads_open_delay(interaction, cid.split(":", 1)[1])
     elif cid.startswith("adinv:"):
         parts = cid.split(":")
         await interaction.response.send_modal(
@@ -11889,6 +11908,7 @@ async def _ads_submit(interaction, ad):
         view = discord.ui.View(timeout=None)
         view.add_item(discord.ui.Button(label="Approve", style=discord.ButtonStyle.success, custom_id=f"ad_ok:{ad_id}"))
         view.add_item(discord.ui.Button(label="Deny", style=discord.ButtonStyle.danger, custom_id=f"ad_no:{ad_id}"))
+        view.add_item(discord.ui.Button(label="Delay", style=discord.ButtonStyle.secondary, custom_id=f"ad_delay:{ad_id}"))
         try:
             await appr.send(embed=info_embed("Ad awaiting approval", _ads_summary(ad)), view=view)
         except Exception as e:
@@ -11998,6 +12018,94 @@ async def _ads_decide(interaction, ad_id, approve):
             await interaction.response.edit_message(embed=info_embed("Ad approved", _ads_summary(ad) + "\n\n🕒 **Queued.**"), view=None)
         except Exception:
             pass
+
+
+def _ads_parse_delay_date(raw):
+    """Accepts 9/2/2026, 09-02-2026 or 2026-09-02 → unix ts at 16:00 UTC that
+    day (mid-day across US timezones, so the queue's <t:…> stamp reads as the
+    day staff picked). Returns None if unparseable."""
+    t = (raw or "").strip()
+    m = re.match(r"^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})$", t)
+    if m:
+        mo, d, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        m = re.match(r"^(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})$", t)
+        if not m:
+            return None
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return int(datetime.datetime(y, mo, d, 16, 0, tzinfo=datetime.timezone.utc).timestamp())
+    except ValueError:
+        return None
+
+
+class AdDelayModal(discord.ui.Modal):
+    """Staff picks the day a pending ad should post. The ad is approved into
+    the queue with that date pinned — everything behind it fills the spots
+    before it (see _ads_queue_entries / _ads_pop_postable)."""
+
+    def __init__(self, ad_id):
+        super().__init__(title="Delay this ad", timeout=600)
+        self._ad_id = ad_id
+        self.date = discord.ui.TextInput(
+            label="Post date (M/D/YYYY)", placeholder="9/2/2026", required=True, max_length=20)
+        self.add_item(self.date)
+
+    async def on_submit(self, interaction):
+        await _ads_delay_submit(interaction, self._ad_id, str(self.date.value or ""))
+
+
+async def _ads_open_delay(interaction, ad_id):
+    if not _is_ads_staff(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "Only ad staff can do that."), ephemeral=True)
+        return
+    await interaction.response.send_modal(AdDelayModal(ad_id))
+
+
+async def _ads_delay_submit(interaction, ad_id, raw_date):
+    gid = str(interaction.guild.id)
+    gd = _ads_g(gid)
+    ts = _ads_parse_delay_date(raw_date)
+    if ts is None:
+        await interaction.response.send_message(embed=error_embed(
+            "Couldn't read that date", "Use M/D/YYYY — for example **9/2/2026**."), ephemeral=True)
+        return
+    if ts < int(time.time()) - 12 * 3600:  # "today" stays valid even past 16:00 UTC
+        await interaction.response.send_message(embed=error_embed(
+            "Date already passed", "Pick today or a future date."), ephemeral=True)
+        return
+    ad = (gd.get("pending") or {}).pop(ad_id, None)
+    if not ad:
+        # Same durable-copy recovery as Approve/Deny: rebuild from the approval
+        # embed if storage lost the pending record across a redeploy.
+        emb = interaction.message.embeds[0] if (interaction.message and interaction.message.embeds) else None
+        if emb and "awaiting" in ((emb.title or "").lower()):
+            ad = _ads_reconstruct_from_embed(emb.description or "")
+        if ad:
+            ad["id"] = ad_id
+            ad["guild_id"] = gid
+        else:
+            await interaction.response.send_message(embed=error_embed(
+                "Not pending anymore",
+                "This ad was already approved or denied. If it went missing after a restart, "
+                "ask the advertiser to submit it again."),
+                ephemeral=True)
+            try:
+                await interaction.message.edit(view=None)
+            except Exception:
+                pass
+            return
+    ad["not_before"] = ts
+    lane = "bypass" if ad.get("addon") == "bypass" else "queue"
+    gd.setdefault(lane, []).append(ad)
+    await _ads_flush_now()
+    try:
+        await interaction.response.edit_message(
+            embed=info_embed("Ad approved", _ads_summary(ad)
+                             + f"\n\n📌 **Scheduled** — posts <t:{ts}:D>. The queue fills the spots before it."),
+            view=None)
+    except Exception:
+        pass
 
 
 class AdRegularModal(discord.ui.Modal):
@@ -12344,6 +12452,8 @@ async def _ads_pop_postable(guild, gd):
     pos = 0
     for ad, lane, ts in _ads_queue_entries(guild):
         pos += 1
+        if int(ad.get("not_before") or 0) > int(time.time()):
+            continue  # delayed via the Delay button — the ads behind it post first
         if await _ad_invite_valid(ad.get("server_link")):
             lst = gd.get("bypass" if lane == "bypass" else "queue") or []
             try:
