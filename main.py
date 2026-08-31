@@ -2202,14 +2202,14 @@ def _ads_queue_entries(guild):
 
 
 def _ads_queue_line(a, lane, ts, n):
-    star = "⭐ " if lane == "bypass" else ""
+    star = "Bypass · " if lane == "bypass" else ""
     if a.get("type") == "giveaway":
-        title = f"🎉 {a.get('prize') or 'Giveaway'}"
+        title = f"Giveaway: {a.get('prize') or 'Giveaway'}"
     else:
         name = a.get("server_name") or "Server"
         link = a.get("server_link") or ""
         title = f"[{name}]({link})" if link else name
-    sched = " · 📌 scheduled" if int(a.get("not_before") or 0) > int(time.time()) else ""
+    sched = " · scheduled" if int(a.get("not_before") or 0) > int(time.time()) else ""
     return f"{star}**{n}.** {title}\nUser: <@{a.get('user_id')}>\nDate: <t:{ts}:f>{sched}"
 
 
@@ -11991,7 +11991,7 @@ async def _ads_decide(interaction, ad_id, approve):
         if ad.get("addon"):
             _ads_grant(gid, ad["user_id"], ad["addon"])
         try:
-            await interaction.response.edit_message(embed=info_embed("Ad denied", _ads_summary(ad) + "\n\n❌ **Denied** — perks refunded."), view=None)
+            await interaction.response.edit_message(embed=info_embed("Ad denied", _ads_summary(ad) + "\n\n**Denied** — perks refunded."), view=None)
         except Exception:
             pass
         return
@@ -12001,7 +12001,7 @@ async def _ads_decide(interaction, ad_id, approve):
     addon = ad.get("addon")
     if addon == "instant":
         try:
-            await interaction.response.edit_message(embed=info_embed("Ad approved", _ads_summary(ad) + "\n\n⚡ **Posted instantly.**"), view=None)
+            await interaction.response.edit_message(embed=info_embed("Ad approved", _ads_summary(ad) + "\n\n**Posted instantly.**"), view=None)
         except Exception:
             pass
         await _ads_post(interaction.guild, ad)
@@ -12009,7 +12009,7 @@ async def _ads_decide(interaction, ad_id, approve):
         gd.setdefault("bypass", []).append(ad)
         await _ads_flush_now()
         try:
-            await interaction.response.edit_message(embed=info_embed("Ad approved", _ads_summary(ad) + "\n\n🚀 **Queued — Bypass lane** (posts before the regular queue)."), view=None)
+            await interaction.response.edit_message(embed=info_embed("Ad approved", _ads_summary(ad) + "\n\n**Queued — Bypass lane** (posts before the regular queue)."), view=None)
         except Exception:
             pass
         await _ads_notify_reschedules(interaction.guild, before)
@@ -12017,7 +12017,7 @@ async def _ads_decide(interaction, ad_id, approve):
         gd.setdefault("queue", []).append(ad)
         await _ads_flush_now()
         try:
-            await interaction.response.edit_message(embed=info_embed("Ad approved", _ads_summary(ad) + "\n\n🕒 **Queued.**"), view=None)
+            await interaction.response.edit_message(embed=info_embed("Ad approved", _ads_summary(ad) + "\n\n**Queued.**"), view=None)
         except Exception:
             pass
 
@@ -12140,7 +12140,7 @@ async def _ads_delay_submit(interaction, ad_id, raw_date):
     try:
         await interaction.response.edit_message(
             embed=info_embed("Ad approved", _ads_summary(ad)
-                             + f"\n\n📌 **Scheduled** — posts <t:{ts}:D>. The queue fills the spots before it."),
+                             + f"\n\n**Scheduled** — posts <t:{ts}:D>. The queue fills the spots before it."),
             view=None)
     except Exception:
         pass
