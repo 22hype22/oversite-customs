@@ -583,7 +583,7 @@ async def _ads_fetch_data():
     for i in range(attempts):
         last = i == attempts - 1
         try:
-            async with httpx.AsyncClient() as client:
+            async with _http() as client:
                 r = await client.get(url, headers=headers, timeout=15)
             if r.status_code == 200:
                 rows = r.json()
@@ -1326,6 +1326,33 @@ _poll_session = None
 _auth_warned = False
 
 
+# ── Shared pooled HTTPS client ─────────────────────────────────────────────
+# One connection pool for the whole process. Every `async with _http() as
+# client:` call site reuses warm keep-alive connections instead of paying a
+# fresh TCP+TLS handshake (~100-300ms) per request — the AboutMe poll alone
+# was doing that every 20 seconds. The wrapper's __aexit__ is a no-op so the
+# 35 existing `async with` call sites keep their exact shape; the pool lives
+# for the life of the process. Default timeout stays httpx's 5s, same as the
+# per-call clients this replaces (most sites pass their own timeout anyway).
+_shared_http = None
+
+
+class _SharedHttp:
+    async def __aenter__(self):
+        global _shared_http
+        if _shared_http is None or _shared_http.is_closed:
+            _shared_http = httpx.AsyncClient(
+                limits=httpx.Limits(max_connections=50, max_keepalive_connections=20))
+        return _shared_http
+
+    async def __aexit__(self, *exc):
+        return False  # never close the shared pool
+
+
+def _http():
+    return _SharedHttp()
+
+
 async def get_poll_session():
     global _poll_session
     if _poll_session is None or _poll_session.closed:
@@ -1335,7 +1362,7 @@ async def get_poll_session():
 
 async def runtime_rpc(name, payload):
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.post(
                 f"{SUPABASE_URL}/rest/v1/rpc/{name}",
                 headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"},
@@ -1413,44 +1440,34 @@ async def on_ready():
     except Exception as e:
         print(f"[Startup] secret-slot seed failed: {e}")
 
-    try:
-        await _load_ads()
-    except Exception as e:
-        print(f"[Ads] load failed: {e}")
-    try:
-        await _load_tts_nicks()
-    except Exception as e:
-        print(f"[TTS] nick load failed: {e}")
-    # Fill in ephemeral-message content for OLDER posted messages whose keys the
-    # fresh configs no longer produce (the design was edited since posting).
-    try:
-        await _load_eph_registry()
-    except Exception as e:
-        print(f"[Tickets] eph registry load failed: {e}")
-    try:
-        await _load_econ()
-    except Exception as e:
-        print(f"[Econ] load failed: {e}")
-    try:
-        await _frel_load()
-    except Exception as e:
-        print(f"[FreeRelease] load failed: {e}")
-    try:
-        await _pkgback_load()
-    except Exception as e:
-        print(f"[PackageBack] load failed: {e}")
-    try:
+    # These restores are independent of each other, so run them CONCURRENTLY —
+    # a redeploy comes back online in roughly one round-trip instead of eight
+    # serial ones (shorter music/presence gap every deploy). Each is isolated:
+    # one failing never blocks the others.
+    async def _safe_load(label, coro):
+        try:
+            await coro
+        except Exception as e:
+            print(f"{label} load failed: {e}")
+
+    async def _invite_boot():
         await _load_invite_tracker()
         for g in bot.guilds:
             await _cache_guild_invites(g)
-    except Exception as e:
-        print(f"[Startup] invite tracker init failed: {e}")
 
-    # Restore every saved giveaway (entrants + timers) so redeploys never drop them.
-    try:
-        await _gw_restore_all()
-    except Exception as e:
-        print(f"[Startup] giveaway restore failed: {e}")
+    await asyncio.gather(
+        _safe_load("[Ads]", _load_ads()),
+        _safe_load("[TTS] nick", _load_tts_nicks()),
+        # Ephemeral-message content for OLDER posted messages whose keys the
+        # fresh configs no longer produce (the design was edited since posting).
+        _safe_load("[Tickets] eph registry", _load_eph_registry()),
+        _safe_load("[Econ]", _load_econ()),
+        _safe_load("[FreeRelease]", _frel_load()),
+        _safe_load("[PackageBack]", _pkgback_load()),
+        _safe_load("[Startup] invite tracker", _invite_boot()),
+        # Every saved giveaway (entrants + timers) so redeploys never drop them.
+        _safe_load("[Startup] giveaway restore", _gw_restore_all()),
+    )
 
     if not update_status.is_running():
         update_status.start()
@@ -2709,7 +2726,7 @@ async def create_payment(method, item, price):
     """Call the payment-create edge function (holds the Roblox cookie + Stripe key)."""
     payload = {"method": method, "item": item, "price": price}
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.post(
                 f"{SUPABASE_FN_URL}/payments-create",
                 headers=_fn_headers(),
@@ -3733,7 +3750,7 @@ async def _portfolio_posts_call(action, thread_id=None, channel_id=None,
     if owner_name is not None:
         payload["owner_name"] = str(owner_name)
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.post(
                 f"{SUPABASE_FN_URL}/portfolio-posts",
                 headers=_fn_headers(), json=payload, timeout=15,
@@ -4229,7 +4246,7 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
         If a /packageback background is active for this guild, lay the preview
         (a transparent uniform) centered on top of it first."""
         try:
-            async with httpx.AsyncClient() as client:
+            async with _http() as client:
                 r = await client.get(f["url"], timeout=90, follow_redirects=True)
             if r.status_code != 200:
                 return None
@@ -5096,7 +5113,7 @@ async def _bot_config_get(feature):
         return {}
     try:
         url = f"{SUPABASE_URL}/rest/v1/bot_config?bot_id=eq.{BOT_ORDER_ID}&feature=eq.{feature}&select=config"
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.get(url, headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=15)
         if r.status_code == 200 and r.json():
             return r.json()[0].get("config") or {}
@@ -5118,7 +5135,7 @@ async def _durable_config_get(feature, attempts=6):
     err = ""
     for i in range(attempts):
         try:
-            async with httpx.AsyncClient() as client:
+            async with _http() as client:
                 r = await client.get(url, headers=headers, timeout=20)
             if r.status_code == 200:
                 rows = r.json()
@@ -5171,7 +5188,7 @@ async def _bot_config_upsert(feature, config):
         url = f"{SUPABASE_URL}/rest/v1/bot_config?on_conflict=bot_id,feature"
         payload = {"bot_id": BOT_ORDER_ID, "feature": feature, "config": config,
                    "updated_at": discord.utils.utcnow().isoformat()}
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.post(
                 url,
                 headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -5312,7 +5329,7 @@ async def _pricing_call(action, entries=None, user=None):
     if user is not None:
         payload["user"] = str(user)
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.post(
                 f"{SUPABASE_FN_URL}/pricing",
                 headers=_fn_headers(), json=payload, timeout=20,
@@ -5763,7 +5780,7 @@ async def _gw_entries_call(action, gid=None, uid=None, meta=None, entrants=None)
     if entrants is not None:
         payload["entrants"] = [str(u) for u in entrants]
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.post(
                 f"{SUPABASE_FN_URL}/giveaway-entries",
                 headers=_fn_headers(), json=payload, timeout=15,
@@ -6323,7 +6340,7 @@ async def _post_form_files(channel, files, label=True):
     words), e.g. a suggestion's image sitting bare in its thread."""
     for f in files or []:
         try:
-            async with httpx.AsyncClient() as client:
+            async with _http() as client:
                 r = await client.get(f["url"], timeout=90, follow_redirects=True)
                 if r.status_code != 200:
                     continue
@@ -6356,7 +6373,7 @@ async def _send_v2_with_files(channel, components_v2, files, allowed_mentions=No
     extra = []
     for i, f in enumerate(files or []):
         try:
-            async with httpx.AsyncClient() as client:
+            async with _http() as client:
                 r = await client.get(f["url"], timeout=90, follow_redirects=True)
                 if r.status_code != 200:
                     print(f"[Form] file fetch HTTP {r.status_code}")
@@ -6829,7 +6846,7 @@ async def _platform_setting_get(key):
     try:
         url = f"{SUPABASE_URL}/rest/v1/platform_settings?key=eq.{key}&select=value"
         headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.get(url, headers=headers, timeout=15)
         if r.status_code == 200:
             rows = r.json()
@@ -7176,7 +7193,7 @@ async def _frel_ref_blob(ref):
             print(f"[FreeRelease] vault read failed: {e}")
     if ref.get("url"):
         try:
-            async with httpx.AsyncClient() as client:
+            async with _http() as client:
                 r = await client.get(ref["url"], timeout=120, follow_redirects=True)
             if r.status_code == 200:
                 return r.content
@@ -7244,7 +7261,7 @@ async def _frel_stash_file(f):
     filename = f.get("filename") or "release"
     vault_id = free_release_config.get("vault_channel_id") or ticket_config.get("log_channel_id") or ""
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.get(f["url"], timeout=120, follow_redirects=True)
         blob = r.content
     except Exception as e:
@@ -10890,7 +10907,7 @@ async def _robux_locker_call(action, amount=0, time_frame=None, **extra):
     for k, v in extra.items():
         payload[k] = v
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.post(
                 f"{SUPABASE_FN_URL}/robux-locker",
                 headers=_fn_headers(),
@@ -10911,7 +10928,7 @@ async def _devproduct_call(action, **extra):
     payload = {"action": action}
     payload.update(extra)
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.post(
                 f"{SUPABASE_FN_URL}/roblox-devproduct",
                 headers=_fn_headers(),
@@ -10933,7 +10950,7 @@ async def _payments_call(action, **extra):
     for k, v in extra.items():
         payload[k] = v
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.post(
                 f"{SUPABASE_FN_URL}/payments-create",
                 headers=_fn_headers(),
@@ -11277,7 +11294,7 @@ async def _pkg_vault_files(delivery_ch, after_files):
         fname = _san_filename(f.get("filename"), "file")
         if delivery_ch:
             try:
-                async with httpx.AsyncClient() as client:
+                async with _http() as client:
                     r = await client.get(f["url"], timeout=90, follow_redirects=True)
                 if r.status_code != 200:
                     continue
@@ -11316,7 +11333,7 @@ async def _pkg_ref_to_file(ref):
                 data = await msg.attachments[0].read()
                 return discord.File(io.BytesIO(data), filename=ref.get("filename") or msg.attachments[0].filename)
         elif ref.get("url"):
-            async with httpx.AsyncClient() as client:
+            async with _http() as client:
                 r = await client.get(ref["url"], timeout=90, follow_redirects=True)
             if r.status_code == 200:
                 return discord.File(io.BytesIO(r.content), filename=ref.get("filename") or "file")
@@ -13196,7 +13213,7 @@ async def poll_roblox_apply():
             f"{SUPABASE_URL}/rest/v1/bot_commands?bot_id=eq.{BOT_ORDER_ID}"
             f"&action=eq.roblox_apply&status=eq.pending&order=created_at.asc&select=id,payload&limit=10"
         )
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.get(
                 url,
                 headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
@@ -13235,7 +13252,7 @@ async def before_poll_roblox_apply():
 
 async def save_ticket_panel(guild_id, channel_id, message_id, channel_name):
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             await client.post(
                 f"{SUPABASE_FN_URL}/save-ticket-panel",
                 headers=_fn_headers(),
@@ -13388,7 +13405,7 @@ async def fire_online_status():
         payload = {"bot_id": BOT_ORDER_ID, "last_heartbeat_at": discord.utils.utcnow().isoformat(), "status": "online"}
         if guilds:
             payload["guilds"] = guilds
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             await client.patch(
                 f"{SUPABASE_URL}/rest/v1/bot_runtime_status?bot_id=eq.{BOT_ORDER_ID}",
                 headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "return=minimal"},
@@ -13478,7 +13495,7 @@ async def supabase_rpc(op: str, payload: dict | None = None):
     isn't present on this project it simply no-ops (favorites/taste stay
     in-memory for the session)."""
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.post(
                 f"{SUPABASE_URL}/rest/v1/rpc/runtime_music_op",
                 headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -13913,7 +13930,7 @@ async def fetch_artist_songs(artist: str) -> list:
     try:
         token = await get_spotify_token()
         if token:
-            async with httpx.AsyncClient() as client:
+            async with _http() as client:
                 r = await client.get(
                     "https://api.spotify.com/v1/search",
                     params={"q": f'artist:"{artist}"', "type": "track", "limit": 10, "market": "US"},
@@ -14779,7 +14796,7 @@ async def _gtts_fetch(text, path):
     tl = _GTTS_ACCENT_LANG.get(tts_config["accent"], TTS_LANG)
     data = b""
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             for ch in _gtts_chunks(text, 200):
                 url = (f"https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob"
                        f"&tl={urllib.parse.quote(tl)}&q={urllib.parse.quote(ch)}")
@@ -14812,7 +14829,7 @@ async def _tts_synth(text):
         try:
             voice_settings = {"stability": 0.5, "similarity_boost": 0.8,
                               "speed": max(0.7, min(1.2, float(TTS_SPEED)))}
-            async with httpx.AsyncClient() as client:
+            async with _http() as client:
                 r = await client.post(
                     f"https://api.elevenlabs.io/v1/text-to-speech/{tts_config['voice_id']}",
                     headers={"xi-api-key": ELEVEN_API_KEY},
@@ -15106,7 +15123,7 @@ async def _dj_make_clip(text: str, voice_id: str | None = None, speed: float | N
         made = False
         if ELEVEN_API_KEY and vid:
             try:
-                async with httpx.AsyncClient() as client:
+                async with _http() as client:
                     r = await client.post(
                         f"https://api.elevenlabs.io/v1/text-to-speech/{vid}",
                         headers={"xi-api-key": ELEVEN_API_KEY, "Content-Type": "application/json"},
@@ -15144,7 +15161,7 @@ async def _dj_ai_line(vibe: str, first: bool):
                   + ("This is the start of the broadcast - welcome listeners to Oversite Radio. " if first
                      else "You are switching vibes mid-broadcast. ")
                   + f"Tone: {_style}. No emojis, no quotes. Output only the line.")
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.post("https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
                 json={"model": "claude-haiku-4-5", "max_tokens": 80, "temperature": 1.0,
@@ -15187,7 +15204,7 @@ async def _dj_ai_pick(guild):
                   + (("Or an artist set by a specific popular artist related to what this room loves: "
                       + (", ".join(loved) if loved else "unknown") + ". ") if allow_artist else "Pick a genre only. ")
                   + 'Respond with ONLY JSON: {"type":"genre","value":"<genre key>"} or {"type":"artist","value":"<artist name>"}')
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.post("https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
                 json={"model": "claude-haiku-4-5", "max_tokens": 60, "temperature": 1.0,
@@ -16977,7 +16994,7 @@ async def apply_bot_identity():
     if not (SUPABASE_URL and BOT_ORDER_ID):
         return
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.get(
                 f"{SUPABASE_URL}/rest/v1/bot_orders?id=eq.{BOT_ORDER_ID}&select=bot_name",
                 headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=10,
@@ -17019,7 +17036,7 @@ async def apply_about_me():
             _about_me_diag = True
         return
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.get(
                 f"{SUPABASE_URL}/rest/v1/bot_orders?id=eq.{BOT_ORDER_ID}&select=bot_bio",
                 headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=10,
@@ -17050,7 +17067,7 @@ async def apply_about_me():
     if bio is None or bio == "" or bio == _last_bio:
         return
     try:
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             resp = await client.patch(
                 "https://discord.com/api/v10/applications/@me",
                 headers={"Authorization": f"Bot {TOKEN}", "Content-Type": "application/json"},
@@ -17127,7 +17144,7 @@ async def _shutdown():
             print(f"[Shutdown] economy flush error: {e}")
     if SUPABASE_URL and BOT_ORDER_ID:
         try:
-            async with httpx.AsyncClient() as client:
+            async with _http() as client:
                 await client.patch(
                     f"{SUPABASE_URL}/rest/v1/bot_runtime_status?bot_id=eq.{BOT_ORDER_ID}",
                     headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json", "Prefer": "return=minimal"},
@@ -17165,7 +17182,7 @@ async def claim_shutdown_command():
             f"{SUPABASE_URL}/rest/v1/bot_commands?bot_id=eq.{BOT_ORDER_ID}&action=eq.shutdown"
             f"&status=eq.pending&created_at=gte.{BOT_START_TIME}&order=created_at.desc&select=id&limit=1"
         )
-        async with httpx.AsyncClient() as client:
+        async with _http() as client:
             r = await client.get(url, headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=15)
             data = r.json()
             if data and isinstance(data, list):
@@ -17191,6 +17208,14 @@ async def before_poll_shutdown():
 
 
 def _run():
+    # uvloop: drop-in libuv event loop, measurably faster for IO-heavy bots.
+    # Guarded — if it's ever missing or broken we run on stock asyncio.
+    try:
+        import uvloop
+        uvloop.install()
+        print("[Boot] uvloop event loop active")
+    except Exception:
+        pass
     try:
         bot.run(TOKEN)
     except discord.errors.HTTPException as e:
