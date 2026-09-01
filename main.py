@@ -7864,14 +7864,25 @@ async def _ui_channel_or_embed(interaction, key, mapping, title, desc,
 
 
 async def _ticket_last_activity(ch):
-    """Timestamp of the ticket's most recent message. Returns None if it can't be
-    read right now — we must never guess an old time (e.g. the channel's creation
-    date), or a long-open ticket would get a false inactivity warning on the very
-    next tick, especially right after a redeploy when the cache is cold."""
+    """Timestamp of the ticket's most recent message that ISN'T one of the bot's
+    own automated messages (inactivity warnings, panels, system notices). The
+    bot's warning must never count as activity — otherwise it looks like someone
+    replied right after the warning, the warn flag is cleared, and the ticket
+    re-warns every 24 hours and never actually auto-closes.
+
+    Returns None if history can't be read right now — we must never guess an old
+    time (e.g. the channel's creation date), or a long-open ticket would get a
+    false inactivity warning on the very next tick, especially right after a
+    redeploy when the cache is cold."""
     try:
-        async for msg in ch.history(limit=1):
+        me_id = getattr(bot.user, "id", None)
+        async for msg in ch.history(limit=50):
+            if me_id is not None and getattr(msg.author, "id", None) == me_id:
+                continue  # skip the bot's own messages (warnings/panels)
             return msg.created_at.timestamp()
-        return ch.created_at.timestamp()  # genuinely empty channel
+        # Only the bot has ever spoken here (or an empty channel): fall back to
+        # the channel's age so a real human message is still required to reset.
+        return ch.created_at.timestamp()
     except Exception:
         return None
 
