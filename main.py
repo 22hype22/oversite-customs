@@ -4536,6 +4536,47 @@ async def portfolio_cleanup():
                 print(f"[Portfolio] cleanup delete failed for {tid}: {e}")
             await _portfolio_posts_call("remove", thread_id=tid)
 
+    # ── Pricing sweep ────────────────────────────────────────────────────────
+    # Drop any designer's saved pricing when they're no longer in the server.
+    # on_member_remove already handles live leaves, but it can't fire for anyone
+    # who left while the bot was offline (a redeploy or a gateway outage), so
+    # their prices would otherwise linger forever and render as @unknown-user.
+    # Only remove a designer confirmed absent from EVERY guild the bot is in,
+    # and never on a transient lookup error.
+    try:
+        pres = await _pricing_call("get")
+        prices = (pres.get("prices") if isinstance(pres, dict) else None) or {}
+        uids = set()
+        for svc_map in prices.values():
+            if isinstance(svc_map, dict):
+                uids.update(svc_map.keys())
+        for uid in uids:
+            if not str(uid).isdigit():
+                continue
+            present = False       # confirmed in some guild
+            uncertain = False     # a lookup errored — don't remove this cycle
+            for g in list(bot.guilds):
+                if g.get_member(int(uid)) is not None:
+                    present = True
+                    break
+                try:
+                    await g.fetch_member(int(uid))
+                    present = True
+                    break
+                except discord.NotFound:
+                    continue  # not in this guild — check the next
+                except Exception:
+                    uncertain = True
+                    break
+            if present or uncertain:
+                continue
+            res = await _pricing_call("remove_user", user=uid)
+            if isinstance(res, dict) and res.get("ok") and res.get("prices") is not None:
+                pricing_config["values"] = res.get("prices") or {}
+            print(f"[Pricing] swept designer {uid} — no longer in any guild")
+    except Exception as e:
+        print(f"[Pricing] leave-sweep failed: {e}")
+
 
 @portfolio_cleanup.before_loop
 async def before_portfolio_cleanup():
