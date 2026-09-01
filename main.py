@@ -17367,6 +17367,26 @@ def _run():
         print("[Boot] uvloop event loop active")
     except Exception:
         pass
+    # Cap discord.py's gateway reconnect backoff. On repeated gateway 503s the
+    # default exponential backoff climbs to 13-16 minutes between retries, which
+    # leaves the bot offline long after Discord has recovered (observed in prod).
+    # Cap each reconnect wait at 60s so a transient gateway hiccup self-heals
+    # within a minute instead of a quarter hour. Discord rate limits (429) are
+    # handled separately, so this never hammers the API.
+    try:
+        import discord.backoff as _dbackoff
+        _orig_delay = _dbackoff.ExponentialBackoff.delay
+
+        def _capped_delay(self, _orig=_orig_delay):
+            try:
+                return min(float(_orig(self)), 60.0)
+            except Exception:
+                return 60.0
+
+        _dbackoff.ExponentialBackoff.delay = _capped_delay
+        print("[Boot] reconnect backoff capped at 60s")
+    except Exception as _e:
+        print(f"[Boot] backoff cap not applied: {_e}")
     try:
         bot.run(TOKEN)
     except discord.errors.HTTPException as e:
