@@ -2976,16 +2976,22 @@ def _giveaway_tidy_text(nodes):
                 _giveaway_tidy_text(n[key])
 
 
-def _giveaway_render_design(g, gid, guild, ended=False, winner_ids=None):
+def _giveaway_render_design(g, gid, guild, ended=False, winner_ids=None, keep_running=False):
     """Render a giveaway layout with tokens filled in. While running (or when no
     dedicated ended design exists) uses the running design + Enter button. When
     ended AND a separate ended design is configured, uses that + a Reroll button.
-    Returns None if no design is configured."""
+    Returns None if no design is configured.
+
+    keep_running=True forces the RUNNING design even after the giveaway ends (with
+    the Enter button disabled) — used to leave the original giveaway message
+    intact (prize/winners/entries visible) while the winner is announced in a
+    separate message below it."""
     running_design = g.get("design") or giveaway_config.get("components") or []
     ended_design = giveaway_config.get("ended_components") or []
     # Only swap to the ended design if the running message was also a V2 design —
     # otherwise the posted message is an embed and can't be edited into V2.
-    use_ended_design = bool(ended and ended_design and running_design)
+    # keep_running never swaps: the original message stays on the running design.
+    use_ended_design = bool(ended and ended_design and running_design) and not keep_running
     design = ended_design if use_ended_design else running_design
     if not design:
         return None
@@ -3056,10 +3062,11 @@ def _giveaway_render_guard(built, g, gid, ended, winner_ids):
             _giveaway_action_row(g, gid, False)]
 
 
-def _giveaway_payload(g, gid, guild, ended=False, winner_ids=None, for_edit=False):
+def _giveaway_payload(g, gid, guild, ended=False, winner_ids=None, for_edit=False, keep_running=False):
     """Build the message payload for a giveaway. Uses the designed V2 layout when
-    one exists, otherwise the built-in embed."""
-    design = _giveaway_render_design(g, gid, guild, ended, winner_ids)
+    one exists, otherwise the built-in embed. keep_running keeps the running
+    layout (with the Enter button disabled) even after the giveaway ends."""
+    design = _giveaway_render_design(g, gid, guild, ended, winner_ids, keep_running=keep_running)
     if design is not None:
         design = _giveaway_render_guard(design, g, gid, ended, winner_ids)
         payload = {"components": design}
@@ -3067,7 +3074,9 @@ def _giveaway_payload(g, gid, guild, ended=False, winner_ids=None, for_edit=Fals
             payload["flags"] = 1 << 15  # Components V2
             payload["allowed_mentions"] = {"parse": ["roles", "users"]}
         return payload
-    embed = build_giveaway_embed(g, ended=ended, winner_ids=winner_ids)
+    # Embed fallback. When keeping the running message on end, show the LIVE embed
+    # (so prize/winners/entries stay) but disable the Enter button.
+    embed = build_giveaway_embed(g, ended=(ended and not keep_running), winner_ids=winner_ids)
     payload = {"embeds": [embed.to_dict()], "components": [_giveaway_action_row(g, gid, ended)]}
     if not for_edit:
         payload["allowed_mentions"] = {"parse": ["roles", "users"]}
@@ -3075,6 +3084,24 @@ def _giveaway_payload(g, gid, guild, ended=False, winner_ids=None, for_edit=Fals
         if ping:
             payload["content"] = _render_guild_text(ping, guild)
     return payload
+
+
+def _giveaway_winner_payload(g, gid, guild, winner_ids, for_edit=False):
+    """Standalone winner announcement, posted as a NEW message directly below the
+    (kept) giveaway so its entry count stays visible. Uses the designed ended
+    layout when one exists, otherwise a compact winner embed."""
+    ended_design = giveaway_config.get("ended_components") or []
+    running_design = g.get("design") or giveaway_config.get("components") or []
+    am = {"parse": ["roles", "users"]}
+    if ended_design and running_design:
+        design = _giveaway_render_design(g, gid, guild, ended=True, winner_ids=winner_ids)
+        if design:
+            payload = {"components": design, "allowed_mentions": am}
+            if not for_edit:
+                payload["flags"] = 1 << 15  # Components V2
+            return payload
+    embed = build_giveaway_embed(g, ended=True, winner_ids=winner_ids)
+    return {"embeds": [embed.to_dict()], "allowed_mentions": am}
 
 
 async def _giveaway_send(channel, g, gid):
@@ -3206,12 +3233,22 @@ async def end_giveaway(gid, actor_id=None):
     g["last_winners"] = winner_ids
     channel = await resolve_channel(g["channel_id"])
     guild = getattr(channel, "guild", None) if channel else None
-    # Edit the giveaway message in place to show the winner. No separate
-    # congratulations message is posted — the winner shows on the message itself,
-    # which is never deleted.
-    await _giveaway_patch(g, _giveaway_payload(g, gid, guild, ended=True, winner_ids=winner_ids, for_edit=True))
-    await _gw_save_state(gid, g)  # persist the ended state + winners for reroll after a redeploy
-    print(f"[Giveaway] {gid} ended — message {g.get('message_id')} EDITED to winner state (never deleted)")
+    # Keep the ORIGINAL giveaway message in place (prize / winners / ENTRIES stay
+    # visible) and only disable its Enter button — never replace it with the
+    # winner announcement.
+    await _giveaway_patch(g, _giveaway_payload(g, gid, guild, ended=True, winner_ids=winner_ids, for_edit=True, keep_running=True))
+    # Announce the winner as a NEW message directly below, so the entry count on
+    # the giveaway above stays readable. Remember its id so -reroll edits it.
+    if channel:
+        try:
+            route = discord.http.Route("POST", "/channels/{channel_id}/messages", channel_id=int(g["channel_id"]))
+            resp = await bot.http.request(route, json=_giveaway_winner_payload(g, gid, guild, winner_ids))
+            if isinstance(resp, dict) and resp.get("id"):
+                g["winner_message_id"] = str(resp["id"])
+        except Exception as e:
+            print(f"[Giveaway] winner announce failed: {e}")
+    await _gw_save_state(gid, g)  # persist ended state + winners + winner msg id for reroll after a redeploy
+    print(f"[Giveaway] {gid} ended — giveaway message kept, winner posted below as {g.get('winner_message_id')}")
     return winner_ids
 
 
@@ -5999,7 +6036,23 @@ async def _cmd_reroll(message):
 
     g["last_winners"] = winners
     guild = message.guild
-    await _giveaway_patch(g, _giveaway_payload(g, gid, guild, ended=True, winner_ids=winners, for_edit=True))
+    win_mid = g.get("winner_message_id")
+    if win_mid:
+        # New model: the winner lives in its own message below the giveaway.
+        # Edit that one; leave the giveaway (with its entry count) untouched.
+        try:
+            route = discord.http.Route(
+                "PATCH", "/channels/{channel_id}/messages/{message_id}",
+                channel_id=int(g["channel_id"]), message_id=int(win_mid),
+            )
+            await bot.http.request(route, json=_giveaway_winner_payload(g, gid, guild, winners, for_edit=True))
+        except Exception as e:
+            print(f"[Giveaway] reroll winner-message edit failed: {e}")
+            return await react("❌")
+    else:
+        # Legacy giveaways that ended before this change: edit the main message.
+        await _giveaway_patch(g, _giveaway_payload(g, gid, guild, ended=True, winner_ids=winners, for_edit=True))
+    await _gw_save_state(gid, g)
     await react("✅")
 
 
