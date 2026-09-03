@@ -46,7 +46,7 @@ BASE_COMMANDS = {
         "promotionroles", "grouproleupdate", "logtest", "logdebug",
         # community
         "giveaway", "suggestion", "blacklist", "unblacklist", "leaderboard", "invitebonus",
-        "resetinvites", "ads", "adsgrant", "payment",
+        "resetinvites", "ads", "adsgrant",
         # music, radio, text to speech
         "join", "leave", "set", "play", "skip", "stop", "pause", "resume", "queue", "volume",
         "nowplaying", "favorites", "setmusic", "stopmusic", "radio", "votegenre", "musicdebug",
@@ -56,7 +56,7 @@ BASE_COMMANDS = {
 BASE_FEATURES = {
     "roleplay": {
         "welcome", "invite", "tickets", "roblox-verify", "customs-giveaway", "customs-infraction",
-        "customs-promotion", "customs-logging", "customs-payment", "music-addon", "auto-radio",
+        "customs-promotion", "customs-logging", "music-addon", "auto-radio",
         "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-blacklist",
         "customs-smallui", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling",
     },
@@ -9408,6 +9408,8 @@ async def ticket_queue_tick():
         return
     now = time.time()
     order_cats = _order_category_names()
+    if not order_cats:
+        return  # no Order Status services set up, so nothing is "in line"
     dirty = False
     live = set()
     for guild in list(bot.guilds):
@@ -9476,7 +9478,10 @@ def _terms_checkbox_component():
 
 def _ticket_is_order(source_key=None, category=None, category_name=None):
     """Order tickets need the policy box: anything opened from the Marketplace
-    panel, or whose category is one of the Order Status services."""
+    panel, or whose category is one of the Order Status services. Network only:
+    roleplay servers sell through their own marketplace, not under our policy."""
+    if BOT_BASE != "customs":
+        return False
     if source_key and _key_source.get(source_key) == "marketplace":
         return True
     if category and _settings_for_category(category) is marketplace_config:
