@@ -60,15 +60,16 @@ fi
 
 python3 -m py_compile "$WORK/main.py"
 git add -A
-if git diff --cached --quiet; then
-  echo "Roleplay repo already up to date."
-  exit 0
-fi
 SRC_SHA="$(git -C "$SRC" rev-parse --short HEAD)"
-git commit -q -m "Sync from oversite-customs ${SRC_SHA}"
+if git diff --cached --quiet; then
+  echo "Nothing new to commit."
+else
+  git commit -q -m "Sync from oversite-customs ${SRC_SHA}"
+fi
 if [[ "${1:-}" == "--no-push" ]]; then
   echo "Committed in $WORK (not pushed)."
   exit 0
 fi
+# Push whatever is ahead of origin, including commits from an earlier run.
 git push -q -u origin main
-echo "Pushed oversite-roleplay main <- oversite-customs ${SRC_SHA}"
+echo "oversite-roleplay main is up to date with oversite-customs ${SRC_SHA}"
