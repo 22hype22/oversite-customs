@@ -2071,7 +2071,7 @@ async def leaderboard_invites(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="invitebonus", description="Adds or removes bonus invites for a member.")
-@app_commands.describe(user="Member to adjust", amount="Bonus invites to add (use a negative number to remove)")
+@app_commands.describe(user="Member to adjust", amount="Bonus invites to add. Use a negative number to take some away.")
 async def invitebonus_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(embed=error_embed("Admins only", "You need Manage Server."), ephemeral=True)
@@ -2113,7 +2113,7 @@ async def _reset_invites(guild, user=None):
 
 
 @bot.tree.command(name="resetinvites", description="Resets everyone's invite count to zero.")
-@app_commands.describe(user="Optional — reset only this member instead of everyone")
+@app_commands.describe(user="Only reset this member. Leave empty to reset everyone.")
 async def resetinvites_cmd(interaction: discord.Interaction, user: discord.Member = None):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(
@@ -2551,7 +2551,7 @@ async def credits_remove(interaction: discord.Interaction, member: discord.Membe
 
 
 @credits_group.command(name="view", description="Shows a member's credits and history.")
-@app_commands.describe(member="Member to look up (leave blank for yourself)")
+@app_commands.describe(member="Member to look up. Leave empty for yourself.")
 async def credits_view(interaction: discord.Interaction, member: discord.Member = None):
     await interaction.response.defer(ephemeral=True)
     member = member or interaction.user
@@ -2708,7 +2708,7 @@ async def logtest_cmd(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="logdebug", description="Checks why a purchase log shows no customer.")
-@app_commands.describe(roblox_id="The buyer's Roblox user ID (e.g. 376043957)", roblox_username="The buyer's Roblox username (optional)")
+@app_commands.describe(roblox_id="The buyer's Roblox user ID, like 376043957.", roblox_username="The buyer's Roblox username, if you have it.")
 async def logdebug_cmd(interaction: discord.Interaction, roblox_id: str, roblox_username: str = ""):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(embed=error_embed("No permission", "Only staff can run this."), ephemeral=True)
@@ -3716,7 +3716,7 @@ async def robuxlockerrate_cmd(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="funds", description="Shows the group's available and pending Robux.")
-@app_commands.describe(period="Revenue window for the breakdown (default: this month)")
+@app_commands.describe(period="Which window to break down. This month if you leave it.")
 @app_commands.choices(period=[
     app_commands.Choice(name="Today", value="Day"),
     app_commands.Choice(name="This Week", value="Week"),
@@ -4674,7 +4674,7 @@ async def package_cmd(interaction: discord.Interaction, channel: typing.Union[di
 
 
 @bot.tree.command(name="packageback", description="Sets a background that package previews are placed on.")
-@app_commands.describe(background="The background image — your uniform preview is centered on top of it")
+@app_commands.describe(background="The background image. Your uniform preview is centered on top of it.")
 async def packageback_cmd(interaction: discord.Interaction, background: discord.Attachment):
     global _pkgback_loaded
     if not interaction.guild:
@@ -5547,7 +5547,7 @@ class _RoleWatchView(discord.ui.View):
 
 
 @bot.tree.command(name="infractionroles", description="Sets the roles that log an infraction when they're removed.")
-@app_commands.describe(min="How many must be removed to trigger (0 = all of them)")
+@app_commands.describe(min="How many must be removed to trigger. 0 means all of them.")
 async def infractionroles_cmd(interaction: discord.Interaction, min: int = 0):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(embed=error_embed("Admins only", "You need Manage Server."), ephemeral=True)
@@ -5558,7 +5558,7 @@ async def infractionroles_cmd(interaction: discord.Interaction, min: int = 0):
 
 
 @bot.tree.command(name="promotionroles", description="Sets the roles that log a promotion when they're added.")
-@app_commands.describe(min="How many must be added to trigger (0 = all of them)")
+@app_commands.describe(min="How many must be added to trigger. 0 means all of them.")
 async def promotionroles_cmd(interaction: discord.Interaction, min: int = 0):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(embed=error_embed("Admins only", "You need Manage Server."), ephemeral=True)
@@ -7657,7 +7657,7 @@ async def vouch_cmd(interaction: discord.Interaction, designer: discord.Member):
 
 
 @bot.tree.command(name="vouches", description="Shows a designer's rating and recent vouches.")
-@app_commands.describe(designer="Whose vouches to show (leave blank for yourself)")
+@app_commands.describe(designer="Whose vouches to show. Leave empty for yourself.")
 async def vouches_cmd(interaction: discord.Interaction, designer: discord.Member = None):
     designer = designer or interaction.user
     guild = interaction.guild
@@ -7697,7 +7697,7 @@ async def vouches_cmd(interaction: discord.Interaction, designer: discord.Member
 
 
 @bot.tree.command(name="vouchremove", description="Removes a vouch.")
-@app_commands.describe(designer="The designer the vouch is for", reviewer="Who left it (staff only — defaults to you)")
+@app_commands.describe(designer="The designer the vouch is for", reviewer="Who left it. Staff can pick anyone, otherwise it's you.")
 async def vouchremove_cmd(interaction: discord.Interaction, designer: discord.Member, reviewer: discord.Member = None):
     target = reviewer or interaction.user
     if target.id != interaction.user.id and not interaction.user.guild_permissions.manage_guild:
@@ -7986,7 +7986,7 @@ def _sales_embed(guild, title, since_ts, footer=""):
 
 
 @bot.tree.command(name="sales", description="Shows each designer's orders, packages, and revenue.")
-@app_commands.describe(period="How far back to count", designer="Only this designer (optional)", public="Post it in the channel instead of just to you")
+@app_commands.describe(period="How far back to count", designer="Only this designer, if you want.", public="Post it in the channel instead of just to you")
 @app_commands.choices(period=[
     app_commands.Choice(name="This week", value="week"),
     app_commands.Choice(name="This month", value="month"),
@@ -8192,7 +8192,7 @@ async def _away_notify_tickets(guild, member, rec=None, back=False):
 
 
 @bot.tree.command(name="away", description="Marks you away, hides you from pricing, and tells your customers when you're back.")
-@app_commands.describe(until="How long or what date: 3d, 2 weeks, 9/10, sep 10", note="Optional note shown to your customers")
+@app_commands.describe(until="How long or until what date, like 3d, 2 weeks, 9/10, or sep 10.", note="Optional note shown to your customers")
 async def away_cmd(interaction: discord.Interaction, until: str, note: str = ""):
     if not _away_loaded:
         return await interaction.response.send_message(embed=error_embed("Try again", "Away mode isn't ready yet, give it a minute."), ephemeral=True)
@@ -9217,7 +9217,7 @@ async def _ticket_set_stage(ch, key, actor=None, note="", announce=True):
 
 
 @bot.tree.command(name="progress", description="Marks an order as in progress or completed.")
-@app_commands.describe(stage="Where the order is now", note="Anything to add for the customer (optional)")
+@app_commands.describe(stage="Where the order is now", note="Anything to add for the customer.")
 @app_commands.choices(stage=[app_commands.Choice(name=v[0], value=k) for k, v in PROGRESS_STAGES.items()])
 async def progress_cmd(interaction: discord.Interaction, stage: app_commands.Choice[str], note: str = ""):
     ch = interaction.channel
@@ -9305,7 +9305,7 @@ def _stage_label(info):
 
 
 @bot.tree.command(name="myorders", description="Shows your open and past orders.")
-@app_commands.describe(member="Staff only: whose orders to show")
+@app_commands.describe(member="Whose orders to show. Staff only.")
 async def myorders_cmd(interaction: discord.Interaction, member: discord.Member = None):
     guild = interaction.guild
     target = member or interaction.user
@@ -14397,7 +14397,7 @@ async def ads_cmd(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="adsgrant", description="Gives a member an ad perk.")
-@app_commands.describe(user="Member to give the perk to", perk="Which perk", amount="How many (default 1)")
+@app_commands.describe(user="Member to give the perk to", perk="Which perk", amount="How many. One if you leave it.")
 @app_commands.choices(perk=[
     app_commands.Choice(name="Everyone Ping", value="ping_everyone"),
     app_commands.Choice(name="Here Ping", value="ping_here"),
@@ -18238,7 +18238,7 @@ _set_group = app_commands.Group(name="set", description="Server settings.")
 
 
 @_set_group.command(name="nick", description="Sets what the bot calls someone when it reads chat.")
-@app_commands.describe(user="Whose name to change (defaults to you)", nickname="New name to be read (blank to reset)")
+@app_commands.describe(user="Whose name to change. You if you leave it.", nickname="The name to read out. Leave empty to reset it.")
 async def set_nick(interaction: discord.Interaction, user: discord.Member = None, nickname: str = ""):
     target = user or interaction.user
     # Anyone may rename themselves; renaming others needs Manage Nicknames.
@@ -18269,7 +18269,7 @@ bot.tree.add_command(_set_group)
 
 # ---- Commands ----
 @bot.tree.command(name="play", description="Plays a song in your voice channel.")
-@app_commands.describe(query="Song name, a link, a genre, or 'favorites'")
+@app_commands.describe(query="A song name, a link, a genre, or favorites.")
 async def music_play(interaction: discord.Interaction, query: str):
     try:
         await interaction.response.defer(ephemeral=True)
@@ -18524,7 +18524,7 @@ async def music_queue(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="volume", description="Sets the volume from 0 to 100.")
-@app_commands.describe(volume="Volume level 0-100")
+@app_commands.describe(volume="Volume from 0 to 100.")
 async def music_volume(interaction: discord.Interaction, volume: app_commands.Range[int, 0, 100]):
     if not is_dj(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "You need a DJ role."), ephemeral=True)
@@ -18559,7 +18559,7 @@ async def favorites_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="setmusic", description="Starts a nonstop radio for a genre.")
-@app_commands.describe(genre="Genre e.g. Country, Hip Hop, Rock, Pop, All")
+@app_commands.describe(genre="A genre, like Country, Hip Hop, Rock, Pop, or All.")
 async def setmusic_command(interaction: discord.Interaction, genre: str):
     if not _is_admin(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "Admins only."), ephemeral=True)
@@ -18634,7 +18634,7 @@ def _radio_stream_for(genre):
 
 
 @bot.tree.command(name="radio", description="Starts a 24/7 radio stream in your voice channel.")
-@app_commands.describe(genre="Genre, e.g. lofi, rock, country, jazz, edm, pop")
+@app_commands.describe(genre="A genre, like lofi, rock, country, jazz, edm, or pop.")
 async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
     if not is_dj(interaction.user):
         await interaction.response.send_message(embed=error_embed("DJ only", "You need a DJ role (or admin) for the radio."), ephemeral=True)
