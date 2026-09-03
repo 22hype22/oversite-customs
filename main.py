@@ -29,8 +29,56 @@ SUPABASE_FN_URL = os.getenv("SUPABASE_FN_URL", f"{SUPABASE_URL}/functions/v1")
 BOT_API = os.getenv("BOT_API_NAME", "utilities-bot-api")
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://oversite.shop/bot-dashboard")
 
-SERVER_NAME = os.getenv("SERVER_NAME", "Oversite Customs")
+# Which product this deployment is. The same code runs every Roblox-side base;
+# the base picks the brand name, which slash commands exist, and which
+# dashboard blocks are loaded. "customs" = Oversite Network (the original).
+BOT_BASE = (os.getenv("BOT_BASE") or "customs").strip().lower()
+BASE_BRANDS = {"customs": "Oversite Customs", "roleplay": "Oversite Roleplay"}
+BRAND = BASE_BRANDS.get(BOT_BASE, "Oversite Customs")
+SERVER_NAME = os.getenv("SERVER_NAME", BRAND)
 ACCENT = 0xC9DBE6
+
+# Slash commands each base keeps. A base not listed here keeps everything.
+BASE_COMMANDS = {
+    "roleplay": {
+        # tickets, join message, verification, group sync, logs
+        "ticketadd", "ticketremove", "joinsetup", "infraction", "promote", "infractionroles",
+        "promotionroles", "grouproleupdate", "logtest", "logdebug",
+        # community
+        "giveaway", "suggestion", "blacklist", "unblacklist", "leaderboard", "invitebonus",
+        "resetinvites", "ads", "adsgrant", "payment",
+        # music, radio, text to speech
+        "join", "leave", "set", "play", "skip", "stop", "pause", "resume", "queue", "volume",
+        "nowplaying", "favorites", "setmusic", "stopmusic", "radio", "votegenre", "musicdebug",
+    },
+}
+# Dashboard features (bot_config rows) each base loads. Unlisted bases load all.
+BASE_FEATURES = {
+    "roleplay": {
+        "welcome", "invite", "tickets", "roblox-verify", "customs-giveaway", "customs-infraction",
+        "customs-promotion", "customs-logging", "customs-payment", "music-addon", "auto-radio",
+        "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-blacklist",
+        "customs-smallui", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling",
+    },
+}
+
+
+def _base_allows_feature(feature):
+    allowed = BASE_FEATURES.get(BOT_BASE)
+    return True if allowed is None else feature in allowed
+
+
+def _prune_commands_for_base():
+    """Drop slash commands this base doesn't sell, before the tree syncs."""
+    allowed = BASE_COMMANDS.get(BOT_BASE)
+    if allowed is None:
+        return 0
+    removed = 0
+    for cmd in list(bot.tree.get_commands()):
+        if cmd.name not in allowed:
+            bot.tree.remove_command(cmd.name)
+            removed += 1
+    return removed
 BOT_START_TIME = discord.utils.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 WELCOME_CHANNEL_ID = os.getenv("WELCOME_CHANNEL_ID", "")
@@ -1543,6 +1591,9 @@ async def on_ready():
         if os.getenv("SKIP_SYNC") == "1":
             print("Command sync skipped")
         else:
+            pruned = _prune_commands_for_base()
+            if pruned:
+                print(f"[Boot] base {BOT_BASE}: {pruned} command(s) not in this product, removed before sync")
             synced = await bot.tree.sync()
             print(f"Synced {len(synced)} commands")
             for cmd in synced:
@@ -1618,7 +1669,7 @@ async def on_guild_join(guild):
         if target is not None:
             await target.send(embed=error_embed(
                 "This bot is licensed per server",
-                "Oversite Customs only runs in servers the owner has added through "
+                f"{BRAND} only runs in servers the owner has added through "
                 "their **Oversite dashboard** (Add to another server). This server "
                 "isn't covered by their plan, so I'm leaving. Ask the owner to add "
                 "it from the dashboard, then re-invite.",
@@ -7005,10 +7056,10 @@ def _pf_config_for(feature):
 _PF_PLATFORM_KEY = {}
 _PF_BUILTIN_DESIGN = {
     "customs-suggestions": [{"type": "text", "text": (
-        "## Oversite Customs | Custom Feature\n**User:** {user}\n"
+        f"## {BRAND} | Custom Feature\n**User:** {{user}}\n"
         "{Question: **Feature Title:**}\n{Question: **Description:**}\n{File: **Example:**}")}],
     "customs-reportbug": [{"type": "text", "text": (
-        "## Oversite Customs | Bug Report\n**User:** {user}\n"
+        f"## {BRAND} | Bug Report\n**User:** {{user}}\n"
         "{Question: **What happened:**}\n{Question: **Steps to reproduce:**}\n{File: **Screenshot:**}")}],
 }
 # The dashboard's Custom Feature / Report a Bug editor uses value tokens
@@ -9414,7 +9465,7 @@ async def _ticket_queue_before():
 
 # ---- Sales and Refund Policy agreement on order tickets (hardcoded) ----
 TERMS_CID = "agree_terms"
-TERMS_LABEL = "Oversite Customs Sales and Refund Policy"
+TERMS_LABEL = f"{BRAND} Sales and Refund Policy"
 
 
 def _terms_checkbox_component():
@@ -13877,14 +13928,14 @@ class AdStartModal(discord.ui.Modal):
         self.add_item(discord.ui.Label(text="Post type", description="Regular Post or Sponsored Giveaway.", component=self.kind))
         self.add_item(discord.ui.Label(
             text="Advertisement Terms of Service",
-            description="I agree to the Oversite Customs Advertisement Terms of Service.",
+            description=f"I agree to the {BRAND} Advertisement Terms of Service.",
             component=self.agree))
 
     async def on_submit(self, interaction):
         if not self.agree.value:
             await interaction.response.send_message(
                 embed=error_embed("Agreement required",
-                    "You must agree to the Oversite Customs Advertisement Terms of Service before posting."),
+                    f"You must agree to the {BRAND} Advertisement Terms of Service before posting."),
                 ephemeral=True)
             return
         kind = self.kind.values[0] if self.kind.values else "regular"
@@ -14318,12 +14369,12 @@ class _PkgBuyModal(discord.ui.Modal):
         self.agree = discord.ui.Checkbox(custom_id="agree")
         self.add_item(discord.ui.Label(text="Recipient", description="Buy for yourself, or gift it to someone.", component=self.recipient))
         self.add_item(discord.ui.Label(text="Gift Recipient (required if gifting)", component=self.ruser))
-        self.add_item(discord.ui.Label(text="Oversite Customs Sales & Refund Policy", description="Check to agree, required before checkout.", component=self.agree))
+        self.add_item(discord.ui.Label(text=f"{BRAND} Sales & Refund Policy", description="Check to agree, required before checkout.", component=self.agree))
 
     async def on_submit(self, interaction):
         if not self.agree.value:
             await interaction.response.send_message(
-                embed=error_embed("Agreement required", "You must agree to the **Oversite Customs Sales & Refund Policy** to continue."), ephemeral=True)
+                embed=error_embed("Agreement required", f"You must agree to the **{BRAND} Sales & Refund Policy** to continue."), ephemeral=True)
             return
         mode = self.recipient.values[0] if self.recipient.values else "personal"
         if mode == "gift":
@@ -14926,7 +14977,7 @@ async def seed_secret_slots():
     if not WORKER_TOKEN:
         return
     slots = [{
-        "addon_id": "customs",
+        "addon_id": BOT_BASE,
         "key": "ROBLOX_COOKIE",
         "label": "Roblox account cookie",
         "description": ("The .ROBLOSECURITY cookie of your group's Roblox bot account. Powers "
@@ -14937,7 +14988,7 @@ async def seed_secret_slots():
         "required": False,
         "sort_order": 0,
     }, {
-        "addon_id": "customs",
+        "addon_id": BOT_BASE,
         "key": "ROBLOX_API_KEY",
         "label": "Roblox Open Cloud API key",
         "description": ("An Open Cloud API key for creating the developer products behind "
@@ -14950,7 +15001,7 @@ async def seed_secret_slots():
         "required": False,
         "sort_order": 1,
     }, {
-        "addon_id": "customs",
+        "addon_id": BOT_BASE,
         "key": "ROBLOX_DEVPRODUCT_PLACE_ID",
         "label": "Store experience ID(s)",
         "description": ("The Roblox experience(s) where Purchase dev products are created. Paste "
@@ -14966,7 +15017,7 @@ async def seed_secret_slots():
         "required": False,
         "sort_order": 2,
     }, {
-        "addon_id": "customs",
+        "addon_id": BOT_BASE,
         "key": "ROBLOX_GROUP_ID",
         "label": "Roblox group ID",
         "description": ("The Roblox group your bot account runs for. Used for group funds and "
@@ -14978,16 +15029,22 @@ async def seed_secret_slots():
         "required": False,
         "sort_order": 3,
     }]
+    if BOT_BASE == "roleplay":
+        # No shop here: only the account cookie (verification, group sync) and
+        # the group id. Packages, dev products and the locker are Network-only.
+        slots = [s for s in slots if s["key"] in ("ROBLOX_COOKIE", "ROBLOX_GROUP_ID")]
     res = await runtime_rpc("runtime_seed_secret_slots", {"_token": WORKER_TOKEN, "_slots": slots})
-    print(f"[Startup] secret slots seeded: {bool(res)}")
+    print(f"[Startup] secret slots seeded for {BOT_BASE}: {bool(res)}")
 
 
 async def load_all_configs():
     if not (BOT_ORDER_ID and WORKER_TOKEN):
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
-    print(f"[Config] loading for bot {BOT_ORDER_ID}")
+    print(f"[Config] loading for bot {BOT_ORDER_ID} (base {BOT_BASE})")
     for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-feedback", "customs-reportbug", "customs-freerelease", "customs-blacklist", "customs-announce", "customs-smallui", "customs-vouches", "customs-sales", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling"):
+        if not _base_allows_feature(feature):
+            continue
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
