@@ -5565,7 +5565,7 @@ def _pricing_lines_text(si, guild=None):
             if guild and vouch_config.get("show_on_pricing"):
                 badge = _vouch_badge(guild.id, uid)
                 if badge:
-                    head += f"  {badge}"
+                    head += f", {badge}"
             blocks.append(head + "\n" + "\n".join(lines))
     return "\n\n".join(blocks) if blocks else "No pricing set yet."
 
@@ -7316,19 +7316,20 @@ def _vouch_stats(guild_id, designer_id):
 
 
 def _vouch_stars(n):
+    """Plain '4 out of 5' wording. No star glyphs or emoji anywhere in the bot."""
     try:
         n = max(0, min(5, int(round(float(n or 0)))))
     except (TypeError, ValueError):
         n = 0
-    return "★" * n + "☆" * (5 - n)
+    return f"{n} out of 5"
 
 
 def _vouch_badge(guild_id, designer_id):
-    """'★ 4.8 · 12 vouches' for a designer, or '' if they have none yet."""
+    """'4.8 out of 5 from 12 vouches' for a designer, or '' if they have none yet."""
     count, avg = _vouch_stats(guild_id, designer_id)
     if not count:
         return ""
-    return f"★ {avg:.1f} · {count} vouch{'es' if count != 1 else ''}"
+    return f"{avg:.1f} out of 5 from {count} vouch{'es' if count != 1 else ''}"
 
 
 def _vouch_can_receive(member):
@@ -7346,11 +7347,11 @@ class _VouchModal(discord.ui.Modal):
     def __init__(self, designer_id, product="", pkg_msg_id=""):
         super().__init__(title="Leave a Vouch", custom_id=f"vouchform:{designer_id}:{pkg_msg_id}", timeout=None)
         rating = discord.ui.Select(custom_id="rating", min_values=1, max_values=1, options=[
-            discord.SelectOption(label="★★★★★  Amazing", value="5"),
-            discord.SelectOption(label="★★★★☆  Great", value="4"),
-            discord.SelectOption(label="★★★☆☆  Okay", value="3"),
-            discord.SelectOption(label="★★☆☆☆  Not great", value="2"),
-            discord.SelectOption(label="★☆☆☆☆  Bad", value="1"),
+            discord.SelectOption(label="5 out of 5", description="Amazing", value="5"),
+            discord.SelectOption(label="4 out of 5", description="Great", value="4"),
+            discord.SelectOption(label="3 out of 5", description="Okay", value="3"),
+            discord.SelectOption(label="2 out of 5", description="Not great", value="2"),
+            discord.SelectOption(label="1 out of 5", description="Bad", value="1"),
         ])
         self.add_item(discord.ui.Label(text="Rating", description="How was the experience?", component=rating))
         self.add_item(discord.ui.Label(
@@ -7370,7 +7371,7 @@ class _VouchModal(discord.ui.Modal):
 def _vouch_card(guild, designer, reviewer_id, entry, count, avg):
     e = discord.Embed(
         title=f"Vouch for {designer.display_name}",
-        description=f"{_vouch_stars(entry.get('rating'))}\n\n{entry.get('review') or '_No written review._'}",
+        description=f"Rated {_vouch_stars(entry.get('rating'))}\n\n{entry.get('review') or 'No written review.'}",
         color=0x2b2d31,
         timestamp=discord.utils.utcnow(),
     )
@@ -7382,7 +7383,7 @@ def _vouch_card(guild, designer, reviewer_id, entry, count, avg):
         e.set_thumbnail(url=designer.display_avatar.url)
     except Exception:
         pass
-    e.set_footer(text=f"Vouch {count} · average {avg:.1f} / 5")
+    e.set_footer(text=f"Vouch number {count}. Average {avg:.1f} out of 5.")
     return e
 
 
@@ -7420,7 +7421,7 @@ async def _vouch_submit(interaction, payload):
             embed=error_embed("Can't vouch", "That designer isn't in the server anymore."), ephemeral=True)
     if designer.id == interaction.user.id:
         return await interaction.response.send_message(
-            embed=error_embed("Nice try", "You can't vouch for yourself."), ephemeral=True)
+            embed=error_embed("Not allowed", "You can't vouch for yourself."), ephemeral=True)
 
     uid = str(interaction.user.id)
     lst = vouches.setdefault(str(guild.id), {}).setdefault(str(designer.id), [])
@@ -7449,8 +7450,8 @@ async def _vouch_submit(interaction, payload):
     await _vouch_save()
     try:
         await interaction.response.send_message(
-            embed=success_embed("Vouch updated" if old else "Thanks for the vouch!",
-                                f"{designer.mention} is now at **{avg:.1f} / 5** from {count} vouch{'es' if count != 1 else ''}."),
+            embed=success_embed("Vouch updated" if old else "Vouch posted",
+                                f"{designer.mention} is now at {avg:.1f} out of 5 from {count} vouch{'es' if count != 1 else ''}."),
             ephemeral=True)
     except Exception:
         pass
@@ -7461,11 +7462,11 @@ async def _vouch_submit(interaction, payload):
 async def vouch_cmd(interaction: discord.Interaction, designer: discord.Member):
     if not vouch_config.get("channel_id"):
         return await interaction.response.send_message(
-            embed=error_embed("Not set up", "Vouches aren't set up yet — an admin needs to pick a vouch channel in the dashboard."), ephemeral=True)
+            embed=error_embed("Not set up", "Vouches aren't set up yet. An admin needs to pick a vouch channel in the dashboard."), ephemeral=True)
     if designer.bot:
         return await interaction.response.send_message(embed=error_embed("Can't vouch", "Bots don't take vouches."), ephemeral=True)
     if designer.id == interaction.user.id:
-        return await interaction.response.send_message(embed=error_embed("Nice try", "You can't vouch for yourself."), ephemeral=True)
+        return await interaction.response.send_message(embed=error_embed("Not allowed", "You can't vouch for yourself."), ephemeral=True)
     if not _vouch_can_receive(designer):
         return await interaction.response.send_message(
             embed=error_embed("Not a designer", f"{designer.mention} doesn't have a designer role here."), ephemeral=True)
@@ -7484,7 +7485,7 @@ async def vouches_cmd(interaction: discord.Interaction, designer: discord.Member
             ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
     count, avg = _vouch_stats(guild.id, designer.id)
     e = discord.Embed(title=f"{designer.display_name}'s vouches", color=0x2b2d31)
-    e.description = f"{_vouch_stars(avg)}  **{avg:.1f} / 5**  from {count} vouch{'es' if count != 1 else ''}"
+    e.description = f"**{avg:.1f} out of 5** from {count} vouch{'es' if count != 1 else ''}"
     # Star breakdown, five down to one.
     tally = {n: 0 for n in range(1, 6)}
     for v in lst:
@@ -7495,15 +7496,15 @@ async def vouches_cmd(interaction: discord.Interaction, designer: discord.Member
         if r in tally:
             tally[r] += 1
     e.add_field(name="Breakdown",
-                value="\n".join(f"{_vouch_stars(n)}  {tally[n]}" for n in range(5, 0, -1)), inline=False)
+                value="\n".join(f"{n} out of 5: {tally[n]}" for n in range(5, 0, -1)), inline=False)
     recent = sorted(lst, key=lambda v: int(v.get("ts") or 0), reverse=True)[:5]
     lines = []
     for v in recent:
         text = (v.get("review") or "").replace("\n", " ").strip()
         if len(text) > 140:
             text = text[:137] + "…"
-        bought = f" · {v['product']}" if v.get("product") else ""
-        lines.append(f"{_vouch_stars(v.get('rating'))} <@{v.get('by')}>{bought}" + (f"\n{text}" if text else ""))
+        bought = f", bought {v['product']}" if v.get("product") else ""
+        lines.append(f"{_vouch_stars(v.get('rating'))} from <@{v.get('by')}>{bought}" + (f"\n{text}" if text else ""))
     e.add_field(name="Recent", value="\n\n".join(lines)[:1024], inline=False)
     try:
         e.set_thumbnail(url=designer.display_avatar.url)
@@ -7639,7 +7640,7 @@ def _sales_lines(summary, guild):
     rows = sorted(summary.items(), key=lambda kv: _sales_rank_key(kv[1]), reverse=True)
     lines = []
     for did, d in rows[:15]:
-        who = f"<@{did}>" if did.isdigit() else "Unattributed"
+        who = f"<@{did}>" if did.isdigit() else "No designer set"
         bits = []
         if d["orders"]:
             bits.append(f"{d['orders']} order{'s' if d['orders'] != 1 else ''}")
@@ -7649,7 +7650,7 @@ def _sales_lines(summary, guild):
             bits.append(f"R$ {d['robux']:,}")
         if d["usd"]:
             bits.append(f"${d['usd']:,.2f}")
-        lines.append(f"{who}, " + " · ".join(bits))
+        lines.append(f"{who}, " + ", ".join(bits))
     return lines
 
 
@@ -7689,7 +7690,7 @@ def _sales_embed(guild, title, since_ts, footer=""):
         tot.append(f"${t['usd']:,.2f}")
     top_id = max(summary.items(), key=lambda kv: _sales_rank_key(kv[1]))[0]
     e.description = "\n".join(lines)[:3900]
-    e.add_field(name="Total", value=" · ".join(tot) or "0", inline=False)
+    e.add_field(name="Total", value=", ".join(tot) or "0", inline=False)
     if top_id.isdigit():
         e.add_field(name="Top designer", value=f"<@{top_id}>", inline=False)
     if footer:
@@ -7729,7 +7730,7 @@ async def sales_cmd(interaction: discord.Interaction, period: app_commands.Choic
     if designer:
         summary = _sales_summary(interaction.guild.id, since)
         d = summary.get(str(designer.id))
-        e = discord.Embed(title=f"{designer.display_name}'s sales · {label}", color=0x2b2d31)
+        e = discord.Embed(title=f"{designer.display_name}'s sales, {label.lower() if label.startswith(('This', 'Last', 'All')) else label}", color=0x2b2d31)
         if not d:
             e.description = "No sales recorded in this window."
         else:
@@ -7740,7 +7741,7 @@ async def sales_cmd(interaction: discord.Interaction, period: app_commands.Choic
             pass
         return await interaction.response.send_message(embed=e, ephemeral=not public,
                                                        allowed_mentions=discord.AllowedMentions.none())
-    e, _top = _sales_embed(interaction.guild, f"Sales · {label}", since)
+    e, _top = _sales_embed(interaction.guild, f"Sales, {label.lower() if label.startswith(('This', 'Last', 'All')) else label}", since)
     await interaction.response.send_message(embed=e, ephemeral=not public,
                                             allowed_mentions=discord.AllowedMentions.none())
 
@@ -7770,7 +7771,7 @@ async def sales_monthly_tick():
     events_backup = sales_data["events"]
     sales_data["events"] = [e for e in events_backup if float(e.get("ts") or 0) < this_month.timestamp()]
     try:
-        e, top = _sales_embed(guild, f"Monthly recap · {last_month_start.strftime('%B %Y')}",
+        e, top = _sales_embed(guild, f"{last_month_start.strftime('%B %Y')} recap",
                               last_month_start.timestamp(), footer="Posted automatically on the 1st")
     finally:
         sales_data["events"] = events_backup
@@ -7892,7 +7893,7 @@ async def _away_notify_tickets(guild, member, rec=None, back=False):
                 if back:
                     text = f"{ping}**Your designer is back**\n{member.mention} is back and will pick this order up again."
                 else:
-                    text = f"{ping}**Your designer is away**\n{member.mention} is away until {rec.get('label') or 'further notice'} and will pick this back up when they return."
+                    text = f"{ping}**Your designer is away**\n{member.mention} is away until {rec.get('label') or 'further notice'} and will pick this back up when they're back."
                     if rec.get("note"):
                         text += f"\n\n{rec['note']}"
                 await send_v2_message(ch, [{"type": "container", "children": [{"type": "text", "text": text}]}],
@@ -7913,7 +7914,7 @@ async def away_cmd(interaction: discord.Interaction, until: str, note: str = "")
     ts, label = _away_parse_until(until)
     if not ts:
         return await interaction.response.send_message(
-            embed=error_embed("Couldn't read that", "Try a length like `3d` or `2 weeks`, or a date like `9/10` or `sep 10`."), ephemeral=True)
+            embed=error_embed("Couldn't read that", "Try a length like 3d or 2 weeks, or a date like 9/10 or sep 10."), ephemeral=True)
     if ts - time.time() > 120 * 86400:
         return await interaction.response.send_message(embed=error_embed("Too long", "Away mode caps at 120 days. Run it again when you're closer."), ephemeral=True)
     rec = {"until": int(ts), "label": label, "note": (note or "").strip()[:300]}
@@ -7922,9 +7923,9 @@ async def away_cmd(interaction: discord.Interaction, until: str, note: str = "")
     await interaction.response.defer(ephemeral=True)
     n = await _away_notify_tickets(interaction.guild, interaction.user, rec)
     await interaction.followup.send(
-        embed=success_embed("You're marked away", f"Back {label}. You're hidden from the pricing board, "
-                            f"{n} claimed ticket{'s' if n != 1 else ''} told, and staff reminders on them are paused. "
-                            "Run `/back` to end it early."), ephemeral=True)
+        embed=success_embed("You're marked away", f"Back {label}. You're off the pricing board until then, "
+                            f"{n} of your claimed ticket{'s' if n != 1 else ''} got a message, and staff reminders on them are paused. "
+                            "Run /back to end it early."), ephemeral=True)
 
 
 @bot.tree.command(name="back", description="End your away mode early")
@@ -7937,7 +7938,7 @@ async def back_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     n = await _away_notify_tickets(interaction.guild, interaction.user, back=True) if rec else 0
     await interaction.followup.send(
-        embed=success_embed("Welcome back", f"You're back on the pricing board and {n} ticket{'s' if n != 1 else ''} were told."), ephemeral=True)
+        embed=success_embed("Welcome back", f"You're back on the pricing board and {n} of your ticket{'s' if n != 1 else ''} got a message."), ephemeral=True)
 
 
 @tasks.loop(minutes=30)
@@ -8914,7 +8915,7 @@ async def progress_cmd(interaction: discord.Interaction, stage: app_commands.Cho
         text = f"{ping}**Order update: {label}**\n{blurb}"
         if note:
             text += f"\n\n{note}"
-        text += f"\n-# Posted by {interaction.user.mention}"
+        text += f"\n-# From {interaction.user.mention}"
         await send_v2_message(ch, [{"type": "container", "children": [{"type": "text", "text": text}]}],
                               allowed_mentions={"parse": ["users"]})
     # Stamp the stage on the channel (name suffix + topic slot 7). Best effort:
@@ -8971,10 +8972,10 @@ async def _staff_nudge_msg(ch, stage, claimer, roles):
             "roles": " ".join(r.mention for r in roles) if (stage >= 2 and roles) else "",
         }), allowed_mentions=allowed)
         return
-    text = (f"{who}**Waiting on staff**\nThe customer has been waiting **{hours} hours** for a reply on this order."
+    text = (f"{who}**Waiting on staff**\nThe customer has been waiting {hours} hours for a reply on this order."
             if stage < 2 else
-            f"{who}**Still waiting on staff**\nNo staff reply on this order for **{hours} hours**. "
-            + (f"{claimer.mention} claimed it." if claimer else "It's claimed but nobody has answered."))
+            f"{who}**Still waiting on staff**\nNo staff reply on this order for {hours} hours. "
+            + (f"{claimer.mention} has it claimed." if claimer else "It's claimed but nobody has answered."))
     await send_v2_message(ch, [{"type": "container", "children": [{"type": "text", "text": text}]}],
                           allowed_mentions=allowed)
 
@@ -9071,11 +9072,11 @@ async def _queue_update_msg(ch, opener, pos, prev):
         return
     ping = f"{opener.mention} " if opener else ""
     if pos == 1:
-        line = f"{ping}**Queue update**\nYou're **next in line** now (up from {_ordinal(prev)})."
+        line = f"{ping}**Queue update**\nYou're next in line now, up from {_ordinal(prev)}."
     elif up:
-        line = f"{ping}**Queue update**\nYou moved up to **{_ordinal(pos)} in line** (from {_ordinal(prev)})."
+        line = f"{ping}**Queue update**\nYou moved up to {_ordinal(pos)} in line from {_ordinal(prev)}."
     else:
-        line = f"{ping}**Queue update**\nYou were moved back to **{_ordinal(pos)} in line** (from {_ordinal(prev)})."
+        line = f"{ping}**Queue update**\nYou were moved back to {_ordinal(pos)} in line from {_ordinal(prev)}."
     await send_v2_message(ch, [{"type": "container", "children": [{"type": "text", "text": line}]}],
                           allowed_mentions={"parse": ["users"]})
 
@@ -9547,7 +9548,7 @@ async def _ticket_close_dm(channel, guild, opener, closer, reason, transcript):
     if reason:
         lines.append(f"**Reason:** {reason}")
     if designer and vouch_config.get("channel_id"):
-        lines.append(f"\nHow did {designer.mention} do? Leave a vouch below, it takes ten seconds and helps the shop.")
+        lines.append(f"\nIf you have a minute, leave a vouch for {designer.mention} with the button below.")
     e.description = "\n".join(lines)
     e.set_footer(text="Your transcript is attached.")
     view = None
