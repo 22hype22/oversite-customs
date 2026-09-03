@@ -1377,6 +1377,16 @@ async def runtime_rpc(name, payload):
     return None
 
 
+async def _bot_secret(key):
+    """A credential the owner saved under API keys & credentials (e.g.
+    ROBLOX_GROUP_ID), decrypted server-side for this bot only. '' if unset."""
+    if not (WORKER_TOKEN and BOT_ORDER_ID):
+        return ""
+    res = await runtime_rpc("runtime_get_bot_secret",
+                            {"_token": WORKER_TOKEN, "_bot_id": BOT_ORDER_ID, "_key": key})
+    return res.strip() if isinstance(res, str) else ""
+
+
 @bot.event
 async def on_ready():
     print(f"{SERVER_NAME} bot online as {bot.user}")
@@ -1503,6 +1513,10 @@ async def on_ready():
         await _bl_load_saved()
     except Exception as e:
         print(f"[Blacklist] saved-roles load failed: {e}")
+    try:
+        await _vouch_load()
+    except Exception as e:
+        print(f"[Vouch] load failed: {e}")
     if not ticket_inactivity_tick.is_running():
         ticket_inactivity_tick.start()
     if not econ_autosave.is_running():
@@ -4408,6 +4422,8 @@ async def _pkg_store_receipt(posted, ch, embed, ctx, after_files):
         "price_field": price_field,
         "guild_id": str(guild.id) if guild else "",
         "files": file_refs,
+        # Who posted it — so the receipt's Leave a Review can vouch for them.
+        "designer_id": str(ctx.get("designer_id") or ""),
     }
     await _pkg_files_set(str(posted.id), record)
 
@@ -4460,7 +4476,7 @@ async def package_cmd(interaction: discord.Interaction, channel: typing.Union[di
     # + payment/link so they survive the modal round-trip.
     form_msgs[PKG_FORM_KEY] = comps
     form_titles[PKG_FORM_KEY] = "Package"
-    _pending_pkg_ctx[interaction.user.id] = {"channel_id": str(channel.id), "payment": payment or "", "link": link or "", "tag": tag or "", "delivery_id": str(delivery.id) if delivery else ""}
+    _pending_pkg_ctx[interaction.user.id] = {"channel_id": str(channel.id), "payment": payment or "", "link": link or "", "tag": tag or "", "delivery_id": str(delivery.id) if delivery else "", "designer_id": str(interaction.user.id)}
     _pending_form_answers.pop((interaction.user.id, PKG_FORM_KEY), None)
     _pending_form_files.pop((interaction.user.id, PKG_FORM_KEY), None)
     fields = _parse_form_fields(comps, limit=FORM_MAX_QUESTIONS)
@@ -5525,7 +5541,13 @@ def _pricing_lines_text(si, guild=None):
             if parts:  # only items this designer actually priced
                 lines.append(f"{item}, {' · '.join(parts)}")
         if lines:
-            blocks.append(f"<@{uid}>\n" + "\n".join(lines))
+            head = f"<@{uid}>"
+            # Their vouch rating next to their name, when the Vouches block allows it.
+            if guild and vouch_config.get("show_on_pricing"):
+                badge = _vouch_badge(guild.id, uid)
+                if badge:
+                    head += f"  {badge}"
+            blocks.append(head + "\n" + "\n".join(lines))
     return "\n\n".join(blocks) if blocks else "No pricing set yet."
 
 
@@ -6112,6 +6134,8 @@ async def on_interaction(interaction: discord.Interaction):
             await handle_robux_buy_submit(interaction)
         elif cid.startswith("pkgreview:"):
             await _pkg_review_submit(interaction, cid.split(":", 1)[1])
+        elif cid.startswith("vouchform:"):
+            await _vouch_submit(interaction, cid.split(":", 1)[1])
         elif cid.startswith("setprice_one:"):
             parts = cid.split(":")
             try:
@@ -6614,10 +6638,11 @@ def _collect_modal_values(components):
             continue
         inner = row.get("component")
         if isinstance(inner, dict) and inner.get("custom_id"):
-            vals[inner["custom_id"]] = inner.get("value", "") or ""
+            # A select inside a Label reports its picks under `values`.
+            vals[inner["custom_id"]] = inner.get("value") or ", ".join(str(v) for v in (inner.get("values") or [])) or ""
         for c in (row.get("components") or []):
             if isinstance(c, dict) and c.get("custom_id"):
-                vals[c["custom_id"]] = c.get("value", "") or ""
+                vals[c["custom_id"]] = c.get("value") or ", ".join(str(v) for v in (c.get("values") or [])) or ""
         if row.get("type") == 4 and row.get("custom_id"):
             vals[row["custom_id"]] = row.get("value", "") or ""
     return vals
@@ -7201,6 +7226,287 @@ async def feedback_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="reportbug", description="Report a bug")
 async def reportbug_cmd(interaction: discord.Interaction):
     await _pf_command(interaction, "customs-reportbug")
+
+
+# ===================== Vouches (designer ratings) =====================
+# /vouch <designer> opens a short form (star rating + review). Every vouch is
+# posted as a card in the vouch channel and remembered per designer, so
+# /vouches shows a designer's average and the pricing board can show it next
+# to their name. One vouch per reviewer per designer: vouching again replaces
+# the old one, so nobody can pump a rating by spamming.
+vouch_config = {"channel_id": "", "designer_role_ids": [], "show_on_pricing": True, "require_review": False}
+vouches = {}   # guild_id -> {designer_id: [{"by", "rating", "review", "product", "ts", "message_id"}]}
+_vouch_loaded = False
+
+
+async def _vouch_load():
+    global _vouch_loaded
+    ok, cfg = await _durable_config_get("vouch-data")
+    if not ok:
+        print("[Vouch] saved vouches load failed — saving disabled this session.")
+        return
+    g = (cfg or {}).get("guilds")
+    if isinstance(g, dict):
+        for gid, designers in g.items():
+            if isinstance(designers, dict):
+                vouches[str(gid)] = {
+                    str(d): [v for v in (lst or []) if isinstance(v, dict)]
+                    for d, lst in designers.items()
+                }
+    _vouch_loaded = True
+    total = sum(len(lst) for d in vouches.values() for lst in d.values())
+    print(f"[Vouch] loaded {total} vouch(es)")
+
+
+async def _vouch_save():
+    if not _vouch_loaded:
+        return
+    try:
+        await _bot_config_upsert("vouch-data", {"guilds": vouches})
+    except Exception as e:
+        print(f"[Vouch] save failed: {e}")
+
+
+def _vouch_list(guild_id, designer_id):
+    return (vouches.get(str(guild_id)) or {}).get(str(designer_id)) or []
+
+
+def _vouch_stats(guild_id, designer_id):
+    """(count, average) for a designer; (0, 0.0) with no vouches."""
+    ratings = []
+    for v in _vouch_list(guild_id, designer_id):
+        try:
+            r = int(v.get("rating") or 0)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= r <= 5:
+            ratings.append(r)
+    if not ratings:
+        return 0, 0.0
+    return len(ratings), sum(ratings) / len(ratings)
+
+
+def _vouch_stars(n):
+    try:
+        n = max(0, min(5, int(round(float(n or 0)))))
+    except (TypeError, ValueError):
+        n = 0
+    return "★" * n + "☆" * (5 - n)
+
+
+def _vouch_badge(guild_id, designer_id):
+    """'★ 4.8 · 12 vouches' for a designer, or '' if they have none yet."""
+    count, avg = _vouch_stats(guild_id, designer_id)
+    if not count:
+        return ""
+    return f"★ {avg:.1f} · {count} vouch{'es' if count != 1 else ''}"
+
+
+def _vouch_can_receive(member):
+    """Who can be vouched for: members with one of the configured designer
+    roles, or anyone at all when no roles are set."""
+    role_ids = vouch_config.get("designer_role_ids") or []
+    if not role_ids:
+        return True
+    return has_any_role(member, role_ids)
+
+
+class _VouchModal(discord.ui.Modal):
+    """Star rating (select) + written review. Submits are handled in
+    on_interaction by custom_id so they survive restarts."""
+    def __init__(self, designer_id, product="", pkg_msg_id=""):
+        super().__init__(title="Leave a Vouch", custom_id=f"vouchform:{designer_id}:{pkg_msg_id}", timeout=None)
+        rating = discord.ui.Select(custom_id="rating", min_values=1, max_values=1, options=[
+            discord.SelectOption(label="★★★★★  Amazing", value="5"),
+            discord.SelectOption(label="★★★★☆  Great", value="4"),
+            discord.SelectOption(label="★★★☆☆  Okay", value="3"),
+            discord.SelectOption(label="★★☆☆☆  Not great", value="2"),
+            discord.SelectOption(label="★☆☆☆☆  Bad", value="1"),
+        ])
+        self.add_item(discord.ui.Label(text="Rating", description="How was the experience?", component=rating))
+        self.add_item(discord.ui.Label(
+            text="Your review",
+            description="A sentence or two about what you got and how it went.",
+            component=discord.ui.TextInput(custom_id="review", style=discord.TextStyle.paragraph,
+                                           max_length=600, required=bool(vouch_config.get("require_review"))),
+        ))
+        self.add_item(discord.ui.Label(
+            text="What did you buy?",
+            description="Optional.",
+            component=discord.ui.TextInput(custom_id="product", style=discord.TextStyle.short,
+                                           max_length=80, required=False, default=(product or "")[:80]),
+        ))
+
+
+def _vouch_card(guild, designer, reviewer_id, entry, count, avg):
+    e = discord.Embed(
+        title=f"Vouch for {designer.display_name}",
+        description=f"{_vouch_stars(entry.get('rating'))}\n\n{entry.get('review') or '_No written review._'}",
+        color=0x2b2d31,
+        timestamp=discord.utils.utcnow(),
+    )
+    e.add_field(name="Designer", value=designer.mention, inline=True)
+    e.add_field(name="From", value=f"<@{reviewer_id}>", inline=True)
+    if entry.get("product"):
+        e.add_field(name="Bought", value=str(entry["product"])[:256], inline=True)
+    try:
+        e.set_thumbnail(url=designer.display_avatar.url)
+    except Exception:
+        pass
+    e.set_footer(text=f"Vouch {count} · average {avg:.1f} / 5")
+    return e
+
+
+async def _vouch_submit(interaction, payload):
+    designer_id, _, pkg_msg_id = str(payload).partition(":")
+    vals = _collect_modal_values((interaction.data or {}).get("components"))
+    try:
+        rating = int(str(vals.get("rating", "")).strip()[:1])
+    except (TypeError, ValueError):
+        rating = 0
+    review = str(vals.get("review", "")).strip()
+    product = str(vals.get("product", "")).strip()
+    if not 1 <= rating <= 5:
+        return await interaction.response.send_message(
+            embed=error_embed("Pick a rating", "Choose 1 to 5 stars and submit again."), ephemeral=True)
+    if vouch_config.get("require_review") and not review:
+        return await interaction.response.send_message(
+            embed=error_embed("Write a review", "A short written review is required here."), ephemeral=True)
+
+    # A receipt vouch comes from a DM: find the server through the package record.
+    guild = interaction.guild
+    if guild is None and pkg_msg_id:
+        try:
+            rec = await _pkg_files_get(pkg_msg_id)
+            if (rec or {}).get("guild_id"):
+                guild = bot.get_guild(int(rec["guild_id"]))
+        except Exception:
+            guild = None
+    designer = guild.get_member(int(designer_id)) if (guild and designer_id.isdigit()) else None
+    if not designer:
+        return await interaction.response.send_message(
+            embed=error_embed("Can't vouch", "That designer isn't in the server anymore."), ephemeral=True)
+    if designer.id == interaction.user.id:
+        return await interaction.response.send_message(
+            embed=error_embed("Nice try", "You can't vouch for yourself."), ephemeral=True)
+
+    uid = str(interaction.user.id)
+    lst = vouches.setdefault(str(guild.id), {}).setdefault(str(designer.id), [])
+    old = next((v for v in lst if str(v.get("by")) == uid), None)
+    ch = await resolve_channel(vouch_config.get("channel_id"))
+    if old:
+        lst.remove(old)
+        # Replace the old card so the channel only ever shows the current opinion.
+        if ch and old.get("message_id"):
+            try:
+                m = await ch.fetch_message(int(old["message_id"]))
+                await m.delete()
+            except Exception:
+                pass
+    entry = {"by": uid, "rating": rating, "review": review[:600], "product": product[:80],
+             "ts": int(discord.utils.utcnow().timestamp()), "message_id": ""}
+    lst.append(entry)
+    count, avg = _vouch_stats(guild.id, designer.id)
+    if ch:
+        try:
+            m = await ch.send(embed=_vouch_card(guild, designer, uid, entry, count, avg),
+                              allowed_mentions=discord.AllowedMentions.none())
+            entry["message_id"] = str(m.id)
+        except Exception as e:
+            print(f"[Vouch] post failed: {e}")
+    await _vouch_save()
+    try:
+        await interaction.response.send_message(
+            embed=success_embed("Vouch updated" if old else "Thanks for the vouch!",
+                                f"{designer.mention} is now at **{avg:.1f} / 5** from {count} vouch{'es' if count != 1 else ''}."),
+            ephemeral=True)
+    except Exception:
+        pass
+
+
+@bot.tree.command(name="vouch", description="Rate a designer you bought from")
+@app_commands.describe(designer="The designer you're vouching for")
+async def vouch_cmd(interaction: discord.Interaction, designer: discord.Member):
+    if not vouch_config.get("channel_id"):
+        return await interaction.response.send_message(
+            embed=error_embed("Not set up", "Vouches aren't set up yet — an admin needs to pick a vouch channel in the dashboard."), ephemeral=True)
+    if designer.bot:
+        return await interaction.response.send_message(embed=error_embed("Can't vouch", "Bots don't take vouches."), ephemeral=True)
+    if designer.id == interaction.user.id:
+        return await interaction.response.send_message(embed=error_embed("Nice try", "You can't vouch for yourself."), ephemeral=True)
+    if not _vouch_can_receive(designer):
+        return await interaction.response.send_message(
+            embed=error_embed("Not a designer", f"{designer.mention} doesn't have a designer role here."), ephemeral=True)
+    await interaction.response.send_modal(_VouchModal(designer.id))
+
+
+@bot.tree.command(name="vouches", description="See a designer's rating and recent vouches")
+@app_commands.describe(designer="Whose vouches to show (leave blank for yourself)")
+async def vouches_cmd(interaction: discord.Interaction, designer: discord.Member = None):
+    designer = designer or interaction.user
+    guild = interaction.guild
+    lst = _vouch_list(guild.id, designer.id) if guild else []
+    if not lst:
+        return await interaction.response.send_message(
+            embed=info_embed("No vouches yet", f"{designer.mention} hasn't been vouched for yet."),
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    count, avg = _vouch_stats(guild.id, designer.id)
+    e = discord.Embed(title=f"{designer.display_name}'s vouches", color=0x2b2d31)
+    e.description = f"{_vouch_stars(avg)}  **{avg:.1f} / 5**  from {count} vouch{'es' if count != 1 else ''}"
+    # Star breakdown, five down to one.
+    tally = {n: 0 for n in range(1, 6)}
+    for v in lst:
+        try:
+            r = int(v.get("rating") or 0)
+        except (TypeError, ValueError):
+            continue
+        if r in tally:
+            tally[r] += 1
+    e.add_field(name="Breakdown",
+                value="\n".join(f"{_vouch_stars(n)}  {tally[n]}" for n in range(5, 0, -1)), inline=False)
+    recent = sorted(lst, key=lambda v: int(v.get("ts") or 0), reverse=True)[:5]
+    lines = []
+    for v in recent:
+        text = (v.get("review") or "").replace("\n", " ").strip()
+        if len(text) > 140:
+            text = text[:137] + "…"
+        bought = f" · {v['product']}" if v.get("product") else ""
+        lines.append(f"{_vouch_stars(v.get('rating'))} <@{v.get('by')}>{bought}" + (f"\n{text}" if text else ""))
+    e.add_field(name="Recent", value="\n\n".join(lines)[:1024], inline=False)
+    try:
+        e.set_thumbnail(url=designer.display_avatar.url)
+    except Exception:
+        pass
+    await interaction.response.send_message(embed=e, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="vouchremove", description="Remove a vouch (your own, or any as staff)")
+@app_commands.describe(designer="The designer the vouch is for", reviewer="Who left it (staff only — defaults to you)")
+async def vouchremove_cmd(interaction: discord.Interaction, designer: discord.Member, reviewer: discord.Member = None):
+    target = reviewer or interaction.user
+    if target.id != interaction.user.id and not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message(
+            embed=error_embed("Staff only", "You can only remove your own vouch."), ephemeral=True)
+    guild = interaction.guild
+    lst = _vouch_list(guild.id, designer.id) if guild else []
+    old = next((v for v in lst if str(v.get("by")) == str(target.id)), None)
+    if not old:
+        return await interaction.response.send_message(
+            embed=error_embed("Nothing to remove", f"{target.mention} hasn't vouched for {designer.mention}."),
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    lst.remove(old)
+    if old.get("message_id"):
+        ch = await resolve_channel(vouch_config.get("channel_id"))
+        if ch:
+            try:
+                m = await ch.fetch_message(int(old["message_id"]))
+                await m.delete()
+            except Exception:
+                pass
+    await _vouch_save()
+    await interaction.response.send_message(
+        embed=success_embed("Vouch removed", f"Removed {target.mention}'s vouch for {designer.mention}."),
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 # ===================== Free Release (reaction-goal file drop) =====================
@@ -10514,6 +10820,15 @@ async def apply_config(feature, cfg, post_panel=False):
         _register_eph_from_tree(design)
         print(f"[Config] {feature} — channel {channel_id or '(none)'}, "
               f"{len(_pf_inputs(design))} form field(s)")
+    elif feature == "customs-vouches":
+        vouch_config["channel_id"] = str(cfg.get("channel_id") or "")
+        roles = cfg.get("designer_role_ids")
+        vouch_config["designer_role_ids"] = [str(r) for r in roles if r] if isinstance(roles, list) else []
+        vouch_config["show_on_pricing"] = bool(cfg.get("show_on_pricing", True))
+        vouch_config["require_review"] = bool(cfg.get("require_review", False))
+        print(f"[Config] customs-vouches — channel {vouch_config['channel_id'] or '(none)'} "
+              f"| designer roles {len(vouch_config['designer_role_ids'])} "
+              f"| on pricing {vouch_config['show_on_pricing']}")
     elif feature in ("customs-freerelease",):
         raw = cfg.get("messages")
         design = []
@@ -10802,6 +11117,10 @@ async def apply_config(feature, cfg, post_panel=False):
 
     elif feature in ("roblox-group-sync", "customs-roblox-group-sync"):
         group_sync_config["group_id"] = str(cfg.get("group_id") or "").strip()
+        if not group_sync_config["group_id"]:
+            # Nothing typed in the block — use the Roblox group ID saved under
+            # API keys & credentials, so the group only has to be entered once.
+            group_sync_config["group_id"] = await _bot_secret("ROBLOX_GROUP_ID")
         group_sync_config["tiers"] = _parse_group_sync_tiers(cfg)
         try:
             dr = cfg.get("demote_rank")
@@ -11567,6 +11886,17 @@ async def _pkg_review(interaction, pkg_msg_id):
     """Leave a Review button on a receipt — open the /feedback form, with the
     Designer field hardcoded to the package they bought (so the buyer only rates
     and writes feedback; they don't pick a member)."""
+    # With the Vouches block set up, a receipt review IS a vouch for whoever
+    # posted the package — rating + review, counted toward their average.
+    try:
+        rec = await _pkg_files_get(pkg_msg_id)
+    except Exception:
+        rec = {}
+    designer_id = str((rec or {}).get("designer_id") or "")
+    if vouch_config.get("channel_id") and designer_id.isdigit() and designer_id != str(interaction.user.id):
+        return await interaction.response.send_modal(
+            _VouchModal(designer_id, product=str((rec or {}).get("product") or ""), pkg_msg_id=str(pkg_msg_id)))
+
     feature = "customs-feedback"
     cfg = _pf_config_for(feature)
     # /feedback config is normally applied at boot; refresh on demand if not.
@@ -13415,6 +13745,18 @@ async def seed_secret_slots():
         "placeholder": "e.g. 10357040169, 128739314806275  (one or more, comma-separated)",
         "required": False,
         "sort_order": 2,
+    }, {
+        "addon_id": "customs",
+        "key": "ROBLOX_GROUP_ID",
+        "label": "Roblox group ID",
+        "description": ("The Roblox group your bot account runs for. Used for group funds and "
+                        "the Robux Locker, sales tracking, and Roblox Group Sync when no group "
+                        "is typed into that block. Find it in the group's URL: "
+                        "roblox.com/groups/<ID>/… — just the number. Leave blank and the bot "
+                        "uses the group its Roblox account owns."),
+        "placeholder": "e.g. 691798472",
+        "required": False,
+        "sort_order": 3,
     }]
     res = await runtime_rpc("runtime_seed_secret_slots", {"_token": WORKER_TOKEN, "_slots": slots})
     print(f"[Startup] secret slots seeded: {bool(res)}")
@@ -13425,7 +13767,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-feedback", "customs-reportbug", "customs-freerelease", "customs-blacklist", "customs-announce", "customs-smallui", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-feedback", "customs-reportbug", "customs-freerelease", "customs-blacklist", "customs-announce", "customs-smallui", "customs-vouches", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
