@@ -1517,8 +1517,18 @@ async def on_ready():
         await _vouch_load()
     except Exception as e:
         print(f"[Vouch] load failed: {e}")
+    try:
+        await _sales_load()
+    except Exception as e:
+        print(f"[Sales] load failed: {e}")
     if not ticket_inactivity_tick.is_running():
         ticket_inactivity_tick.start()
+    if not ticket_staff_reply_tick.is_running():
+        ticket_staff_reply_tick.start()
+    if not ticket_queue_tick.is_running():
+        ticket_queue_tick.start()
+    if not sales_monthly_tick.is_running():
+        sales_monthly_tick.start()
     if not econ_autosave.is_running():
         econ_autosave.start()
     await refresh_status()
@@ -7509,6 +7519,253 @@ async def vouchremove_cmd(interaction: discord.Interaction, designer: discord.Me
         ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
+# ===================== Sales stats (per designer) =====================
+# Every completed sale is remembered as one event: a package purchase (from the
+# receipt flow, attributed to whoever posted the package) or a claimed order
+# ticket being closed (attributed to the claimer). /sales sums them per designer
+# for the week / month / all time, and on the 1st of each month the bot posts a
+# recap with the top designer to the Sales Stats channel.
+sales_config = {"channel_id": "", "staff_role_ids": [], "monthly_post": True}
+sales_data = {"events": [], "last_monthly": ""}
+_sales_loaded = False
+SALES_KEEP_DAYS = 400
+_MONEY_ROBUX_RE = re.compile(r"(?:R\$\s*([\d,]+))|(?:([\d,]+)\s*(?:R\$|robux))", re.IGNORECASE)
+_MONEY_USD_RE = re.compile(r"\$\s*([\d,]*\.?\d+)")
+
+
+def _parse_money(text):
+    """(robux:int, usd:float) found in a price string like 'R$ 500 · $5.00'."""
+    s = str(text or "")
+    robux, usd = 0, 0.0
+    m = _MONEY_ROBUX_RE.search(s)
+    if m:
+        try:
+            robux = int((m.group(1) or m.group(2) or "0").replace(",", ""))
+        except ValueError:
+            robux = 0
+    # '$5.00' but not the '$' inside 'R$ 500'.
+    for m2 in _MONEY_USD_RE.finditer(s):
+        start = m2.start()
+        if start > 0 and s[start - 1] in "Rr":
+            continue
+        try:
+            usd = float(m2.group(1).replace(",", ""))
+        except ValueError:
+            usd = 0.0
+        break
+    return robux, usd
+
+
+async def _sales_load():
+    global _sales_loaded
+    ok, cfg = await _durable_config_get("sales-data")
+    if not ok:
+        print("[Sales] load failed — recording disabled this session.")
+        return
+    ev = (cfg or {}).get("events")
+    if isinstance(ev, list):
+        sales_data["events"] = [e for e in ev if isinstance(e, dict)]
+    sales_data["last_monthly"] = str((cfg or {}).get("last_monthly") or "")
+    _sales_loaded = True
+    print(f"[Sales] loaded {len(sales_data['events'])} sale event(s)")
+
+
+async def _sales_save():
+    if not _sales_loaded:
+        return
+    cutoff = time.time() - SALES_KEEP_DAYS * 86400
+    sales_data["events"] = [e for e in sales_data["events"] if float(e.get("ts") or 0) >= cutoff][-5000:]
+    try:
+        await _bot_config_upsert("sales-data", sales_data)
+    except Exception as e:
+        print(f"[Sales] save failed: {e}")
+
+
+async def _sales_record(guild_id, designer_id, kind, product="", robux=0, usd=0.0, buyer_id=""):
+    if not _sales_loaded:
+        return
+    sales_data["events"].append({
+        "ts": int(time.time()), "guild_id": str(guild_id or ""), "designer_id": str(designer_id or ""),
+        "kind": kind, "product": str(product or "")[:80], "robux": int(robux or 0),
+        "usd": round(float(usd or 0), 2), "buyer_id": str(buyer_id or ""),
+    })
+    await _sales_save()
+
+
+def _sales_summary(guild_id, since_ts):
+    """{designer_id: {orders, packages, robux, usd}} for one server since a time."""
+    out = {}
+    for e in sales_data["events"]:
+        if str(e.get("guild_id")) != str(guild_id) or float(e.get("ts") or 0) < since_ts:
+            continue
+        d = out.setdefault(str(e.get("designer_id") or ""), {"orders": 0, "packages": 0, "robux": 0, "usd": 0.0})
+        if e.get("kind") == "order":
+            d["orders"] += 1
+        else:
+            d["packages"] += 1
+        d["robux"] += int(e.get("robux") or 0)
+        d["usd"] += float(e.get("usd") or 0)
+    return out
+
+
+def _sales_rank_key(d):
+    # Revenue first (Robux counted at 0.0035 USD each, roughly DevEx), then volume.
+    return (d["usd"] + d["robux"] * 0.0035, d["orders"] + d["packages"])
+
+
+def _sales_lines(summary, guild):
+    rows = sorted(summary.items(), key=lambda kv: _sales_rank_key(kv[1]), reverse=True)
+    lines = []
+    for did, d in rows[:15]:
+        who = f"<@{did}>" if did.isdigit() else "Unattributed"
+        bits = []
+        if d["orders"]:
+            bits.append(f"{d['orders']} order{'s' if d['orders'] != 1 else ''}")
+        if d["packages"]:
+            bits.append(f"{d['packages']} package{'s' if d['packages'] != 1 else ''}")
+        if d["robux"]:
+            bits.append(f"R$ {d['robux']:,}")
+        if d["usd"]:
+            bits.append(f"${d['usd']:,.2f}")
+        lines.append(f"{who}, " + " · ".join(bits))
+    return lines
+
+
+def _sales_totals(summary):
+    t = {"orders": 0, "packages": 0, "robux": 0, "usd": 0.0}
+    for d in summary.values():
+        for k in t:
+            t[k] += d[k]
+    return t
+
+
+def _sales_can_view(member):
+    try:
+        if member.guild_permissions.manage_guild:
+            return True
+    except Exception:
+        pass
+    return has_any_role(member, sales_config.get("staff_role_ids") or [])
+
+
+def _sales_embed(guild, title, since_ts, footer=""):
+    summary = _sales_summary(guild.id, since_ts)
+    e = discord.Embed(title=title, color=0x2b2d31, timestamp=discord.utils.utcnow())
+    if not summary:
+        e.description = "No sales recorded in this window."
+        return e, None
+    lines = _sales_lines(summary, guild)
+    t = _sales_totals(summary)
+    tot = []
+    if t["orders"]:
+        tot.append(f"{t['orders']} order{'s' if t['orders'] != 1 else ''}")
+    if t["packages"]:
+        tot.append(f"{t['packages']} package{'s' if t['packages'] != 1 else ''}")
+    if t["robux"]:
+        tot.append(f"R$ {t['robux']:,}")
+    if t["usd"]:
+        tot.append(f"${t['usd']:,.2f}")
+    top_id = max(summary.items(), key=lambda kv: _sales_rank_key(kv[1]))[0]
+    e.description = "\n".join(lines)[:3900]
+    e.add_field(name="Total", value=" · ".join(tot) or "0", inline=False)
+    if top_id.isdigit():
+        e.add_field(name="Top designer", value=f"<@{top_id}>", inline=False)
+    if footer:
+        e.set_footer(text=footer)
+    return e, (top_id if top_id.isdigit() else None)
+
+
+@bot.tree.command(name="sales", description="Sales per designer: orders, packages and revenue (staff)")
+@app_commands.describe(period="How far back to count", designer="Only this designer (optional)", public="Post it in the channel instead of just to you")
+@app_commands.choices(period=[
+    app_commands.Choice(name="This week", value="week"),
+    app_commands.Choice(name="This month", value="month"),
+    app_commands.Choice(name="Last 30 days", value="30d"),
+    app_commands.Choice(name="All time", value="all"),
+])
+async def sales_cmd(interaction: discord.Interaction, period: app_commands.Choice[str] = None,
+                    designer: discord.Member = None, public: bool = False):
+    if not _sales_can_view(interaction.user):
+        return await interaction.response.send_message(
+            embed=error_embed("Staff only", "You need Manage Server or a Sales Stats role to view this."), ephemeral=True)
+    p = period.value if period else "month"
+    now = discord.utils.utcnow()
+    if p == "week":
+        start = now - datetime.timedelta(days=now.weekday())
+        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        label = "This week"
+    elif p == "30d":
+        start = now - datetime.timedelta(days=30)
+        label = "Last 30 days"
+    elif p == "all":
+        start = datetime.datetime(2000, 1, 1, tzinfo=datetime.timezone.utc)
+        label = "All time"
+    else:
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        label = now.strftime("%B %Y")
+    since = start.timestamp()
+    if designer:
+        summary = _sales_summary(interaction.guild.id, since)
+        d = summary.get(str(designer.id))
+        e = discord.Embed(title=f"{designer.display_name}'s sales · {label}", color=0x2b2d31)
+        if not d:
+            e.description = "No sales recorded in this window."
+        else:
+            e.description = "\n".join(_sales_lines({str(designer.id): d}, interaction.guild))
+        try:
+            e.set_thumbnail(url=designer.display_avatar.url)
+        except Exception:
+            pass
+        return await interaction.response.send_message(embed=e, ephemeral=not public,
+                                                       allowed_mentions=discord.AllowedMentions.none())
+    e, _top = _sales_embed(interaction.guild, f"Sales · {label}", since)
+    await interaction.response.send_message(embed=e, ephemeral=not public,
+                                            allowed_mentions=discord.AllowedMentions.none())
+
+
+@tasks.loop(minutes=30)
+async def sales_monthly_tick():
+    """On the 1st of the month (from 9am Central) post last month's recap with
+    the top designer to the Sales Stats channel. Once per month, remembered."""
+    if not (_sales_loaded and sales_config.get("monthly_post") and sales_config.get("channel_id")):
+        return
+    now = discord.utils.utcnow()
+    # 9am Central = 14:00 UTC (CDT) / 15:00 UTC (CST); 15:00 UTC is safe for both.
+    if now.day != 1 or now.hour < 15:
+        return
+    stamp = now.strftime("%Y-%m")
+    if sales_data.get("last_monthly") == stamp:
+        return
+    ch = await resolve_channel(sales_config.get("channel_id"))
+    if not ch:
+        return
+    this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_month_start = (this_month - datetime.timedelta(days=1)).replace(day=1)
+    guild = getattr(ch, "guild", None)
+    if not guild:
+        return
+    # Only last month's events.
+    events_backup = sales_data["events"]
+    sales_data["events"] = [e for e in events_backup if float(e.get("ts") or 0) < this_month.timestamp()]
+    try:
+        e, top = _sales_embed(guild, f"Monthly recap · {last_month_start.strftime('%B %Y')}",
+                              last_month_start.timestamp(), footer="Posted automatically on the 1st")
+    finally:
+        sales_data["events"] = events_backup
+    try:
+        content = f"Top designer for {last_month_start.strftime('%B')}: <@{top}>" if top else None
+        await ch.send(content=content, embed=e, allowed_mentions=discord.AllowedMentions(users=True))
+        sales_data["last_monthly"] = stamp
+        await _sales_save()
+    except Exception as ex:
+        print(f"[Sales] monthly post failed: {ex}")
+
+
+@sales_monthly_tick.before_loop
+async def _sales_monthly_before():
+    await bot.wait_until_ready()
+
+
 # ===================== Free Release (reaction-goal file drop) =====================
 # `/freerelease` -> a form to attach the release file -> posts the designed
 # announcement with a hardcoded Enter button + a live "X/goal" counter. When the
@@ -8166,6 +8423,18 @@ _ticket_warned = {}
 # Tickets exempted from the inactivity warn/close (-inactive hold). Persisted.
 _ticket_ac_hold = set()
 _ticket_ac_loaded = False
+# Staff-side reminders on CLAIMED tickets: channel_id -> {"stage": 0|1|2,
+# "since": unix ts of the customer's oldest unanswered message}. Stage 1 pings
+# the claimer after 12h with no staff reply; stage 2 pings the ticket's staff
+# roles plus the claimer at 24h. Cleared as soon as staff reply. Persisted.
+_ticket_staff_nudge = {}
+STAFF_NUDGE_HOURS = 12
+STAFF_ESCALATE_HOURS = 24
+# Queue position updates: channel_id -> last position we told the customer
+# (1 = next up). Only unclaimed order tickets are "in line". Persisted so a
+# redeploy doesn't re-announce positions it already reported.
+_ticket_queue_pos = {}
+_ticket_queue_last_notice = {}  # channel_id -> unix ts of the last update we posted
 
 
 async def _load_ticket_autoclose():
@@ -8187,8 +8456,21 @@ async def _load_ticket_autoclose():
     held = cfg.get("held") if isinstance(cfg, dict) else None
     if isinstance(held, list):
         _ticket_ac_hold.update(str(x) for x in held)
+    nudged = cfg.get("staff_nudge") if isinstance(cfg, dict) else None
+    if isinstance(nudged, dict):
+        for k, v in nudged.items():
+            if isinstance(v, dict):
+                _ticket_staff_nudge[str(k)] = {"stage": int(v.get("stage") or 0), "since": float(v.get("since") or 0)}
+    qpos = cfg.get("queue_pos") if isinstance(cfg, dict) else None
+    if isinstance(qpos, dict):
+        for k, v in qpos.items():
+            try:
+                _ticket_queue_pos[str(k)] = int(v)
+            except Exception:
+                pass
     _ticket_ac_loaded = True
-    print(f"[Ticket] autoclose state loaded — {len(_ticket_warned)} warned, {len(_ticket_ac_hold)} held ticket(s)")
+    print(f"[Ticket] autoclose state loaded — {len(_ticket_warned)} warned, {len(_ticket_ac_hold)} held, "
+          f"{len(_ticket_staff_nudge)} nudged, {len(_ticket_queue_pos)} queued ticket(s)")
 
 
 async def _save_ticket_autoclose():
@@ -8196,7 +8478,8 @@ async def _save_ticket_autoclose():
         return
     try:
         await _bot_config_upsert("ticket-autoclose-state",
-                                 {"warned": _ticket_warned, "held": sorted(_ticket_ac_hold)})
+                                 {"warned": _ticket_warned, "held": sorted(_ticket_ac_hold),
+                                  "staff_nudge": _ticket_staff_nudge, "queue_pos": _ticket_queue_pos})
     except Exception as e:
         print(f"[Ticket] autoclose state save failed: {e}")
 
@@ -8367,6 +8650,233 @@ async def ticket_inactivity_tick():
 
 @ticket_inactivity_tick.before_loop
 async def _ticket_inactivity_before():
+    await bot.wait_until_ready()
+
+
+def _ticket_topic_info(ch):
+    """Parse a ticket channel's topic: ticket|opener|cat|base|claim_ts|claimer."""
+    parts = (getattr(ch, "topic", "") or "").split("|")
+    if not parts or parts[0] != "ticket":
+        return None
+    claim_ts = parts[4].strip() if len(parts) > 4 else ""
+    claimer = parts[5].strip() if len(parts) > 5 else ""
+    return {
+        "opener_id": parts[1] if len(parts) > 1 else "",
+        "cat": parts[2] if len(parts) > 2 else "",
+        "claimed": claim_ts.isdigit(),
+        "claim_ts": int(claim_ts) if claim_ts.isdigit() else 0,
+        "claimer_id": claimer if claimer.isdigit() else "",
+    }
+
+
+async def _ticket_waiting_since(ch, opener_id):
+    """If the customer is waiting on staff: the unix ts of their OLDEST message
+    since the last staff reply. None when a staff member spoke last (or history
+    can't be read). The bot's own messages never count either way."""
+    try:
+        me_id = getattr(bot.user, "id", None)
+        oldest = None
+        async for msg in ch.history(limit=50):
+            a = msg.author
+            if me_id is not None and getattr(a, "id", None) == me_id:
+                continue
+            is_customer = str(getattr(a, "id", "")) == str(opener_id)
+            if not is_customer and isinstance(a, discord.Member) and _is_ticket_staff(a, ch):
+                break  # staff replied — the customer isn't waiting past this point
+            if is_customer:
+                oldest = msg.created_at.timestamp()
+        return oldest
+    except Exception:
+        return None
+
+
+async def _staff_nudge_msg(ch, stage, claimer, roles):
+    hours = STAFF_ESCALATE_HOURS if stage >= 2 else STAFF_NUDGE_HOURS
+    who = ""
+    allowed = {"parse": ["users"]}
+    if stage >= 2 and roles:
+        who = " ".join(r.mention for r in roles) + " "
+        allowed = {"parse": ["users"], "roles": [str(r.id) for r in roles]}
+    if claimer:
+        who += f"{claimer.mention} "
+    design = _small_ui("ticket_staff_reminder")
+    if design:
+        await send_v2_message(ch, _ui_render(design, {
+            "user": claimer.mention if claimer else "", "hours": hours,
+            "roles": " ".join(r.mention for r in roles) if (stage >= 2 and roles) else "",
+        }), allowed_mentions=allowed)
+        return
+    text = (f"{who}**Waiting on staff**\nThe customer has been waiting **{hours} hours** for a reply on this order."
+            if stage < 2 else
+            f"{who}**Still waiting on staff**\nNo staff reply on this order for **{hours} hours**. "
+            + (f"{claimer.mention} claimed it." if claimer else "It's claimed but nobody has answered."))
+    await send_v2_message(ch, [{"type": "container", "children": [{"type": "text", "text": text}]}],
+                          allowed_mentions=allowed)
+
+
+@tasks.loop(minutes=30)
+async def ticket_staff_reply_tick():
+    """Nudge the claimer when a claimed ticket's customer has waited 12h with no
+    staff reply; at 24h ping the ticket's staff roles too (with the claimer's @)."""
+    if not _ticket_ac_loaded:
+        return
+    now = time.time()
+    dirty = False
+    live = set()
+    for guild in list(bot.guilds):
+        for ch in list(getattr(guild, "text_channels", [])):
+            info = _ticket_topic_info(ch)
+            if not info:
+                continue
+            wid = str(ch.id)
+            live.add(wid)
+            if not info["claimed"] or wid in _ticket_ac_hold:
+                if wid in _ticket_staff_nudge:
+                    _ticket_staff_nudge.pop(wid, None)
+                    dirty = True
+                continue
+            since = await _ticket_waiting_since(ch, info["opener_id"])
+            state = _ticket_staff_nudge.get(wid)
+            if since is None:
+                if state:
+                    _ticket_staff_nudge.pop(wid, None)  # staff replied
+                    dirty = True
+                continue
+            if state and abs(state.get("since", 0) - since) > 2:
+                state = None  # a new unanswered run started — restart the clock
+            stage = int(state.get("stage") or 0) if state else 0
+            waited = now - since
+            want = 2 if waited >= STAFF_ESCALATE_HOURS * 3600 else (1 if waited >= STAFF_NUDGE_HOURS * 3600 else 0)
+            if want <= stage:
+                if state is None and wid in _ticket_staff_nudge:
+                    _ticket_staff_nudge.pop(wid, None)
+                    dirty = True
+                continue
+            claimer = guild.get_member(int(info["claimer_id"])) if info["claimer_id"] else None
+            roles = _ticket_reping_roles(ch) if want >= 2 else []
+            if want == 1 and claimer is None:
+                continue  # old-format claim with no claimer id: only the 24h staff ping applies
+            try:
+                await _staff_nudge_msg(ch, want, claimer, roles)
+            except Exception as e:
+                print(f"[Ticket] staff reminder failed: {e}")
+            _ticket_staff_nudge[wid] = {"stage": want, "since": since}
+            dirty = True
+    for gone in [w for w in _ticket_staff_nudge if w not in live]:
+        _ticket_staff_nudge.pop(gone, None)
+        dirty = True
+    if dirty:
+        await _save_ticket_autoclose()
+
+
+@ticket_staff_reply_tick.before_loop
+async def _ticket_staff_reply_before():
+    await bot.wait_until_ready()
+
+
+def _ordinal(n):
+    n = int(n)
+    if 10 <= n % 100 <= 20:
+        suf = "th"
+    else:
+        suf = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suf}"
+
+
+def _order_category_names():
+    """Lower-cased Discord category names that hold ORDER tickets (from the
+    Order Status block's services). Empty = treat every ticket category as a queue."""
+    out = set()
+    for svc in (order_status_config.get("services") or []):
+        cat = (svc.get("category") or svc.get("name") or "").strip().lower()
+        if cat:
+            out.add(cat)
+    return out
+
+
+async def _queue_update_msg(ch, opener, pos, prev):
+    up = pos < prev
+    mapping = {"user": opener.mention if opener else "", "position": _ordinal(pos),
+               "previous": _ordinal(prev), "direction": "up" if up else "back"}
+    design = _small_ui("ticket_queue_update")
+    if design:
+        await send_v2_message(ch, _ui_render(design, mapping), allowed_mentions={"parse": ["users"]})
+        return
+    ping = f"{opener.mention} " if opener else ""
+    if pos == 1:
+        line = f"{ping}**Queue update**\nYou're **next in line** now (up from {_ordinal(prev)})."
+    elif up:
+        line = f"{ping}**Queue update**\nYou moved up to **{_ordinal(pos)} in line** (from {_ordinal(prev)})."
+    else:
+        line = f"{ping}**Queue update**\nYou were moved back to **{_ordinal(pos)} in line** (from {_ordinal(prev)})."
+    await send_v2_message(ch, [{"type": "container", "children": [{"type": "text", "text": line}]}],
+                          allowed_mentions={"parse": ["users"]})
+
+
+QUEUE_NOTICE_COOLDOWN = 600  # seconds between position updates in one ticket
+
+
+@tasks.loop(minutes=2)
+async def ticket_queue_tick():
+    """Tell customers when their unclaimed order moves in the line. Position =
+    order of the unclaimed tickets in the same category (top of the category is
+    next). Claimed tickets are being worked and aren't in line."""
+    if not _ticket_ac_loaded:
+        return
+    now = time.time()
+    order_cats = _order_category_names()
+    dirty = False
+    live = set()
+    for guild in list(bot.guilds):
+        lanes = {}  # category id -> [channel]
+        for ch in list(getattr(guild, "text_channels", [])):
+            info = _ticket_topic_info(ch)
+            if not info:
+                continue
+            cat_name = ch.category.name.strip().lower() if ch.category else ""
+            if order_cats and cat_name not in order_cats:
+                continue
+            wid = str(ch.id)
+            if info["claimed"]:
+                if wid in _ticket_queue_pos:
+                    _ticket_queue_pos.pop(wid, None)  # picked up — no longer in line
+                    dirty = True
+                continue
+            live.add(wid)
+            lanes.setdefault(ch.category_id or 0, []).append(ch)
+        for chans in lanes.values():
+            chans.sort(key=lambda c: (int(getattr(c, "position", 0) or 0), c.id))
+            for idx, ch in enumerate(chans):
+                pos = idx + 1
+                wid = str(ch.id)
+                prev = _ticket_queue_pos.get(wid)
+                if prev is None:
+                    _ticket_queue_pos[wid] = pos  # first sighting — remember quietly
+                    dirty = True
+                    continue
+                if prev == pos:
+                    continue
+                if now - _ticket_queue_last_notice.get(wid, 0) < QUEUE_NOTICE_COOLDOWN:
+                    continue  # let the shuffle settle; report the net move next tick
+                info = _ticket_topic_info(ch) or {}
+                oid = info.get("opener_id") or ""
+                opener = guild.get_member(int(oid)) if oid.isdigit() else None
+                try:
+                    await _queue_update_msg(ch, opener, pos, prev)
+                except Exception as e:
+                    print(f"[Ticket] queue update failed: {e}")
+                _ticket_queue_last_notice[wid] = now
+                _ticket_queue_pos[wid] = pos
+                dirty = True
+    for gone in [w for w in _ticket_queue_pos if w not in live]:
+        _ticket_queue_pos.pop(gone, None)
+        dirty = True
+    if dirty:
+        await _save_ticket_autoclose()
+
+
+@ticket_queue_tick.before_loop
+async def _ticket_queue_before():
     await bot.wait_until_ready()
 
 
@@ -8730,6 +9240,16 @@ async def _do_close(channel, guild, closer, reason=""):
             except Exception as e:
                 print(f"[Ticket] log failed: {e}")
     await record_ticket(guild.id, channel.id, opener_id, category, "closed")
+    # A claimed order closed by a person counts as a completed order for the
+    # claimer (Sales Stats). Auto-closes for inactivity don't count.
+    try:
+        info = _ticket_topic_info(channel) or {}
+        if info.get("claimer_id") and not str(reason or "").lower().startswith("auto-closed"):
+            await _sales_record(guild.id, info["claimer_id"], "order",
+                                product=channel.category.name if channel.category else category,
+                                buyer_id=opener_id)
+    except Exception as e:
+        print(f"[Sales] record order failed: {e}")
     await asyncio.sleep(2)
     try:
         await channel.delete(reason=f"Ticket closed by {closer}")
@@ -8940,7 +9460,8 @@ async def _do_claim_toggle(channel, member, claimed, msg):
             # Stamp the claim time in the topic (slot 5) so a later unclaim \u2014 even
             # after a redeploy \u2014 can tell a quick claim/unclaim from a real hold.
             new_name = f"\U0001F7E2\u30FB{_san_name(member.name)}"[:90]
-            new_topic = f"ticket|{opener_id}|{cat}|{base}|{int(time.time())}"
+            # Slot 6 = who claimed it, so the staff-reply reminders can @ them.
+            new_topic = f"ticket|{opener_id}|{cat}|{base}|{int(time.time())}|{member.id}"
             await channel.edit(name=new_name, topic=new_topic, reason=f"Ticket claimed by {member}")
             try:
                 await channel.move(beginning=True, category=channel.category, sync_permissions=False, reason="Claimed ticket to top")
@@ -10820,6 +11341,13 @@ async def apply_config(feature, cfg, post_panel=False):
         _register_eph_from_tree(design)
         print(f"[Config] {feature} — channel {channel_id or '(none)'}, "
               f"{len(_pf_inputs(design))} form field(s)")
+    elif feature == "customs-sales":
+        sales_config["channel_id"] = str(cfg.get("channel_id") or "")
+        roles = cfg.get("staff_role_ids")
+        sales_config["staff_role_ids"] = [str(r) for r in roles if r] if isinstance(roles, list) else []
+        sales_config["monthly_post"] = bool(cfg.get("monthly_post", True))
+        print(f"[Config] customs-sales — channel {sales_config['channel_id'] or '(none)'} "
+              f"| monthly {sales_config['monthly_post']}")
     elif feature == "customs-vouches":
         vouch_config["channel_id"] = str(cfg.get("channel_id") or "")
         roles = cfg.get("designer_role_ids")
@@ -11817,6 +12345,15 @@ async def _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, product
     rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
     product = (rec.get("product") if rec else "") or "your package"
     image = (rec.get("image") if rec else "") or ""
+    # Count the sale for whoever posted the package (Sales Stats).
+    try:
+        rb, us = _parse_money(price_str)
+        await _sales_record(
+            (rec or {}).get("guild_id") or (interaction.guild.id if interaction.guild else ""),
+            (rec or {}).get("designer_id") or "", "package", product=product,
+            robux=rb, usd=us, buyer_id=interaction.user.id)
+    except Exception as e:
+        print(f"[Sales] record package failed: {e}")
     thread_url = (rec.get("thread_url") if rec else "") or ""
     files = (rec.get("files") if rec else []) or []
     # Advertising perk? Grant from the stashed intent first (robust even if the
@@ -13767,7 +14304,7 @@ async def load_all_configs():
         print(f"[Config] load skipped — BOT_ORDER_ID set: {bool(BOT_ORDER_ID)}, WORKER_TOKEN set: {bool(WORKER_TOKEN)}")
         return
     print(f"[Config] loading for bot {BOT_ORDER_ID}")
-    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-feedback", "customs-reportbug", "customs-freerelease", "customs-blacklist", "customs-announce", "customs-smallui", "customs-vouches", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling"):
+    for feature in ("welcome", "invite", "tickets", "credits", "roblox-verify", "customs-giveaway", "customs-robux-locker", "customs-portfolio", "customs-packages", "customs-orderlog", "customs-infraction", "customs-promotion", "customs-qualitycheck", "customs-payment", "customs-logging", "customs-order-status", "customs-pricing", "music-addon", "auto-radio", "roblox-group-sync", "customs-messages", "customs-suggestions", "customs-feedback", "customs-reportbug", "customs-freerelease", "customs-blacklist", "customs-announce", "customs-smallui", "customs-vouches", "customs-sales", "invite-tracker", "marketplace", "ads", "customs-tts", "customs-gambling"):
         cfg = await fetch_config(feature)
         if cfg:
             await apply_config(feature, cfg)
