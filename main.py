@@ -1817,7 +1817,7 @@ async def leaderboard_invites(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="invitebonus", description="Adds or removes bonus invites for a member.")
-@app_commands.describe(user="Member to adjust", amount="Bonus invites to add (use a negative number to remove)")
+@app_commands.describe(user="Member to adjust", amount="Bonus invites to add. Use a negative number to take some away.")
 async def invitebonus_cmd(interaction: discord.Interaction, user: discord.Member, amount: int):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(embed=error_embed("Admins only", "You need Manage Server."), ephemeral=True)
@@ -1859,7 +1859,7 @@ async def _reset_invites(guild, user=None):
 
 
 @bot.tree.command(name="resetinvites", description="Resets everyone's invite count to zero.")
-@app_commands.describe(user="Optional — reset only this member instead of everyone")
+@app_commands.describe(user="Only reset this member. Leave empty to reset everyone.")
 async def resetinvites_cmd(interaction: discord.Interaction, user: discord.Member = None):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(
@@ -2395,7 +2395,7 @@ async def logtest_cmd(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="logdebug", description="Checks why a purchase log shows no customer.")
-@app_commands.describe(roblox_id="The buyer's Roblox user ID (e.g. 376043957)", roblox_username="The buyer's Roblox username (optional)")
+@app_commands.describe(roblox_id="The buyer's Roblox user ID, like 376043957.", roblox_username="The buyer's Roblox username, if you have it.")
 async def logdebug_cmd(interaction: discord.Interaction, roblox_id: str, roblox_username: str = ""):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(embed=error_embed("No permission", "Only staff can run this."), ephemeral=True)
@@ -3677,7 +3677,7 @@ class _RoleWatchView(discord.ui.View):
 
 
 @bot.tree.command(name="infractionroles", description="Sets the roles that log an infraction when they're removed.")
-@app_commands.describe(min="How many must be removed to trigger (0 = all of them)")
+@app_commands.describe(min="How many must be removed to trigger. 0 means all of them.")
 async def infractionroles_cmd(interaction: discord.Interaction, min: int = 0):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(embed=error_embed("Admins only", "You need Manage Server."), ephemeral=True)
@@ -3688,7 +3688,7 @@ async def infractionroles_cmd(interaction: discord.Interaction, min: int = 0):
 
 
 @bot.tree.command(name="promotionroles", description="Sets the roles that log a promotion when they're added.")
-@app_commands.describe(min="How many must be added to trigger (0 = all of them)")
+@app_commands.describe(min="How many must be added to trigger. 0 means all of them.")
 async def promotionroles_cmd(interaction: discord.Interaction, min: int = 0):
     if not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message(embed=error_embed("Admins only", "You need Manage Server."), ephemeral=True)
@@ -5315,7 +5315,7 @@ async def shift_manage_cmd(interaction: discord.Interaction):
 
 
 @shift_group.command(name="leaderboard", description="Shows who has been on shift the most.")
-@app_commands.describe(period="This week (default) or all time")
+@app_commands.describe(period="This week or all time. This week if you leave it.")
 @app_commands.choices(period=[app_commands.Choice(name="This week", value="week"), app_commands.Choice(name="All time", value="all")])
 async def shift_leaderboard_cmd(interaction: discord.Interaction, period: app_commands.Choice[str] = None):
     guild = interaction.guild
@@ -10362,7 +10362,7 @@ async def ads_cmd(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="adsgrant", description="Gives a member an ad perk.")
-@app_commands.describe(user="Member to give the perk to", perk="Which perk", amount="How many (default 1)")
+@app_commands.describe(user="Member to give the perk to", perk="Which perk", amount="How many. One if you leave it.")
 @app_commands.choices(perk=[
     app_commands.Choice(name="Everyone Ping", value="ping_everyone"),
     app_commands.Choice(name="Here Ping", value="ping_here"),
@@ -13709,7 +13709,7 @@ _set_group = app_commands.Group(name="set", description="Server settings.")
 
 
 @_set_group.command(name="nick", description="Sets what the bot calls someone when it reads chat.")
-@app_commands.describe(user="Whose name to change (defaults to you)", nickname="New name to be read (blank to reset)")
+@app_commands.describe(user="Whose name to change. You if you leave it.", nickname="The name to read out. Leave empty to reset it.")
 async def set_nick(interaction: discord.Interaction, user: discord.Member = None, nickname: str = ""):
     target = user or interaction.user
     # Anyone may rename themselves; renaming others needs Manage Nicknames.
@@ -13740,7 +13740,7 @@ bot.tree.add_command(_set_group)
 
 # ---- Commands ----
 @bot.tree.command(name="play", description="Plays a song in your voice channel.")
-@app_commands.describe(query="Song name, a link, a genre, or 'favorites'")
+@app_commands.describe(query="A song name, a link, a genre, or favorites.")
 async def music_play(interaction: discord.Interaction, query: str):
     try:
         await interaction.response.defer(ephemeral=True)
@@ -13995,7 +13995,7 @@ async def music_queue(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="volume", description="Sets the volume from 0 to 100.")
-@app_commands.describe(volume="Volume level 0-100")
+@app_commands.describe(volume="Volume from 0 to 100.")
 async def music_volume(interaction: discord.Interaction, volume: app_commands.Range[int, 0, 100]):
     if not is_dj(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "You need a DJ role."), ephemeral=True)
@@ -14030,7 +14030,7 @@ async def favorites_command(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="setmusic", description="Starts a nonstop radio for a genre.")
-@app_commands.describe(genre="Genre e.g. Country, Hip Hop, Rock, Pop, All")
+@app_commands.describe(genre="A genre, like Country, Hip Hop, Rock, Pop, or All.")
 async def setmusic_command(interaction: discord.Interaction, genre: str):
     if not _is_admin(interaction.user):
         await interaction.response.send_message(embed=error_embed("No permission", "Admins only."), ephemeral=True)
@@ -14105,7 +14105,7 @@ def _radio_stream_for(genre):
 
 
 @bot.tree.command(name="radio", description="Starts a 24/7 radio stream in your voice channel.")
-@app_commands.describe(genre="Genre, e.g. lofi, rock, country, jazz, edm, pop")
+@app_commands.describe(genre="A genre, like lofi, rock, country, jazz, edm, or pop.")
 async def radio_cmd(interaction: discord.Interaction, genre: str = ""):
     if not is_dj(interaction.user):
         await interaction.response.send_message(embed=error_embed("DJ only", "You need a DJ role (or admin) for the radio."), ephemeral=True)
