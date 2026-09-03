@@ -9087,9 +9087,12 @@ async def progress_cmd(interaction: discord.Interaction, stage: app_commands.Cho
         await interaction.response.defer(ephemeral=True)
     except Exception:
         pass
+    already_done = info.get("status") == "completed"
     await _ticket_set_stage(ch, stage.value, actor=interaction.user, note=(note or "").strip()[:400])
     if stage.value == "completed":
         await _sales_record_order_once(ch, info)
+        if not already_done:
+            await _vouch_prompt_after_completion(ch, info)
     try:
         await interaction.delete_original_response()
     except Exception:
@@ -9124,7 +9127,76 @@ async def _orderlog_mark_completed(interaction):
         return ch
     await _ticket_set_stage(ch, "completed", actor=interaction.user)
     await _sales_record_order_once(ch, info)
+    await _vouch_prompt_after_completion(ch, info)
     return ch
+
+
+async def _vouch_prompt_after_completion(ch, info=None):
+    """DM the customer a vouch button the moment their order is completed, so
+    they don't have to wait for the ticket to close."""
+    info = info or _ticket_topic_info(ch) or {}
+    if not (vouch_config.get("channel_id") and info.get("claimer_id") and info.get("opener_id", "").isdigit()):
+        return
+    guild = ch.guild
+    opener = guild.get_member(int(info["opener_id"]))
+    designer = guild.get_member(int(info["claimer_id"]))
+    if not opener or not designer or opener.id == designer.id:
+        return
+    what = ch.category.name if ch.category else (info.get("cat") or "your order")
+    e = discord.Embed(title="Your order is done", color=0x2b2d31, timestamp=discord.utils.utcnow())
+    e.description = (f"**Server:** {guild.name}\n**Order:** {what}\n**Designer:** {designer.mention}\n\n"
+                     f"If you have a minute, leave a vouch for {designer.mention} with the button below.")
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label=f"Vouch for {designer.display_name}"[:80], style=discord.ButtonStyle.success,
+                                    custom_id=f"vouch_open:{designer.id}:{guild.id}"))
+    try:
+        await opener.send(embed=e, view=view)
+    except Exception as e2:
+        print(f"[Vouch] completion DM failed: {e2}")
+
+
+def _stage_label(info):
+    if not info.get("claimed"):
+        return "Waiting to be claimed"
+    return PROGRESS_STAGES.get(info.get("status") or "", ("Claimed, not started",))[0]
+
+
+@bot.tree.command(name="myorders", description="Your open and past orders here (staff can look up a member)")
+@app_commands.describe(member="Staff only: whose orders to show")
+async def myorders_cmd(interaction: discord.Interaction, member: discord.Member = None):
+    guild = interaction.guild
+    target = member or interaction.user
+    if target.id != interaction.user.id and not _is_ticket_staff(interaction.user):
+        return await interaction.response.send_message(embed=error_embed("Staff only", "You can only look up your own orders."), ephemeral=True)
+    open_lines = []
+    for ch in getattr(guild, "text_channels", []):
+        info = _ticket_topic_info(ch)
+        if not info or info.get("opener_id") != str(target.id):
+            continue
+        who = f", with <@{info['claimer_id']}>" if info.get("claimer_id") else ""
+        open_lines.append(f"{ch.mention}, {_stage_label(info)}{who}")
+    past = [e for e in sales_data.get("events", [])
+            if str(e.get("guild_id")) == str(guild.id) and str(e.get("buyer_id")) == str(target.id)]
+    past.sort(key=lambda e: float(e.get("ts") or 0), reverse=True)
+    past_lines = []
+    for e in past[:10]:
+        when = f"<t:{int(float(e.get('ts') or 0))}:d>"
+        who = f" by <@{e['designer_id']}>" if str(e.get("designer_id") or "").isdigit() else ""
+        money = []
+        if e.get("robux"):
+            money.append(f"R$ {int(e['robux']):,}")
+        if e.get("usd"):
+            money.append(f"${float(e['usd']):,.2f}")
+        cost = f", {' and '.join(money)}" if money else ""
+        past_lines.append(f"{when}, {e.get('product') or 'Order'}{who}{cost}")
+    emb = discord.Embed(title=f"{target.display_name}'s orders", color=0x2b2d31)
+    emb.add_field(name=f"Open ({len(open_lines)})", value="\n".join(open_lines)[:1024] or "None right now.", inline=False)
+    emb.add_field(name="Past", value="\n".join(past_lines)[:1024] or "Nothing recorded yet.", inline=False)
+    try:
+        emb.set_thumbnail(url=target.display_avatar.url)
+    except Exception:
+        pass
+    await interaction.response.send_message(embed=emb, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 async def _ticket_waiting_since(ch, opener_id):
@@ -9849,12 +9921,15 @@ async def _ticket_close_dm(channel, guild, opener, closer, reason, transcript):
     lines.append(f"**Closed by:** {closer.mention if hasattr(closer, 'mention') else closer}")
     if reason:
         lines.append(f"**Reason:** {reason}")
-    if designer and vouch_config.get("channel_id"):
+    # A completed order already got its vouch DM at completion, so no second ask.
+    ask_vouch = bool(designer and vouch_config.get("channel_id") and designer.id != opener.id
+                     and info.get("status") != "completed")
+    if ask_vouch:
         lines.append(f"\nIf you have a minute, leave a vouch for {designer.mention} with the button below.")
     e.description = "\n".join(lines)
     e.set_footer(text="Your transcript is attached.")
     view = None
-    if designer and vouch_config.get("channel_id") and designer.id != opener.id:
+    if ask_vouch:
         view = discord.ui.View(timeout=None)
         view.add_item(discord.ui.Button(label=f"Vouch for {designer.display_name}"[:80], style=discord.ButtonStyle.success,
                                         custom_id=f"vouch_open:{designer.id}:{guild.id}"))
