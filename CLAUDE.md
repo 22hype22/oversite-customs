@@ -1,28 +1,27 @@
-# CLAUDE.md — Oversite Network bot
+# CLAUDE.md, Oversite Roleplay bot
 
-Single-file discord.py bot (`main.py`). Auto-deploys to Railway from `main`.
+Single-file discord.py bot (`main.py`). This is the `roleplay` branch of
+22hype22/oversite-customs, which IS the Oversite Roleplay codebase. It started
+as a copy of the Network bot (branch `main`) and is allowed to diverge: fixes
+are not required to be mirrored between the two. The GitHub repo
+22hype22/oversite-roleplay mirrors this branch (its sync workflow pulls it every
+ten minutes) and Railway deploys The Six Roleplay from that repo.
+
+`BOT_BASE` defaults to "roleplay" here: brand name, the slash commands kept
+before sync, and the dashboard blocks loaded.
 
 ## Message wording rules (owner's standing request)
 
-Every message the bot posts or DMs must read like a person typed it:
-
-- No emoji and no symbol glyphs (no stars, checkmarks, arrows). Ratings are
-  written out: "4 out of 5", "4.8 out of 5 from 12 vouches".
-- No em dashes, no parentheses, no mid-dot separators. Use commas and short
-  sentences instead.
-- No "AI voice": no "Nice try", no cheerleading, no filler. Say what happened.
+- No emoji and no symbol glyphs. Ratings are written out, "4 out of 5".
+- No em dashes, no parentheses, no mid-dot separators.
+- No AI voice: no cheerleading, no filler. Say what happened.
 - Existing red/green channel-name markers for tickets are the one exception.
-
-Dashboard-designable versions of the system messages live under the System
-Messages block keys (ticket_progress, ticket_queue_update,
-ticket_staff_reminder, ticket_designer_away, ticket_designer_back, ...).
 
 ## Persistence
 
-Anything the bot must remember across a redeploy goes through
-`_durable_config_get(feature)` / `_bot_config_upsert(feature, config)` and a
-`*_loaded` flag so a failed load never overwrites stored data with an empty
-snapshot (see vouch-data, sales-data, away-data, ticket-autoclose-state).
+Anything that must survive a redeploy goes through `_durable_config_get` and
+`_bot_config_upsert` with a `*_loaded` flag, so a failed load never overwrites
+stored data with an empty snapshot.
 
 ## Git
 

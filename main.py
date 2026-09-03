@@ -31,8 +31,9 @@ DASHBOARD_URL = os.getenv("DASHBOARD_URL", "https://oversite.shop/bot-dashboard"
 
 # Which product this deployment is. The same code runs every Roblox-side base;
 # the base picks the brand name, which slash commands exist, and which
-# dashboard blocks are loaded. "customs" = Oversite Network (the original).
-BOT_BASE = (os.getenv("BOT_BASE") or "customs").strip().lower()
+# dashboard blocks are loaded. This branch IS the Oversite Roleplay codebase:
+# it started as a copy of the Network bot and is free to diverge from it.
+BOT_BASE = (os.getenv("BOT_BASE") or "roleplay").strip().lower()
 BASE_BRANDS = {"customs": "Oversite Customs", "roleplay": "Oversite Roleplay"}
 BRAND = BASE_BRANDS.get(BOT_BASE, "Oversite Customs")
 SERVER_NAME = os.getenv("SERVER_NAME", BRAND)
