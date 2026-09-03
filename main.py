@@ -4707,7 +4707,14 @@ async def _post_form_log(interaction, key, comps, files=None):
     else:
         mid = await send_v2_message(ch, final, allowed_mentions={"parse": []})
     if mid:
-        await interaction.followup.send(embed=success_embed("Logged", f"Posted in {ch.mention}."), ephemeral=True)
+        done = None
+        if key == "orderlog":
+            try:
+                done = await _orderlog_mark_completed(interaction)
+            except Exception as e:
+                print(f"[Ticket] orderlog completion failed: {e}")
+        extra = f" {done.mention} is marked completed." if done else ""
+        await interaction.followup.send(embed=success_embed("Logged", f"Posted in {ch.mention}.{extra}"), ephemeral=True)
     else:
         reason = _V2_LAST_ERROR.get("msg") or "unknown error"
         await interaction.followup.send(embed=error_embed("Couldn't post", f"Discord rejected the message: {reason}"), ephemeral=True)
@@ -6181,6 +6188,8 @@ async def on_interaction(interaction: discord.Interaction):
             await _pkg_review_submit(interaction, cid.split(":", 1)[1])
         elif cid.startswith("vouchform:"):
             await _vouch_submit(interaction, cid.split(":", 1)[1])
+        elif cid.startswith("agree:"):
+            await _terms_modal_submit(interaction, cid.split(":", 1)[1])
         elif cid.startswith("setprice_one:"):
             parts = cid.split(":")
             try:
@@ -6209,8 +6218,7 @@ async def on_interaction(interaction: discord.Interaction):
         if values:
             v = values[0]
             if v.startswith("ticket_msg:"):
-                mk = v.split(":", 1)[1]
-                await open_ticket(interaction, v, open_comps_override=ticket_msgs.get(mk), category_name_override=ticket_categories.get(mk), access_names_override=ticket_access.get(mk))
+                await _open_or_gate(interaction, v)
             elif v.startswith("ticket_form:"):
                 await open_ticket_form(interaction, v.split(":", 1)[1])
             elif v.startswith("eph:"):
@@ -6221,12 +6229,13 @@ async def on_interaction(interaction: discord.Interaction):
                 except Exception:
                     pass
             else:
-                await open_ticket(interaction, v)
+                await _open_or_gate(interaction, v)
     elif cid.startswith("ticket_msg:"):
-        mk = cid.split(":", 1)[1]
-        await open_ticket(interaction, cid, open_comps_override=ticket_msgs.get(mk), category_name_override=ticket_categories.get(mk), access_names_override=ticket_access.get(mk))
+        await _open_or_gate(interaction, cid)
     elif cid.startswith("ticket_form:"):
         await open_ticket_form(interaction, cid.split(":", 1)[1])
+    elif cid.startswith("agreebtn:"):
+        await _open_terms_modal(interaction, f"formopen:{cid.split(':', 1)[1]}")
     elif cid.startswith("formcont:"):
         payload = cid.split(":", 1)[1]
         fkey, pg = (payload.rsplit("|", 1) + ["0"])[:2] if "|" in payload else (payload, "0")
@@ -6238,9 +6247,9 @@ async def on_interaction(interaction: discord.Interaction):
     elif cid.startswith("eph:"):
         await show_ephemeral(interaction, cid.split(":", 1)[1])
     elif cid.startswith("ticket_cat:"):
-        await open_ticket(interaction, cid.split(":", 1)[1])
+        await _open_or_gate(interaction, cid)
     elif cid == "ticket_open":
-        await open_ticket(interaction, "support")
+        await _open_or_gate(interaction, "ticket_open")
     elif cid == "ticket_claim":
         await ticket_claim_toggle(interaction, True)
     elif cid == "ticket_unclaim":
@@ -6665,6 +6674,11 @@ async def _open_form_page(interaction, key, page):
                 "component": {"type": 4, "custom_id": f"q{idx}", "style": style,
                               "required": True, "max_length": 1000},
             })
+    # Order tickets: the Sales and Refund Policy box rides on the last page when
+    # there's room (Discord caps a modal at 5 components). A full last page gets
+    # the box as a follow-up step instead (see handle_ticket_form_submit).
+    if page + 1 == total_pages and len(components) < 5 and _ticket_is_order(key):
+        components.append(_terms_checkbox_component())
     title = (form_titles.get(key) or "Application")
     if total_pages > 1:
         title = f"{title} ({page + 1}/{total_pages})"
@@ -7687,7 +7701,7 @@ async def _ticket_paid_msg(ch, customer, designer, amount_text, label):
         await send_v2_message(ch, _ui_render(design, mapping), allowed_mentions={"parse": ["users"]})
         return
     who = " ".join(x.mention for x in (customer, designer) if x)
-    text = f"{who} **Payment received**\n{amount_text} through {label}. This order is marked paid."
+    text = f"{who} **Payment received**\n{amount_text} through {label}. This order is now in progress."
     await send_v2_message(ch, [{"type": "container", "children": [{"type": "text", "text": text.strip()}]}],
                           allowed_mentions={"parse": ["users"]})
 
@@ -7737,6 +7751,10 @@ async def _sales_match_payment(method, usd=0.0, robux=0, created=None, channel_i
             await _ticket_paid_msg(ch, customer, designer, amount_text, best.get("label") or "payment")
         except Exception as e:
             print(f"[Sales] paid message failed: {e}")
+        try:
+            await _ticket_set_stage(ch, "inprogress", announce=False)
+        except Exception as e:
+            print(f"[Sales] stage stamp failed: {e}")
     print(f"[Sales] matched {method} payment {ref} to ticket {best.get('channel_id')} for {best.get('designer_id')}")
     return True
 
@@ -9004,16 +9022,58 @@ def _ticket_topic_info(ch):
     }
 
 
-# ---- /progress: designer-set order stage, posted to the customer ----
+# ---- Order stages: in progress (payment came through) -> completed (/orderlog) ----
+# Set automatically by the payment match and the order log; /progress is the
+# manual override for either.
 PROGRESS_STAGES = {
-    "started": ("Started", "Work on your order has started."),
-    "draft": ("Draft ready", "A first version is ready for you to look at."),
-    "approval": ("Awaiting your approval", "The designer needs your OK before finishing."),
-    "delivered": ("Delivered", "Your order has been delivered."),
+    "inprogress": ("In progress", "Payment came through and work on your order has started."),
+    "completed": ("Completed", "Your order has been logged as completed."),
 }
+_STAGE_SUFFIX_RE = re.compile(r"・(in-progress|completed|started|draft|approval|delivered)$")
 
 
-@bot.tree.command(name="progress", description="Update the customer on where their order is (staff)")
+async def _ticket_set_stage(ch, key, actor=None, note="", announce=True):
+    """Move a ticket to a stage: tell the customer (unless announce=False), and
+    stamp it on the channel name suffix and topic slot 7. Renames are best
+    effort since Discord allows two per 10 minutes per channel."""
+    info = _ticket_topic_info(ch)
+    if not info:
+        return False
+    label, blurb = PROGRESS_STAGES.get(key, (key, ""))
+    guild = ch.guild
+    opener = guild.get_member(int(info["opener_id"])) if info["opener_id"].isdigit() else None
+    if announce:
+        mapping = {"user": opener.mention if opener else "", "status": label, "note": note or "",
+                   "staff": actor.mention if actor else ""}
+        design = _small_ui("ticket_progress")
+        try:
+            if design:
+                await send_v2_message(ch, _ui_render(design, mapping), allowed_mentions={"parse": ["users"]})
+            else:
+                ping = f"{opener.mention} " if opener else ""
+                text = f"{ping}**Order update: {label}**\n{blurb}"
+                if note:
+                    text += f"\n\n{note}"
+                if actor:
+                    text += f"\n-# From {actor.mention}"
+                await send_v2_message(ch, [{"type": "container", "children": [{"type": "text", "text": text}]}],
+                                      allowed_mentions={"parse": ["users"]})
+        except Exception as e:
+            print(f"[Ticket] stage message failed: {e}")
+    try:
+        parts = (ch.topic or "").split("|")
+        while len(parts) < 6:
+            parts.append("")
+        parts = parts[:6] + [key]
+        suffix = "in-progress" if key == "inprogress" else key
+        base_name = _STAGE_SUFFIX_RE.sub("", ch.name)
+        await ch.edit(name=f"{base_name}・{suffix}"[:100], topic="|".join(parts), reason=f"Order stage: {label}")
+    except Exception as e:
+        print(f"[Ticket] stage stamp failed: {e}")
+    return True
+
+
+@bot.tree.command(name="progress", description="Set an order to in progress or completed by hand (staff)")
 @app_commands.describe(stage="Where the order is now", note="Anything to add for the customer (optional)")
 @app_commands.choices(stage=[app_commands.Choice(name=v[0], value=k) for k, v in PROGRESS_STAGES.items()])
 async def progress_cmd(interaction: discord.Interaction, stage: app_commands.Choice[str], note: str = ""):
@@ -9023,42 +9083,48 @@ async def progress_cmd(interaction: discord.Interaction, stage: app_commands.Cho
         return await interaction.response.send_message(embed=error_embed("Not a ticket", "Run this inside an order ticket."), ephemeral=True)
     if not _is_ticket_staff(interaction.user, ch):
         return await interaction.response.send_message(embed=error_embed("Staff only", "Only staff can post order updates."), ephemeral=True)
-    key = stage.value
-    label, blurb = PROGRESS_STAGES.get(key, (key, ""))
-    opener = interaction.guild.get_member(int(info["opener_id"])) if info["opener_id"].isdigit() else None
-    note = (note or "").strip()[:400]
-    mapping = {"user": opener.mention if opener else "", "status": label, "note": note,
-               "staff": interaction.user.mention}
-    design = _small_ui("ticket_progress")
     try:
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
     except Exception:
         pass
-    if design:
-        await send_v2_message(ch, _ui_render(design, mapping), allowed_mentions={"parse": ["users"]})
-    else:
-        ping = f"{opener.mention} " if opener else ""
-        text = f"{ping}**Order update: {label}**\n{blurb}"
-        if note:
-            text += f"\n\n{note}"
-        text += f"\n-# From {interaction.user.mention}"
-        await send_v2_message(ch, [{"type": "container", "children": [{"type": "text", "text": text}]}],
-                              allowed_mentions={"parse": ["users"]})
-    # Stamp the stage on the channel (name suffix + topic slot 7). Best effort:
-    # Discord allows two renames per 10 minutes per channel.
-    try:
-        parts = (ch.topic or "").split("|")
-        while len(parts) < 6:
-            parts.append("")
-        parts = parts[:6] + [key]
-        base_name = re.sub(r"・(started|draft|approval|delivered)$", "", ch.name)
-        await ch.edit(name=f"{base_name}・{key}"[:100], topic="|".join(parts), reason=f"Order progress: {label}")
-    except Exception as e:
-        print(f"[Ticket] progress stamp failed: {e}")
+    await _ticket_set_stage(ch, stage.value, actor=interaction.user, note=(note or "").strip()[:400])
+    if stage.value == "completed":
+        await _sales_record_order_once(ch, info)
     try:
         await interaction.delete_original_response()
     except Exception:
         pass
+
+
+async def _sales_record_order_once(ch, info=None):
+    """Count a claimed order for its designer once per ticket, whichever comes
+    first: payment matched, logged as completed, or closed by a person."""
+    info = info or _ticket_topic_info(ch) or {}
+    if not info.get("claimer_id"):
+        return
+    if any(str(e.get("channel_id")) == str(ch.id) for e in sales_data.get("events", [])):
+        return
+    await _sales_record(ch.guild.id, info["claimer_id"], "order",
+                        product=ch.category.name if ch.category else info.get("cat", ""),
+                        buyer_id=info.get("opener_id", ""), channel_id=ch.id)
+
+
+async def _orderlog_mark_completed(interaction):
+    """After /orderlog posts: the ticket it was run in (or the runner's single
+    in-progress claimed ticket) is marked completed."""
+    ch = interaction.channel
+    info = _ticket_topic_info(ch) if ch else None
+    if not info:
+        guild = interaction.guild
+        cands = [(c, i) for c, i in _claimed_tickets_for(guild, interaction.user.id) if i.get("status") == "inprogress"] if guild else []
+        if len(cands) != 1:
+            return None
+        ch, info = cands[0]
+    if info.get("status") == "completed":
+        return ch
+    await _ticket_set_stage(ch, "completed", actor=interaction.user)
+    await _sales_record_order_once(ch, info)
+    return ch
 
 
 async def _ticket_waiting_since(ch, opener_id):
@@ -9274,6 +9340,87 @@ async def _ticket_queue_before():
     await bot.wait_until_ready()
 
 
+# ---- Sales and Refund Policy agreement on order tickets (hardcoded) ----
+TERMS_CID = "agree_terms"
+TERMS_LABEL = "Oversite Customs Sales and Refund Policy"
+
+
+def _terms_checkbox_component():
+    return {"type": 18, "label": TERMS_LABEL[:45],
+            "description": "Tick to agree. Required before an order can be opened.",
+            "component": {"type": 23, "custom_id": TERMS_CID, "required": True}}
+
+
+def _ticket_is_order(source_key=None, category=None, category_name=None):
+    """Order tickets need the policy box: anything opened from the Marketplace
+    panel, or whose category is one of the Order Status services."""
+    if source_key and _key_source.get(source_key) == "marketplace":
+        return True
+    if category and _settings_for_category(category) is marketplace_config:
+        return True
+    name = (category_name or (ticket_categories.get(source_key) if source_key else "") or "").strip().lower()
+    return bool(name and name in _order_category_names())
+
+
+async def _open_terms_modal(interaction, action):
+    """A one-box modal before a plain (no form) order ticket opens. `action`
+    is the original open action, replayed on submit (agree:<action>)."""
+    data = {"title": "Before you order"[:45], "custom_id": f"agree:{action}"[:100],
+            "components": [_terms_checkbox_component()]}
+    route = discord.http.Route(
+        "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+        interaction_id=interaction.id, interaction_token=interaction.token)
+    await bot.http.request(route, json={"type": 9, "data": data})
+
+
+async def _dispatch_ticket_open(interaction, action, agreed=False):
+    """Open a ticket for a panel action string exactly as the button would."""
+    if action.startswith("ticket_msg:"):
+        mk = action.split(":", 1)[1]
+        await open_ticket(interaction, action, open_comps_override=ticket_msgs.get(mk),
+                          category_name_override=ticket_categories.get(mk), access_names_override=ticket_access.get(mk), agreed=agreed)
+    elif action.startswith("ticket_form:"):
+        key = action.split(":", 1)[1]
+        await open_ticket(interaction, action, open_comps_override=form_msgs.get(key) or [], agreed=agreed)
+    elif action.startswith("ticket_cat:"):
+        await open_ticket(interaction, action.split(":", 1)[1], agreed=agreed)
+    elif action == "ticket_open":
+        await open_ticket(interaction, "support", agreed=agreed)
+    else:
+        await open_ticket(interaction, action, agreed=agreed)
+
+
+async def _open_or_gate(interaction, action):
+    """Plain ticket buttons: order tickets get the policy box first."""
+    if action.startswith(("ticket_msg:", "ticket_form:")):
+        is_order = _ticket_is_order(source_key=action.split(":", 1)[1])
+    elif action.startswith("ticket_cat:"):
+        is_order = _ticket_is_order(category=action.split(":", 1)[1])
+    else:
+        is_order = _ticket_is_order(category=action)
+    if is_order:
+        try:
+            await _open_terms_modal(interaction, action)
+            return
+        except Exception as e:
+            print(f"[Ticket] terms modal failed, opening without it: {e}")
+    await _dispatch_ticket_open(interaction, action)
+
+
+async def _terms_modal_submit(interaction, action):
+    vals = _collect_modal_values((interaction.data or {}).get("components"))
+    if not vals.get(TERMS_CID):
+        return await interaction.response.send_message(
+            embed=error_embed("Agreement required", f"You need to agree to the {TERMS_LABEL} to open an order."), ephemeral=True)
+    if action.startswith("formopen:"):
+        # The box came as its own step after a full form page: answers are stashed.
+        key = action.split(":", 1)[1]
+        open_comps = form_msgs.get(key) or []
+        await _finish_ticket_form(interaction, key, open_comps, agreed=True)
+        return
+    await _dispatch_ticket_open(interaction, action, agreed=True)
+
+
 async def open_ticket_form(interaction, key):
     """A Form button/option: pop a modal to collect {Question:} answers, then
     open the ticket with those answers filled into the designed message."""
@@ -9281,7 +9428,7 @@ async def open_ticket_form(interaction, key):
     fields = _parse_form_fields(open_comps, limit=FORM_MAX_QUESTIONS)
     if not fields:
         # No questions/files defined — behave exactly like a Ticket button.
-        await open_ticket(interaction, f"ticket_form:{key}", open_comps_override=open_comps)
+        await _open_or_gate(interaction, f"ticket_form:{key}")
         return
 
     guild = interaction.guild
@@ -9357,6 +9504,32 @@ async def handle_ticket_form_submit(interaction, key, page=0):
             print(f"[Ticket] form continue prompt failed: {e}")
         return
 
+    # Order tickets must have the policy box ticked. If it was on this page and
+    # left empty, ask them to reopen the page; if there was no room for it, the
+    # box comes as its own small step (button -> modal). Answers stay stashed.
+    is_ticket_form = key not in form_log_configs and key != PKG_FORM_KEY and key != "qualitycheck"
+    if is_ticket_form and _ticket_is_order(key) and not vals.get(TERMS_CID):
+        had_box = len(fields[start:start + FORM_PAGE_SIZE]) < 5
+        if had_box:
+            btn = {"type": 2, "style": 1, "custom_id": f"formcont:{key}|{page}", "label": "Open the form again"}
+            msg = "Tick the box agreeing to the Sales and Refund Policy, then submit again. Your answers are saved."
+        else:
+            btn = {"type": 2, "style": 3, "custom_id": f"agreebtn:{key}", "label": "Agree to the policy"}
+            msg = "One more step: agree to the Sales and Refund Policy to open your order."
+        try:
+            route = discord.http.Route(
+                "POST", "/interactions/{interaction_id}/{interaction_token}/callback",
+                interaction_id=interaction.id, interaction_token=interaction.token)
+            await bot.http.request(route, json={"type": 4, "data": {
+                "flags": 1 << 6, "content": msg, "components": [{"type": 1, "components": [btn]}]}})
+        except Exception as e:
+            print(f"[Ticket] terms prompt failed: {e}")
+        return
+
+    await _finish_ticket_form(interaction, key, open_comps, agreed=bool(vals.get(TERMS_CID)))
+
+
+async def _finish_ticket_form(interaction, key, open_comps, agreed=False):
     # Last page — acknowledge, then build the ticket with ALL collected answers.
     try:
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -9379,7 +9552,7 @@ async def handle_ticket_form_submit(interaction, key, page=0):
             return
         await open_ticket(interaction, f"ticket_form:{key}", open_comps_override=substituted,
                           category_name_override=ticket_categories.get(key), access_names_override=ticket_access.get(key),
-                          already_responded=True, attachments=files)
+                          already_responded=True, attachments=files, agreed=agreed)
     except Exception as e:
         import traceback
         print(f"[Ticket] form submit failed: {e}\n{traceback.format_exc()}")
@@ -9443,12 +9616,15 @@ def _resolve_role_names(guild, names_csv):
     return out
 
 
-async def open_ticket(interaction, category, open_comps_override=None, category_name_override=None, access_names_override=None, already_responded=False, attachments=None):
+async def open_ticket(interaction, category, open_comps_override=None, category_name_override=None, access_names_override=None, already_responded=False, attachments=None, agreed=False):
     guild = interaction.guild
     if not guild:
         return
     if not already_responded:
         await interaction.response.defer(ephemeral=True)
+    # The policy agreement is written into the ticket so there's a record of it.
+    agreed_line = (f"-# {interaction.user.mention} agreed to the {TERMS_LABEL} <t:{int(time.time())}:f>"
+                   if agreed else "")
 
     # Tickets vs Marketplace: use the settings block for whichever panel this
     # button came from.
@@ -9527,13 +9703,14 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
             comps = json.loads(raw)
             close_row = {"type": "buttonRow", "buttons": [{"label": "Claim", "style": "success", "__ticket_claim": True}, {"label": "Close", "style": "danger", "__ticket_close": True}]}
             panel = [dict(c) for c in comps]
+            tail = ([{"type": "text", "text": agreed_line}] if agreed_line else []) + [close_row]
             container_idxs = [i for i, c in enumerate(panel) if c.get("type") == "container"]
             if container_idxs:
                 i = container_idxs[-1]
                 panel[i] = dict(panel[i])
-                panel[i]["children"] = list(panel[i].get("children") or []) + [close_row]
+                panel[i]["children"] = list(panel[i].get("children") or []) + tail
             else:
-                panel.append(close_row)
+                panel.extend(tail)
             # Ping first (plain message) so the opener + support actually get notified,
             # then the rich Components V2 message (which can't carry a pinging content).
             if content:
@@ -9558,6 +9735,8 @@ async def open_ticket(interaction, category, open_comps_override=None, category_
     if not sent_rich:
         open_msg = st.get("open_message") or f"Thanks {interaction.user.mention}, a member of the team will be with you shortly."
         open_msg = open_msg.replace("{user}", interaction.user.mention)
+        if agreed_line:
+            open_msg += f"\n\n{agreed_line}"
         embed = info_embed(f"{type_name} ticket", open_msg)
         embed.set_footer(text=f"Opened by {interaction.user}")
 
@@ -9637,12 +9816,8 @@ async def _do_close(channel, guild, closer, reason=""):
     # A claimed order closed by a person counts as a completed order for the
     # claimer (Sales Stats). Auto-closes for inactivity don't count.
     try:
-        info = _ticket_topic_info(channel) or {}
-        already_paid = any(str(e.get("channel_id")) == str(channel.id) for e in sales_data.get("events", []))
-        if info.get("claimer_id") and not already_paid and not str(reason or "").lower().startswith("auto-closed"):
-            await _sales_record(guild.id, info["claimer_id"], "order",
-                                product=channel.category.name if channel.category else category,
-                                buyer_id=opener_id, channel_id=channel.id)
+        if not str(reason or "").lower().startswith("auto-closed"):
+            await _sales_record_order_once(channel)
     except Exception as e:
         print(f"[Sales] record order failed: {e}")
     # The customer's copy: a short summary, the transcript, and (for a claimed
