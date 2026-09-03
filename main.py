@@ -1521,6 +1521,12 @@ async def on_ready():
         await _sales_load()
     except Exception as e:
         print(f"[Sales] load failed: {e}")
+    try:
+        await _away_load()
+    except Exception as e:
+        print(f"[Away] load failed: {e}")
+    if not away_tick.is_running():
+        away_tick.start()
     if not ticket_inactivity_tick.is_running():
         ticket_inactivity_tick.start()
     if not ticket_staff_reply_tick.is_running():
@@ -5534,8 +5540,11 @@ def _pricing_lines_text(si, guild=None):
 
     blocks = []
     for uid in sorted(by_user.keys(), key=_join_key):
-        # Never show pricing for a designer who has left the server.
+        # Never show pricing for a designer who has left the server, and hide
+        # designers who are away (/away) until they're back.
         if guild and str(uid).isdigit() and guild.get_member(int(uid)) is None:
+            continue
+        if guild and _away_get(guild.id, uid):
             continue
         item_map = by_user.get(uid) or {}
         if not isinstance(item_map, dict):
@@ -6333,6 +6342,16 @@ async def on_interaction(interaction: discord.Interaction):
         await _pkg_download(interaction, cid.split(":", 1)[1])
     elif cid.startswith("pkg_review:"):
         await _pkg_review(interaction, cid.split(":", 1)[1])
+    elif cid.startswith("vouch_open:"):
+        # Vouch button on a closed-order DM: vouch_open:<designer_id>:<guild_id>
+        bits = cid.split(":")
+        designer_id = bits[1] if len(bits) > 1 else ""
+        guild_id = bits[2] if len(bits) > 2 else ""
+        if not vouch_config.get("channel_id"):
+            await interaction.response.send_message(
+                embed=error_embed("Not set up", "Vouches aren't turned on in this server yet."), ephemeral=True)
+        else:
+            await interaction.response.send_modal(_VouchModal(designer_id, pkg_msg_id=f"g{guild_id}"))
     elif cid == "pkg_claim":
         # Package card "Claim" button. Behavior is a simple acknowledgement for
         # now — the real claim flow can be wired later.
@@ -7383,9 +7402,12 @@ async def _vouch_submit(interaction, payload):
         return await interaction.response.send_message(
             embed=error_embed("Write a review", "A short written review is required here."), ephemeral=True)
 
-    # A receipt vouch comes from a DM: find the server through the package record.
+    # A DM vouch (receipt or closed-order DM) has no guild: a "g<id>" tag names
+    # the server directly; otherwise find it through the package record.
     guild = interaction.guild
-    if guild is None and pkg_msg_id:
+    if guild is None and pkg_msg_id.startswith("g") and pkg_msg_id[1:].isdigit():
+        guild = bot.get_guild(int(pkg_msg_id[1:]))
+    elif guild is None and pkg_msg_id:
         try:
             rec = await _pkg_files_get(pkg_msg_id)
             if (rec or {}).get("guild_id"):
@@ -7763,6 +7785,190 @@ async def sales_monthly_tick():
 
 @sales_monthly_tick.before_loop
 async def _sales_monthly_before():
+    await bot.wait_until_ready()
+
+
+# ===================== Designer away mode =====================
+# /away hides a designer from the pricing board, tells the customers in their
+# claimed tickets that they're out and when they're back, and pauses the staff
+# reply reminders on those tickets. /back (or the date passing) reverses it.
+away_data = {}   # guild_id -> {user_id: {"until": unix_ts, "label": str, "note": str}}
+_away_loaded = False
+
+
+async def _away_load():
+    global _away_loaded
+    ok, cfg = await _durable_config_get("away-data")
+    if not ok:
+        print("[Away] load failed — away mode disabled this session.")
+        return
+    g = (cfg or {}).get("guilds")
+    if isinstance(g, dict):
+        for gid, users in g.items():
+            if isinstance(users, dict):
+                away_data[str(gid)] = {str(u): v for u, v in users.items() if isinstance(v, dict)}
+    _away_loaded = True
+    print(f"[Away] loaded {sum(len(u) for u in away_data.values())} away designer(s)")
+
+
+async def _away_save():
+    if not _away_loaded:
+        return
+    try:
+        await _bot_config_upsert("away-data", {"guilds": away_data})
+    except Exception as e:
+        print(f"[Away] save failed: {e}")
+
+
+def _away_get(guild_id, user_id):
+    """The away record for a designer, or None if they're not away (or it expired)."""
+    rec = (away_data.get(str(guild_id)) or {}).get(str(user_id))
+    if not rec:
+        return None
+    try:
+        if float(rec.get("until") or 0) <= time.time():
+            return None
+    except (TypeError, ValueError):
+        return None
+    return rec
+
+
+def _away_parse_until(text):
+    """'3d', '2 weeks', '9/10', 'sep 10', '2026-09-10' -> (unix_ts, label). Dates
+    end at 11:59pm Central that day. (0, '') if it can't be read."""
+    s = str(text or "").strip().lower().replace("weeks", "w").replace("week", "w") \
+        .replace("days", "d").replace("day", "d").replace("hours", "h").replace("hour", "h").replace(" ", "")
+    secs = _parse_duration_seconds(s)
+    if secs > 0:
+        ts = time.time() + secs
+        return ts, f"<t:{int(ts)}:D>"
+    central = datetime.timezone(datetime.timedelta(hours=-5))
+    now = datetime.datetime.now(central)
+    for fmt in ("%m/%d", "%m/%d/%Y", "%m/%d/%y", "%b%d", "%B%d", "%Y-%m-%d", "%d%b", "%d%B"):
+        try:
+            d = datetime.datetime.strptime(str(text or "").strip().replace(" ", ""), fmt)
+        except ValueError:
+            continue
+        year = d.year if "%Y" in fmt or "%y" in fmt else now.year
+        end = datetime.datetime(year, d.month, d.day, 23, 59, tzinfo=central)
+        if end < now and "%Y" not in fmt and "%y" not in fmt:
+            end = end.replace(year=year + 1)
+        return end.timestamp(), f"<t:{int(end.timestamp())}:D>"
+    return 0, ""
+
+
+def _away_can_use(member):
+    if _is_ticket_staff(member):
+        return True
+    return has_any_role(member, pricing_config.get("designer_role_ids") or [])
+
+
+def _claimed_tickets_for(guild, user_id):
+    out = []
+    for ch in getattr(guild, "text_channels", []):
+        info = _ticket_topic_info(ch)
+        if info and info.get("claimer_id") == str(user_id):
+            out.append((ch, info))
+    return out
+
+
+async def _away_notify_tickets(guild, member, rec=None, back=False):
+    """Tell the customers in this designer's claimed tickets that they're away
+    (or back). Uses the ticket_designer_away / ticket_designer_back system
+    messages when designed."""
+    n = 0
+    for ch, info in _claimed_tickets_for(guild, member.id):
+        oid = info.get("opener_id") or ""
+        opener = guild.get_member(int(oid)) if oid.isdigit() else None
+        ping = f"{opener.mention} " if opener else ""
+        key = "ticket_designer_back" if back else "ticket_designer_away"
+        mapping = {"user": opener.mention if opener else "", "designer": member.mention,
+                   "until": (rec or {}).get("label", ""), "note": (rec or {}).get("note", "")}
+        design = _small_ui(key)
+        try:
+            if design:
+                await send_v2_message(ch, _ui_render(design, mapping), allowed_mentions={"parse": ["users"]})
+            else:
+                if back:
+                    text = f"{ping}**Your designer is back**\n{member.mention} is back and will pick this order up again."
+                else:
+                    text = f"{ping}**Your designer is away**\n{member.mention} is away until {rec.get('label') or 'further notice'} and will pick this back up when they return."
+                    if rec.get("note"):
+                        text += f"\n\n{rec['note']}"
+                await send_v2_message(ch, [{"type": "container", "children": [{"type": "text", "text": text}]}],
+                                      allowed_mentions={"parse": ["users"]})
+            n += 1
+        except Exception as e:
+            print(f"[Away] ticket notice failed in {ch.id}: {e}")
+    return n
+
+
+@bot.tree.command(name="away", description="Designer away mode: hide from pricing and tell your customers when you're back")
+@app_commands.describe(until="How long or what date: 3d, 2 weeks, 9/10, sep 10", note="Optional note shown to your customers")
+async def away_cmd(interaction: discord.Interaction, until: str, note: str = ""):
+    if not _away_loaded:
+        return await interaction.response.send_message(embed=error_embed("Try again", "Away mode isn't ready yet, give it a minute."), ephemeral=True)
+    if not _away_can_use(interaction.user):
+        return await interaction.response.send_message(embed=error_embed("Designers only", "You need a designer or staff role to use this."), ephemeral=True)
+    ts, label = _away_parse_until(until)
+    if not ts:
+        return await interaction.response.send_message(
+            embed=error_embed("Couldn't read that", "Try a length like `3d` or `2 weeks`, or a date like `9/10` or `sep 10`."), ephemeral=True)
+    if ts - time.time() > 120 * 86400:
+        return await interaction.response.send_message(embed=error_embed("Too long", "Away mode caps at 120 days. Run it again when you're closer."), ephemeral=True)
+    rec = {"until": int(ts), "label": label, "note": (note or "").strip()[:300]}
+    away_data.setdefault(str(interaction.guild.id), {})[str(interaction.user.id)] = rec
+    await _away_save()
+    await interaction.response.defer(ephemeral=True)
+    n = await _away_notify_tickets(interaction.guild, interaction.user, rec)
+    await interaction.followup.send(
+        embed=success_embed("You're marked away", f"Back {label}. You're hidden from the pricing board, "
+                            f"{n} claimed ticket{'s' if n != 1 else ''} told, and staff reminders on them are paused. "
+                            "Run `/back` to end it early."), ephemeral=True)
+
+
+@bot.tree.command(name="back", description="End your away mode early")
+async def back_cmd(interaction: discord.Interaction):
+    rec = _away_get(interaction.guild.id, interaction.user.id)
+    stored = (away_data.get(str(interaction.guild.id)) or {}).pop(str(interaction.user.id), None)
+    if not stored:
+        return await interaction.response.send_message(embed=info_embed("Not away", "You weren't marked away."), ephemeral=True)
+    await _away_save()
+    await interaction.response.defer(ephemeral=True)
+    n = await _away_notify_tickets(interaction.guild, interaction.user, back=True) if rec else 0
+    await interaction.followup.send(
+        embed=success_embed("Welcome back", f"You're back on the pricing board and {n} ticket{'s' if n != 1 else ''} were told."), ephemeral=True)
+
+
+@tasks.loop(minutes=30)
+async def away_tick():
+    """Expire away records whose date has passed and tell their customers."""
+    if not _away_loaded:
+        return
+    dirty = False
+    for gid, users in list(away_data.items()):
+        guild = bot.get_guild(int(gid)) if str(gid).isdigit() else None
+        for uid, rec in list(users.items()):
+            try:
+                expired = float(rec.get("until") or 0) <= time.time()
+            except (TypeError, ValueError):
+                expired = True
+            if not expired:
+                continue
+            users.pop(uid, None)
+            dirty = True
+            member = guild.get_member(int(uid)) if (guild and uid.isdigit()) else None
+            if member:
+                try:
+                    await _away_notify_tickets(guild, member, back=True)
+                except Exception as e:
+                    print(f"[Away] back notice failed: {e}")
+    if dirty:
+        await _away_save()
+
+
+@away_tick.before_loop
+async def _away_before():
     await bot.wait_until_ready()
 
 
@@ -8663,10 +8869,69 @@ def _ticket_topic_info(ch):
     return {
         "opener_id": parts[1] if len(parts) > 1 else "",
         "cat": parts[2] if len(parts) > 2 else "",
+        "base": parts[3] if len(parts) > 3 else "",
         "claimed": claim_ts.isdigit(),
         "claim_ts": int(claim_ts) if claim_ts.isdigit() else 0,
         "claimer_id": claimer if claimer.isdigit() else "",
+        "status": parts[6].strip() if len(parts) > 6 else "",  # /progress stage
     }
+
+
+# ---- /progress: designer-set order stage, posted to the customer ----
+PROGRESS_STAGES = {
+    "started": ("Started", "Work on your order has started."),
+    "draft": ("Draft ready", "A first version is ready for you to look at."),
+    "approval": ("Awaiting your approval", "The designer needs your OK before finishing."),
+    "delivered": ("Delivered", "Your order has been delivered."),
+}
+
+
+@bot.tree.command(name="progress", description="Update the customer on where their order is (staff)")
+@app_commands.describe(stage="Where the order is now", note="Anything to add for the customer (optional)")
+@app_commands.choices(stage=[app_commands.Choice(name=v[0], value=k) for k, v in PROGRESS_STAGES.items()])
+async def progress_cmd(interaction: discord.Interaction, stage: app_commands.Choice[str], note: str = ""):
+    ch = interaction.channel
+    info = _ticket_topic_info(ch)
+    if not info:
+        return await interaction.response.send_message(embed=error_embed("Not a ticket", "Run this inside an order ticket."), ephemeral=True)
+    if not _is_ticket_staff(interaction.user, ch):
+        return await interaction.response.send_message(embed=error_embed("Staff only", "Only staff can post order updates."), ephemeral=True)
+    key = stage.value
+    label, blurb = PROGRESS_STAGES.get(key, (key, ""))
+    opener = interaction.guild.get_member(int(info["opener_id"])) if info["opener_id"].isdigit() else None
+    note = (note or "").strip()[:400]
+    mapping = {"user": opener.mention if opener else "", "status": label, "note": note,
+               "staff": interaction.user.mention}
+    design = _small_ui("ticket_progress")
+    try:
+        await interaction.response.defer()
+    except Exception:
+        pass
+    if design:
+        await send_v2_message(ch, _ui_render(design, mapping), allowed_mentions={"parse": ["users"]})
+    else:
+        ping = f"{opener.mention} " if opener else ""
+        text = f"{ping}**Order update: {label}**\n{blurb}"
+        if note:
+            text += f"\n\n{note}"
+        text += f"\n-# Posted by {interaction.user.mention}"
+        await send_v2_message(ch, [{"type": "container", "children": [{"type": "text", "text": text}]}],
+                              allowed_mentions={"parse": ["users"]})
+    # Stamp the stage on the channel (name suffix + topic slot 7). Best effort:
+    # Discord allows two renames per 10 minutes per channel.
+    try:
+        parts = (ch.topic or "").split("|")
+        while len(parts) < 6:
+            parts.append("")
+        parts = parts[:6] + [key]
+        base_name = re.sub(r"・(started|draft|approval|delivered)$", "", ch.name)
+        await ch.edit(name=f"{base_name}・{key}"[:100], topic="|".join(parts), reason=f"Order progress: {label}")
+    except Exception as e:
+        print(f"[Ticket] progress stamp failed: {e}")
+    try:
+        await interaction.delete_original_response()
+    except Exception:
+        pass
 
 
 async def _ticket_waiting_since(ch, opener_id):
@@ -8735,6 +9000,8 @@ async def ticket_staff_reply_tick():
                     _ticket_staff_nudge.pop(wid, None)
                     dirty = True
                 continue
+            if info["claimer_id"] and _away_get(guild.id, info["claimer_id"]):
+                continue  # designer is away on purpose — no reminders while they're out
             since = await _ticket_waiting_since(ch, info["opener_id"])
             state = _ticket_staff_nudge.get(wid)
             if since is None:
@@ -9250,11 +9517,49 @@ async def _do_close(channel, guild, closer, reason=""):
                                 buyer_id=opener_id)
     except Exception as e:
         print(f"[Sales] record order failed: {e}")
+    # The customer's copy: a short summary, the transcript, and (for a claimed
+    # order) a button to vouch for the designer who did it.
+    try:
+        await _ticket_close_dm(channel, guild, opener, closer, reason, transcript)
+    except Exception as e:
+        print(f"[Ticket] close DM failed: {e}")
     await asyncio.sleep(2)
     try:
         await channel.delete(reason=f"Ticket closed by {closer}")
     except Exception as e:
         print(f"[Ticket] delete failed: {e}")
+
+
+async def _ticket_close_dm(channel, guild, opener, closer, reason, transcript):
+    """DM the opener when their ticket closes: what it was, who handled it, the
+    transcript file, and a Vouch button for the designer (claimed orders)."""
+    if opener is None or getattr(opener, "bot", False):
+        return
+    info = _ticket_topic_info(channel) or {}
+    claimer_id = info.get("claimer_id") or ""
+    designer = guild.get_member(int(claimer_id)) if claimer_id else None
+    what = channel.category.name if channel.category else (info.get("cat") or "your ticket")
+    e = discord.Embed(title="Your order was closed", color=0x2b2d31, timestamp=discord.utils.utcnow())
+    lines = [f"**Server:** {guild.name}", f"**Order:** {what}"]
+    if designer:
+        lines.append(f"**Designer:** {designer.mention}")
+    lines.append(f"**Closed by:** {closer.mention if hasattr(closer, 'mention') else closer}")
+    if reason:
+        lines.append(f"**Reason:** {reason}")
+    if designer and vouch_config.get("channel_id"):
+        lines.append(f"\nHow did {designer.mention} do? Leave a vouch below, it takes ten seconds and helps the shop.")
+    e.description = "\n".join(lines)
+    e.set_footer(text="Your transcript is attached.")
+    view = None
+    if designer and vouch_config.get("channel_id") and designer.id != opener.id:
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(label=f"Vouch for {designer.display_name}"[:80], style=discord.ButtonStyle.success,
+                                        custom_id=f"vouch_open:{designer.id}:{guild.id}"))
+    file = discord.File(io.BytesIO((transcript or "").encode("utf-8")), filename=f"{channel.name}.txt")
+    kwargs = {"embed": e, "file": file}
+    if view is not None:
+        kwargs["view"] = view
+    await opener.send(**kwargs)
 
 
 async def close_ticket(interaction):
