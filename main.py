@@ -1425,6 +1425,95 @@ async def runtime_rpc(name, payload):
     return None
 
 
+# ---- Roleplay repo mirror (Network bot only) ----
+# The Oversite Roleplay codebase lives on the `roleplay` branch of this repo.
+# This job copies that branch into the 22hype22/oversite-roleplay repo whenever
+# it changes, through the GitHub API, using GITHUB_PUSH_TOKEN (a token that can
+# only write that one repo). Railway then builds the Roleplay bot from there.
+GITHUB_PUSH_TOKEN = os.getenv("GITHUB_PUSH_TOKEN", "")
+MIRROR_SRC_REPO, MIRROR_SRC_BRANCH = "22hype22/oversite-customs", "roleplay"
+MIRROR_DST_REPO, MIRROR_DST_BRANCH = "22hype22/oversite-roleplay", "main"
+_mirror_state = {"sha": "", "busy": False}
+
+
+async def _mirror_roleplay_once():
+    import base64 as _b64, io as _io, tarfile as _tar
+    ua = {"User-Agent": "oversite-mirror/1.0", "Accept": "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28"}
+    auth = dict(ua, Authorization=f"Bearer {GITHUB_PUSH_TOKEN}")
+    api = "https://api.github.com/repos"
+    async with _http() as client:
+        r = await client.get(f"{api}/{MIRROR_SRC_REPO}/branches/{MIRROR_SRC_BRANCH}", headers=ua, timeout=20)
+        if r.status_code != 200:
+            return
+        src_sha = r.json()["commit"]["sha"]
+        if src_sha == _mirror_state["sha"]:
+            return
+        # Already mirrored by an earlier process? The destination commit names its source.
+        r = await client.get(f"{api}/{MIRROR_DST_REPO}/commits/{MIRROR_DST_BRANCH}", headers=auth, timeout=20)
+        parent = None
+        if r.status_code == 200:
+            parent = r.json()["sha"]
+            if src_sha in str(r.json().get("commit", {}).get("message", "")):
+                _mirror_state["sha"] = src_sha
+                return
+        print(f"[Mirror] roleplay branch moved to {src_sha[:8]}, copying into {MIRROR_DST_REPO}")
+        t = await client.get(f"https://codeload.github.com/{MIRROR_SRC_REPO}/tar.gz/refs/heads/{MIRROR_SRC_BRANCH}",
+                             headers={"User-Agent": ua["User-Agent"]}, follow_redirects=True, timeout=120)
+        t.raise_for_status()
+        tf = _tar.open(fileobj=_io.BytesIO(t.content), mode="r:gz")
+        entries = []
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            rel = m.name.split("/", 1)[1] if "/" in m.name else m.name
+            if rel.startswith(".git/") or "__pycache__" in rel or rel.endswith(".pyc"):
+                continue
+            data = tf.extractfile(m).read()
+            b = await client.post(f"{api}/{MIRROR_DST_REPO}/git/blobs", headers=auth, timeout=120,
+                                  json={"content": _b64.b64encode(data).decode(), "encoding": "base64"})
+            if b.status_code != 201:
+                raise RuntimeError(f"blob {rel}: HTTP {b.status_code} {b.text[:120]}")
+            entries.append({"path": rel, "mode": "100755" if (m.mode & 0o111) else "100644",
+                            "type": "blob", "sha": b.json()["sha"]})
+        tr = await client.post(f"{api}/{MIRROR_DST_REPO}/git/trees", headers=auth, timeout=60, json={"tree": entries})
+        if tr.status_code != 201:
+            raise RuntimeError(f"tree: HTTP {tr.status_code} {tr.text[:120]}")
+        msg = f"Mirror oversite-customs {MIRROR_SRC_BRANCH} {src_sha[:8]}\n\nsource: {src_sha}"
+        c = await client.post(f"{api}/{MIRROR_DST_REPO}/git/commits", headers=auth, timeout=60,
+                              json={"message": msg, "tree": tr.json()["sha"], "parents": [parent] if parent else []})
+        if c.status_code != 201:
+            raise RuntimeError(f"commit: HTTP {c.status_code} {c.text[:120]}")
+        if parent:
+            u = await client.patch(f"{api}/{MIRROR_DST_REPO}/git/refs/heads/{MIRROR_DST_BRANCH}", headers=auth,
+                                   timeout=60, json={"sha": c.json()["sha"], "force": True})
+        else:
+            u = await client.post(f"{api}/{MIRROR_DST_REPO}/git/refs", headers=auth, timeout=60,
+                                  json={"ref": f"refs/heads/{MIRROR_DST_BRANCH}", "sha": c.json()["sha"]})
+        if u.status_code not in (200, 201):
+            raise RuntimeError(f"ref: HTTP {u.status_code} {u.text[:160]}")
+        _mirror_state["sha"] = src_sha
+        print(f"[Mirror] {MIRROR_DST_REPO}@{MIRROR_DST_BRANCH} <- {src_sha[:8]} ({len(entries)} files)")
+
+
+@tasks.loop(minutes=2)
+async def roleplay_mirror_tick():
+    if BOT_BASE != "customs" or not GITHUB_PUSH_TOKEN or _mirror_state["busy"]:
+        return
+    _mirror_state["busy"] = True
+    try:
+        await _mirror_roleplay_once()
+    except Exception as e:
+        print(f"[Mirror] failed: {str(e)[:200]}")
+    finally:
+        _mirror_state["busy"] = False
+
+
+@roleplay_mirror_tick.before_loop
+async def _roleplay_mirror_before():
+    await bot.wait_until_ready()
+
+
 async def _bot_secret(key):
     """A credential the owner saved under API keys & credentials (e.g.
     ROBLOX_GROUP_ID), decrypted server-side for this bot only. '' if unset."""
@@ -1575,6 +1664,9 @@ async def on_ready():
         print(f"[Away] load failed: {e}")
     if not away_tick.is_running():
         away_tick.start()
+    if BOT_BASE == "customs" and GITHUB_PUSH_TOKEN and not roleplay_mirror_tick.is_running():
+        roleplay_mirror_tick.start()
+        print("[Mirror] roleplay repo mirror armed")
     if not ticket_inactivity_tick.is_running():
         ticket_inactivity_tick.start()
     if not ticket_staff_reply_tick.is_running():
