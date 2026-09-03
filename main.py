@@ -2630,6 +2630,11 @@ async def _log_group_sale(sale):
         payment_type=f"Roblox {item_type}".strip(), amount=f"R$ {amount}",
         payment_id=f"#{sale.get('id')}", when=when,
     )
+    try:
+        await _sales_match_payment("roblox", robux=amount, created=when,
+                                   item_id=str(sale.get("itemId") or ""), ref=str(sale.get("id") or ""))
+    except Exception as e:
+        print(f"[Sales] roblox match failed: {e}")
 
 
 _sales_diag = {"top": None}
@@ -2640,7 +2645,7 @@ async def poll_group_sales():
     """Poll the Roblox group's recent sales and log any new ones. Dedups via a
     persisted seen-id cursor. On the first run it seeds the cursor WITHOUT logging
     (so old sales don't spam the channel)."""
-    if not logging_config.get("purchase_log_channel_id"):
+    if not logging_config.get("purchase_log_channel_id") and not _sales_pending_open():
         return
     res = await _robux_locker_call("sales")
     if not (isinstance(res, dict) and res.get("ok")):
@@ -2714,6 +2719,11 @@ async def _log_stripe_sale(pi):
         None, customer_name=customer,
         payment_type="Stripe", amount=amount, payment_id=f"#{pi.get('id')}", when=when,
     )
+    try:
+        await _sales_match_payment("stripe", usd=cents / 100, created=when,
+                                   channel_id=str(pi.get("channel_id") or ""), ref=str(pi.get("id") or ""))
+    except Exception as e:
+        print(f"[Sales] stripe match failed: {e}")
 
 
 @tasks.loop(seconds=30)
@@ -2721,7 +2731,7 @@ async def poll_stripe_sales():
     """Poll recent paid Stripe payments and log any new ones, deduped by a
     persisted cursor. No first-run seeding — any paid customs payment we haven't
     logged yet gets posted."""
-    if not logging_config.get("purchase_log_channel_id"):
+    if not logging_config.get("purchase_log_channel_id") and not _sales_pending_open():
         return
     res = await _payments_call("stripe_recent")
     if not (isinstance(res, dict) and res.get("ok")):
@@ -2771,9 +2781,13 @@ async def _before_poll_stripe_sales():
 bot.tree.add_command(credits_group)
 
 
-async def create_payment(method, item, price):
-    """Call the payment-create edge function (holds the Roblox cookie + Stripe key)."""
+async def create_payment(method, item, price, extra=None):
+    """Call the payment-create edge function (holds the Roblox cookie + Stripe key).
+    `extra` rides along as Stripe metadata (ticket + designer) so the paid
+    checkout can be matched back to the order."""
     payload = {"method": method, "item": item, "price": price}
+    if isinstance(extra, dict):
+        payload.update({k: v for k, v in extra.items() if v})
     try:
         async with _http() as client:
             r = await client.post(
@@ -2827,10 +2841,22 @@ class PaymentModal(discord.ui.Modal):
             price = float(str(self.price.value or "").replace("$", "").replace(",", "").strip())
         except Exception:
             price = 0
-        result = await create_payment(method, item, price)
+        # Inside a ticket, the payment belongs to that order: the claimer (or the
+        # person running /payment) is the designer, the opener is the customer.
+        info = _ticket_topic_info(interaction.channel) or {}
+        designer_id = info.get("claimer_id") or str(interaction.user.id)
+        extra = {"channel_id": str(interaction.channel.id), "designer_id": designer_id} if info else None
+        result = await create_payment(method, item, price, extra)
         if isinstance(result, dict) and result.get("ok") and result.get("url"):
+            note = ""
+            if info:
+                try:
+                    await _sales_pending_add(interaction, method, item, price, result, designer_id, info.get("opener_id") or "")
+                    note = "\n\nOnce it's paid the bot will post here and count it for the designer."
+                except Exception as e:
+                    print(f"[Sales] pending add failed: {e}")
             await interaction.followup.send(
-                embed=success_embed("Payment ready", f"**{result.get('label', 'Payment')}**\n{result['url']}"),
+                embed=success_embed("Payment ready", f"**{result.get('label', 'Payment')}**\n{result['url']}{note}"),
             )
         else:
             err = (result or {}).get("error") if isinstance(result, dict) else str(result)
@@ -7549,7 +7575,7 @@ async def vouchremove_cmd(interaction: discord.Interaction, designer: discord.Me
 # for the week / month / all time, and on the 1st of each month the bot posts a
 # recap with the top designer to the Sales Stats channel.
 sales_config = {"channel_id": "", "staff_role_ids": [], "monthly_post": True}
-sales_data = {"events": [], "last_monthly": ""}
+sales_data = {"events": [], "pending": [], "last_monthly": ""}
 _sales_loaded = False
 SALES_KEEP_DAYS = 400
 _MONEY_ROBUX_RE = re.compile(r"(?:R\$\s*([\d,]+))|(?:([\d,]+)\s*(?:R\$|robux))", re.IGNORECASE)
@@ -7588,9 +7614,11 @@ async def _sales_load():
     ev = (cfg or {}).get("events")
     if isinstance(ev, list):
         sales_data["events"] = [e for e in ev if isinstance(e, dict)]
+    pend = (cfg or {}).get("pending")
+    sales_data["pending"] = [p for p in pend if isinstance(p, dict)] if isinstance(pend, list) else []
     sales_data["last_monthly"] = str((cfg or {}).get("last_monthly") or "")
     _sales_loaded = True
-    print(f"[Sales] loaded {len(sales_data['events'])} sale event(s)")
+    print(f"[Sales] loaded {len(sales_data['events'])} sale event(s), {len(_sales_pending_open())} open payment(s)")
 
 
 async def _sales_save():
@@ -7604,15 +7632,113 @@ async def _sales_save():
         print(f"[Sales] save failed: {e}")
 
 
-async def _sales_record(guild_id, designer_id, kind, product="", robux=0, usd=0.0, buyer_id=""):
+async def _sales_record(guild_id, designer_id, kind, product="", robux=0, usd=0.0, buyer_id="", channel_id=""):
     if not _sales_loaded:
         return
     sales_data["events"].append({
         "ts": int(time.time()), "guild_id": str(guild_id or ""), "designer_id": str(designer_id or ""),
         "kind": kind, "product": str(product or "")[:80], "robux": int(robux or 0),
-        "usd": round(float(usd or 0), 2), "buyer_id": str(buyer_id or ""),
+        "usd": round(float(usd or 0), 2), "buyer_id": str(buyer_id or ""), "channel_id": str(channel_id or ""),
     })
     await _sales_save()
+
+
+# ---- /payment inside a ticket -> the paid checkout is matched back to the order ----
+PENDING_PAYMENT_DAYS = 30
+
+
+def _sales_pending_open():
+    cutoff = time.time() - PENDING_PAYMENT_DAYS * 86400
+    return [p for p in sales_data.get("pending", []) if not p.get("matched") and float(p.get("ts") or 0) >= cutoff]
+
+
+async def _sales_pending_add(interaction, method, item, price, result, designer_id, customer_id):
+    """Remember a /payment made inside a ticket so the paid sale can be tied to it."""
+    if not _sales_loaded:
+        return
+    url = str(result.get("url") or "")
+    m = re.search(r"/(?:game-pass|catalog)/(\d+)", url)
+    rec = {
+        "id": f"{int(time.time())}-{interaction.channel.id}",
+        "ts": int(time.time()),
+        "guild_id": str(interaction.guild.id) if interaction.guild else "",
+        "channel_id": str(interaction.channel.id),
+        "designer_id": str(designer_id or ""),
+        "customer_id": str(customer_id or ""),
+        "method": "stripe" if method == "stripe" else "roblox",
+        "label": "Stripe" if method == "stripe" else ("Gamepass" if method == "gamepass" else "Shirt"),
+        "usd": round(float(price), 2) if method == "stripe" else 0.0,
+        "robux": int(round(float(price))) if method != "stripe" else 0,
+        "item_id": m.group(1) if m else "",
+        "matched": False,
+    }
+    sales_data.setdefault("pending", []).append(rec)
+    # Keep the list short: drop matched or stale entries.
+    cutoff = time.time() - PENDING_PAYMENT_DAYS * 86400
+    sales_data["pending"] = [p for p in sales_data["pending"] if not p.get("matched") and float(p.get("ts") or 0) >= cutoff][-200:]
+    await _sales_save()
+
+
+async def _ticket_paid_msg(ch, customer, designer, amount_text, label):
+    mapping = {"user": customer.mention if customer else "", "designer": designer.mention if designer else "",
+               "amount": amount_text, "method": label}
+    design = _small_ui("ticket_payment_received")
+    if design:
+        await send_v2_message(ch, _ui_render(design, mapping), allowed_mentions={"parse": ["users"]})
+        return
+    who = " ".join(x.mention for x in (customer, designer) if x)
+    text = f"{who} **Payment received**\n{amount_text} through {label}. This order is marked paid."
+    await send_v2_message(ch, [{"type": "container", "children": [{"type": "text", "text": text.strip()}]}],
+                          allowed_mentions={"parse": ["users"]})
+
+
+async def _sales_match_payment(method, usd=0.0, robux=0, created=None, channel_id="", item_id="", ref=""):
+    """A paid sale just came through a poller. Find the /payment it belongs to,
+    count it for that designer, and tell the ticket. Stripe payments carry the
+    ticket id in their metadata when the backend supports it; otherwise the
+    match is by amount, oldest open payment first. Roblox sales match on the
+    gamepass/shirt id, then by amount (Roblox pays out 70 percent)."""
+    if not _sales_loaded:
+        return False
+    when = float(created or time.time())
+    best = None
+    for p in _sales_pending_open():
+        if p.get("method") != method:
+            continue
+        if when < float(p.get("ts") or 0) - 120:
+            continue  # paid before this payment was created: not this one
+        if channel_id and str(p.get("channel_id")) == str(channel_id):
+            best = p
+            break
+        if method == "stripe" and not channel_id and abs(float(p.get("usd") or 0) - float(usd or 0)) < 0.005:
+            best = best or p
+        elif method == "roblox":
+            if item_id and p.get("item_id") and str(p["item_id"]) == str(item_id):
+                best = p
+                break
+            gross = int(p.get("robux") or 0)
+            if not p.get("item_id") and int(robux or 0) in (gross, int(round(gross * 0.7))):
+                best = best or p
+    if not best:
+        return False
+    best["matched"] = True
+    best["ref"] = ref
+    guild = bot.get_guild(int(best["guild_id"])) if str(best.get("guild_id")).isdigit() else None
+    ch = guild.get_channel(int(best["channel_id"])) if (guild and str(best.get("channel_id")).isdigit()) else None
+    product = ch.category.name if (ch and ch.category) else "Order"
+    await _sales_record(best.get("guild_id"), best.get("designer_id"), "order", product=product,
+                        robux=best.get("robux") or 0, usd=best.get("usd") or 0.0,
+                        buyer_id=best.get("customer_id"), channel_id=best.get("channel_id"))
+    if ch:
+        customer = guild.get_member(int(best["customer_id"])) if str(best.get("customer_id")).isdigit() else None
+        designer = guild.get_member(int(best["designer_id"])) if str(best.get("designer_id")).isdigit() else None
+        amount_text = f"${float(best.get('usd') or 0):,.2f}" if method == "stripe" else f"R$ {int(best.get('robux') or 0):,}"
+        try:
+            await _ticket_paid_msg(ch, customer, designer, amount_text, best.get("label") or "payment")
+        except Exception as e:
+            print(f"[Sales] paid message failed: {e}")
+    print(f"[Sales] matched {method} payment {ref} to ticket {best.get('channel_id')} for {best.get('designer_id')}")
+    return True
 
 
 def _sales_summary(guild_id, since_ts):
@@ -9512,10 +9638,11 @@ async def _do_close(channel, guild, closer, reason=""):
     # claimer (Sales Stats). Auto-closes for inactivity don't count.
     try:
         info = _ticket_topic_info(channel) or {}
-        if info.get("claimer_id") and not str(reason or "").lower().startswith("auto-closed"):
+        already_paid = any(str(e.get("channel_id")) == str(channel.id) for e in sales_data.get("events", []))
+        if info.get("claimer_id") and not already_paid and not str(reason or "").lower().startswith("auto-closed"):
             await _sales_record(guild.id, info["claimer_id"], "order",
                                 product=channel.category.name if channel.category else category,
-                                buyer_id=opener_id)
+                                buyer_id=opener_id, channel_id=channel.id)
     except Exception as e:
         print(f"[Sales] record order failed: {e}")
     # The customer's copy: a short summary, the transcript, and (for a claimed
