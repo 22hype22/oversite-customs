@@ -14761,15 +14761,71 @@ async def _pkg_flow_devproduct(interaction, title, price_field, pkg_msg_id, deli
 
 async def _pkg_claim_devproduct(interaction, pkg_msg_id="", deliver_to="", perk=""):
     """Claim for a dev-product purchase. Dev products can't be ownership-checked
-    from outside the game, so this is trust-based (like Stripe): DM the receipt;
-    the sale shows in the group's Robux transaction history for auditing."""
+    from outside the game, so the purchase is confirmed from the group's own
+    Robux transaction log: a sale by the buyer's linked Roblox account, for a
+    product with this package's name, at the price less Roblox's 30 percent
+    cut, within the last two hours. No sale, no receipt."""
     await interaction.response.defer(ephemeral=True, thinking=True)
-    acct = await _pkg_lookup_roblox(interaction.user.id) or {"roblox_username": interaction.user.display_name, "roblox_id": ""}
+    help_to = _pkg_help_mention(interaction.guild)
+    acct = await _pkg_lookup_roblox(interaction.user.id)
+    if not acct or not acct.get("roblox_id"):
+        await interaction.followup.send(embed=error_embed("Verify first", f"Link your Roblox account first, then claim. {help_to}"), ephemeral=True)
+        return
     rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
-    robux = _pkg_parse_robux((rec or {}).get("price_field") or "")
+    rec = rec or {}
+    robux = _pkg_parse_robux(rec.get("price_field") or "")
+    product = str(rec.get("product") or rec.get("title") or "").strip().lower()
+    sale = await _pkg_find_devproduct_sale(str(acct["roblox_id"]), product, robux)
+    if sale is None:
+        await interaction.followup.send(embed=error_embed(
+            "Couldn't verify", f"Roblox didn't answer, try again in a moment or open a ticket in {help_to}."), ephemeral=True)
+        return
+    if not sale:
+        await interaction.followup.send(embed=error_embed(
+            "No purchase found",
+            "I don't see a purchase of this product on your Roblox account in the group's sales yet. "
+            "Buy it with the link, give Roblox a minute, then click Claim Package again. "
+            f"If you did buy it, open a ticket in {help_to} and we will match it by hand."), ephemeral=True)
+        return
     price_str = f"R$ {robux}" if robux else ""
     dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, None, deliver_to, perk_hint=perk)
     await interaction.followup.send(embed=success_embed("Claimed", _pkg_claimed_msg(dm_ok, target, interaction.user)), ephemeral=True)
+
+
+async def _pkg_find_devproduct_sale(roblox_id, product_name, robux):
+    """The group's recent sale that matches this buyer and product, or False when
+    none does, or None when Roblox could not be read. The log records what the
+    group received, the price less Roblox's cut, so the amount is checked
+    against that with a little rounding room."""
+    res = None
+    for _attempt in range(3):
+        res = await _robux_locker_call("sales", limit=100)
+        if isinstance(res, dict) and res.get("ok"):
+            break
+        if _attempt < 2:
+            await asyncio.sleep(1.5 * (_attempt + 1))
+    if not (isinstance(res, dict) and res.get("ok")):
+        return None
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)
+    net = float(robux or 0) * 0.7
+    for sale in res.get("sales") or []:
+        if str(sale.get("buyerId") or "") != str(roblox_id):
+            continue
+        name = str(sale.get("itemName") or "").strip().lower()
+        if product_name and name != product_name:
+            continue
+        amount = float(sale.get("amount") or 0)
+        if robux and not (amount == float(robux) or (int(net) - 1) <= amount <= (int(net) + 2)):
+            continue
+        created = str(sale.get("created") or "")
+        try:
+            when = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if when < cutoff:
+            continue
+        return sale
+    return False
 
 
 async def _pkg_flow_gamepass(interaction, title, pkg_msg_id, deliver_to, perk=""):
