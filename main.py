@@ -13231,10 +13231,17 @@ def _pkg_receipt_embed(roblox_username, roblox_id, price_str, product, product_u
     return e
 
 
-async def _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, product_url, deliver_to=None, perk_hint=""):
+async def _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, product_url, deliver_to=None, perk_hint="", proof=None):
     """DM the Purchase Receipt (Download / Leave a Review / View Package Thread)
     to the buyer, or to `deliver_to` (a Discord user id) for a gift. Returns
-    (sent_ok, target_user_or_None)."""
+    (sent_ok, target_user_or_None).
+
+    `proof` is the payment record the claim was checked against: a sale from
+    the group's Robux transaction log or a paid Stripe session. Without it no
+    receipt is sent, whoever calls. A receipt is never sent on trust."""
+    if not isinstance(proof, dict) or not proof:
+        raise ValueError("receipt refused: no proof of purchase")
+    print(f"[Packages] receipt for {pkg_msg_id} to {deliver_to or interaction.user.id}: proof {proof.get('kind')} {proof.get('id') or proof.get('created')}")
     target = interaction.user
     if deliver_to and str(deliver_to) != str(interaction.user.id):
         try:
@@ -14788,15 +14795,23 @@ async def _pkg_claim_devproduct(interaction, pkg_msg_id="", deliver_to="", perk=
             f"If you did buy it, open a ticket in {help_to} and we will match it by hand."), ephemeral=True)
         return
     price_str = f"R$ {robux}" if robux else ""
-    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, None, deliver_to, perk_hint=perk)
+    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, None, deliver_to, perk_hint=perk, proof=sale)
     await interaction.followup.send(embed=success_embed("Claimed", _pkg_claimed_msg(dm_ok, target, interaction.user)), ephemeral=True)
 
 
 async def _pkg_find_devproduct_sale(roblox_id, product_name, robux):
-    """The group's recent sale that matches this buyer and product, or False when
-    none does, or None when Roblox could not be read. The log records what the
-    group received, the price less Roblox's cut, so the amount is checked
-    against that with a little rounding room."""
+    return await _pkg_find_sale(roblox_id, robux, item_name=product_name)
+
+
+async def _pkg_find_sale(roblox_id, robux, item_id="", item_name="", item_type=""):
+    """The group's recent sale that matches this buyer and item, or False when
+    none does, or None when Roblox could not be read. Matching is on the buyer's
+    Roblox id, the item (id, or name, or type), the amount and the time: the
+    log records what the group received, the price less Roblox's 30 percent
+    cut, so the amount is checked against that with a little rounding room,
+    and the sale must be from the last two hours. Owning an item is not
+    enough: the payment shirts and passes are shared between orders, so an
+    old purchase must never pay for a new package."""
     res = None
     for _attempt in range(3):
         res = await _robux_locker_call("sales", limit=100)
@@ -14811,8 +14826,12 @@ async def _pkg_find_devproduct_sale(roblox_id, product_name, robux):
     for sale in res.get("sales") or []:
         if str(sale.get("buyerId") or "") != str(roblox_id):
             continue
+        if item_id and str(sale.get("itemId") or "") != str(item_id):
+            continue
         name = str(sale.get("itemName") or "").strip().lower()
-        if product_name and name != product_name:
+        if item_name and name != str(item_name).strip().lower():
+            continue
+        if item_type and str(sale.get("itemType") or "").replace(" ", "").lower() != item_type.replace(" ", "").lower():
             continue
         amount = float(sale.get("amount") or 0)
         if robux and not (amount == float(robux) or (int(net) - 1) <= amount <= (int(net) + 2)):
@@ -14824,6 +14843,8 @@ async def _pkg_find_devproduct_sale(roblox_id, product_name, robux):
             continue
         if when < cutoff:
             continue
+        sale = dict(sale)
+        sale["kind"] = "robux_sale"
         return sale
     return False
 
@@ -14860,7 +14881,7 @@ async def _pkg_flow_stripe(interaction, price_field, pkg_msg_id, deliver_to, per
         await interaction.followup.send(embed=error_embed(
             "Couldn't read the price", f"I couldn't find a $ amount on this package. Open a ticket in {help_to}."), ephemeral=True)
         return
-    res = await _payments_call("", method="stripe", price=dollars)
+    res = await _payments_call("", method="stripe", price=dollars, discord_id=str(interaction.user.id), pkg_msg_id=str(pkg_msg_id or ""))
     if not (isinstance(res, dict) and res.get("ok") and res.get("url")):
         err = (res or {}).get("error") if isinstance(res, dict) else None
         await interaction.followup.send(embed=error_embed(
@@ -14919,83 +14940,115 @@ def _pkg_claimed_msg(dm_ok, target, buyer):
 
 
 async def _pkg_claim_stripe(interaction, pkg_msg_id="", deliver_to="", perk=""):
-    """Claim for a Stripe purchase — Stripe can't be tied to a Roblox account, so
-    we simply DM the receipt (the purchase-log poller records the sale)."""
+    """Claim for a Stripe purchase: Stripe must show a paid checkout, stamped
+    with this buyer's Discord id, for this package or this amount, in the last
+    two hours. No payment, no receipt."""
     await interaction.response.defer(ephemeral=True, thinking=True)
+    help_to = _pkg_help_mention(interaction.guild)
     acct = await _pkg_lookup_roblox(interaction.user.id) or {"roblox_username": interaction.user.display_name, "roblox_id": ""}
     rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
     usd = _pkg_parse_usd((rec or {}).get("price_field") or "")
+    payment = await _pkg_find_stripe_payment(str(interaction.user.id), str(pkg_msg_id or ""), usd)
+    if payment is None:
+        await interaction.followup.send(embed=error_embed("Couldn't verify", f"Stripe didn't answer, try again in a moment or open a ticket in {help_to}."), ephemeral=True)
+        return
+    if not payment:
+        await interaction.followup.send(embed=error_embed(
+            "No payment found",
+            "I don't see a completed Stripe payment from you for this package yet. Pay with the link, give it a minute, "
+            f"then click Claim Package again. If you did pay, open a ticket in {help_to} and we will match it by hand."), ephemeral=True)
+        return
     price_str = f"${usd:.2f}" if usd else ""
-    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, None, deliver_to, perk_hint=perk)
+    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, None, deliver_to, perk_hint=perk, proof=payment)
     await interaction.followup.send(embed=success_embed("Claimed", _pkg_claimed_msg(dm_ok, target, interaction.user)), ephemeral=True)
 
 
+async def _pkg_find_stripe_payment(discord_id, pkg_msg_id, usd):
+    """A paid Stripe checkout by this Discord user for this package (or this
+    amount) in the last two hours, or False, or None when Stripe could not be
+    read. Links made before the stamp existed carry no Discord id and never
+    match; those buyers go through a ticket."""
+    res = None
+    for _attempt in range(3):
+        res = await _payments_call("stripe_recent", limit=100)
+        if isinstance(res, dict) and res.get("ok"):
+            break
+        if _attempt < 2:
+            await asyncio.sleep(1.5 * (_attempt + 1))
+    if not (isinstance(res, dict) and res.get("ok")):
+        return None
+    cutoff = datetime.datetime.now(datetime.timezone.utc).timestamp() - 2 * 3600
+    cents = int(round(float(usd or 0) * 100))
+    for sale in res.get("sales") or []:
+        if str(sale.get("discord_id") or "") != str(discord_id):
+            continue
+        if float(sale.get("created") or 0) < cutoff:
+            continue
+        same_pkg = pkg_msg_id and str(sale.get("pkg_msg_id") or "") == str(pkg_msg_id)
+        same_amount = cents and int(sale.get("amount") or 0) == cents
+        if not (same_pkg or same_amount):
+            continue
+        sale = dict(sale)
+        sale["kind"] = "stripe"
+        return sale
+    return False
+
+
 async def _pkg_claim_shirt(interaction, asset_id, pkg_msg_id="", deliver_to="", perk=""):
-    """Claim for a Roblox Select shirt: confirm the buyer owns the asset, DM them."""
+    """Claim for a Roblox Select shirt: the group's sales log must show this
+    buyer bought this shirt, at this package's price, in the last two hours.
+    Owning the shirt is not enough, the shirts are shared between orders."""
     await interaction.response.defer(ephemeral=True, thinking=True)
     acct = await _pkg_lookup_roblox(interaction.user.id)
     help_to = _pkg_help_mention(interaction.guild)
-    if not acct:
+    if not acct or not acct.get("roblox_id"):
         await interaction.followup.send(embed=error_embed("Verify first", f"Link your Roblox account first, then claim. {help_to}"), ephemeral=True)
         return
     if not asset_id:
         await interaction.followup.send(embed=error_embed("Couldn't verify", f"I lost track of which shirt this was, open a ticket in {help_to}."), ephemeral=True)
         return
-    res = None
-    for _attempt in range(3):  # the backend 500s in bursts; retry before failing the buyer
-        res = await _robux_locker_call("owns_asset", user_id=acct["roblox_id"], asset_id=str(asset_id))
-        if isinstance(res, dict) and res.get("ok"):
-            break
-        if _attempt < 2:
-            await asyncio.sleep(1.5 * (_attempt + 1))
-    if not (isinstance(res, dict) and res.get("ok")):
-        await interaction.followup.send(embed=error_embed("Couldn't verify", f"Roblox didn't answer, try again shortly or open a ticket in {help_to}."), ephemeral=True)
-        return
-    if res.get("hidden"):
-        await interaction.followup.send(embed=error_embed(
-            "Inventory is private", f"Make your Roblox inventory **public** so I can confirm the purchase, then click **Claim Package** again, or open a ticket in {help_to}."), ephemeral=True)
-        return
-    if not res.get("owned"):
-        await interaction.followup.send(embed=error_embed(
-            "Not owned yet", "I don't see that shirt on your account yet. Buy it with the link, then click **Claim Package** again."), ephemeral=True)
-        return
     rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
     robux = _pkg_parse_robux((rec or {}).get("price_field") or "")
+    sale = await _pkg_find_sale(str(acct["roblox_id"]), robux, item_id=str(asset_id))
+    if sale is None:
+        await interaction.followup.send(embed=error_embed("Couldn't verify", f"Roblox didn't answer, try again shortly or open a ticket in {help_to}."), ephemeral=True)
+        return
+    if not sale:
+        await interaction.followup.send(embed=error_embed(
+            "No purchase found",
+            "I don't see a purchase of that shirt on your account in the group's sales yet. Buy it with the link, give Roblox a minute, "
+            f"then click Claim Package again. If you did buy it, open a ticket in {help_to} and we will match it by hand."), ephemeral=True)
+        return
     price_str = f"R$ {robux}" if robux else ""
-    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, f"https://www.roblox.com/catalog/{asset_id}", deliver_to, perk_hint=perk)
+    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, f"https://www.roblox.com/catalog/{asset_id}", deliver_to, perk_hint=perk, proof=sale)
     await interaction.followup.send(embed=success_embed("Claimed", _pkg_claimed_msg(dm_ok, target, interaction.user)), ephemeral=True)
 
 
 async def _pkg_claim_gamepass(interaction, gamepass_id, pkg_msg_id="", deliver_to="", perk=""):
-    """Claim button for a gamepass: confirm the buyer now owns it, then DM them."""
+    """Claim for a game pass: the group's sales log must show this buyer bought
+    a pass at this package's price in the last two hours. Roblox logs a pass
+    sale under an id of its own, so the match is on buyer, type, amount and
+    time. Owning the pass is not enough, the passes are shared between orders."""
     await interaction.response.defer(ephemeral=True, thinking=True)
     acct = await _pkg_lookup_roblox(interaction.user.id)
     help_to = _pkg_help_mention(interaction.guild)
-    if not acct:
+    if not acct or not acct.get("roblox_id"):
         await interaction.followup.send(embed=error_embed("Verify first", f"Link your Roblox account first, then claim. {help_to}"), ephemeral=True)
-        return
-    res = None
-    for _attempt in range(3):  # the backend 500s in bursts; retry before failing the buyer
-        res = await _robux_locker_call("owns_gamepass", user_id=acct["roblox_id"], gamepass_id=str(gamepass_id))
-        if isinstance(res, dict) and res.get("ok"):
-            break
-        if _attempt < 2:
-            await asyncio.sleep(1.5 * (_attempt + 1))
-    if not (isinstance(res, dict) and res.get("ok")):
-        await interaction.followup.send(embed=error_embed("Couldn't verify", f"Roblox didn't answer, try again in a moment or open a ticket in {help_to}."), ephemeral=True)
-        return
-    if res.get("hidden"):
-        await interaction.followup.send(embed=error_embed(
-            "Inventory is private", f"Make your Roblox inventory **public** so I can confirm the purchase, then click **Claim Package** again, or open a ticket in {help_to}."), ephemeral=True)
-        return
-    if not res.get("owned"):
-        await interaction.followup.send(embed=error_embed(
-            "Not owned yet", "I don't see that gamepass on your account yet. Buy it with the link, then click **Claim Package** again."), ephemeral=True)
         return
     rec = await _pkg_files_get(pkg_msg_id) if pkg_msg_id else {}
     robux = _pkg_parse_robux((rec or {}).get("price_field") or "")
+    sale = await _pkg_find_sale(str(acct["roblox_id"]), robux, item_type="GamePass")
+    if sale is None:
+        await interaction.followup.send(embed=error_embed("Couldn't verify", f"Roblox didn't answer, try again in a moment or open a ticket in {help_to}."), ephemeral=True)
+        return
+    if not sale:
+        await interaction.followup.send(embed=error_embed(
+            "No purchase found",
+            "I don't see a purchase of that gamepass on your account in the group's sales yet. Buy it with the link, give Roblox a minute, "
+            f"then click Claim Package again. If you did buy it, open a ticket in {help_to} and we will match it by hand."), ephemeral=True)
+        return
     price_str = f"R$ {robux}" if robux else ""
-    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, f"https://www.roblox.com/game-pass/{gamepass_id}", deliver_to, perk_hint=perk)
+    dm_ok, target = await _pkg_deliver_receipt(interaction, pkg_msg_id, acct, price_str, f"https://www.roblox.com/game-pass/{gamepass_id}", deliver_to, perk_hint=perk, proof=sale)
     await interaction.followup.send(embed=success_embed("Claimed", _pkg_claimed_msg(dm_ok, target, interaction.user)), ephemeral=True)
 
 
