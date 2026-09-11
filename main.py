@@ -5201,7 +5201,8 @@ async def _rolelog_expire(log_id):
 
 async def _rolelog_trigger(guild, member, kind, roles):
     """Post the log immediately (Reason: N/A), then DM the person who made the
-    change a copy + a Reason button that fills it in (editable for 10 minutes)."""
+    change a copy + a Reason button that fills it in (editable for 10 minutes).
+    The button is only ever sent in that DM: the channel keeps the log alone."""
     meta = _ROLELOG[kind]
     ch = await resolve_channel(form_log_configs.get(kind, {}).get("channel_id"))
     if not ch:
@@ -5252,14 +5253,11 @@ async def _rolelog_trigger(guild, member, kind, roles):
         except Exception as e:
             print(f"[RoleLog] DM to issuer failed: {e}")
     if not dmed:
-        # Couldn't DM (unknown remover or their DMs are closed) — put the button
-        # in the channel so someone can still add the reason.
-        try:
-            who = issuer.mention if issuer else "A staff member"
-            await ch.send(f"{who}, add the reason (10 min):", view=view,
-                          allowed_mentions=discord.AllowedMentions(users=[issuer] if issuer else False, roles=False))
-        except Exception as e:
-            print(f"[RoleLog] channel prompt failed: {e}")
+        # The reason is asked for in DMs only. When there is nobody to ask —
+        # the change has no identifiable author, or their DMs are closed — the
+        # log simply keeps Reason: N/A; nothing is posted in the channel.
+        who = f"{issuer} ({issuer.id})" if issuer else "unknown author"
+        print(f"[RoleLog] no reason prompt sent for {kind} log {log_id}: {who}")
 
 
 class _RoleLogReasonModal(discord.ui.Modal):
