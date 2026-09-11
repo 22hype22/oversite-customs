@@ -5165,6 +5165,24 @@ async def _find_role_changer(guild, target_id):
 _ROLELOG_EDIT_WINDOW = 600  # seconds the reason can still be added / changed
 
 
+async def _discord_retry(make_call, tries=3, label="call"):
+    """Run an awaitable-producing callable, retrying when the connection to
+    Discord itself fails (a dropped or refused TLS connection), so a single
+    bad connection from the host does not surface as an error to the person
+    clicking a button. Anything else raises straight through."""
+    delay = 0.35
+    for attempt in range(1, tries + 1):
+        try:
+            return await make_call()
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+            if attempt == tries:
+                print(f"[RoleLog] {label} failed after {tries} attempts: {e}")
+                raise
+            print(f"[RoleLog] {label} attempt {attempt} failed, retrying: {e}")
+            await asyncio.sleep(delay)
+            delay *= 2
+
+
 async def _rolelog_render(kind, target_txt, logger_txt, roles_text, reason, date_txt):
     """Return (v2_components_or_None, plain_text) for the log, rendered from the
     dashboard V2 design if one is set."""
@@ -5278,7 +5296,7 @@ class _RoleLogReasonModal(discord.ui.Modal):
                 embed=error_embed("Acknowledgement required", _ROLELOG[self._kind]["ack"]), ephemeral=True)
             return
         reason = (self.reason.value or "").strip() or "No reason provided."
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await _discord_retry(lambda: interaction.response.defer(ephemeral=True, thinking=True), label="defer reason")
         await _rolelog_apply_reason(interaction, self._log_id, reason)
 
 
@@ -5296,20 +5314,28 @@ async def _rolelog_apply_reason(interaction, log_id, reason):
     final, txt = await _rolelog_render(kind, pend["target_txt"], logger_txt, pend["roles_text"], reason, pend["date_txt"])
     ok = False
     if ch:
-        if final:
-            ok = await edit_v2_message(ch, log_id, final, allowed_mentions={"parse": []})
-        else:
-            try:
-                m = await ch.fetch_message(int(log_id))
-                await m.edit(content=txt)
-                ok = True
-            except Exception as e:
-                print(f"[RoleLog] edit failed: {e}")
+        for attempt in range(3):
+            if final:
+                ok = await edit_v2_message(ch, log_id, final, allowed_mentions={"parse": []})
+            else:
+                try:
+                    m = await ch.fetch_message(int(log_id))
+                    await m.edit(content=txt)
+                    ok = True
+                except Exception as e:
+                    print(f"[RoleLog] edit failed: {e}")
+            if ok:
+                break
+            await asyncio.sleep(0.35 * (attempt + 1))
     _pending_rolelog.pop(log_id, None)  # reason set — lock it
     if ok:
-        await interaction.followup.send(embed=success_embed("Reason added", "The log has been updated."), ephemeral=True)
+        embed = success_embed("Reason added", "The log has been updated.")
     else:
-        await interaction.followup.send(embed=error_embed("Couldn't update", "The log couldn't be edited."), ephemeral=True)
+        embed = error_embed("Couldn't update", "The log couldn't be edited.")
+    try:
+        await _discord_retry(lambda: interaction.followup.send(embed=embed, ephemeral=True), label="reason reply")
+    except Exception as e:
+        print(f"[RoleLog] reply failed: {e}")
 
 
 async def _rolelog_open_reason(interaction, cid):
@@ -5330,9 +5356,15 @@ async def _rolelog_open_reason(interaction, cid):
             ephemeral=True)
         return
     try:
-        await interaction.response.send_modal(_RoleLogReasonModal(log_id, pend["kind"]))
+        await _discord_retry(lambda: interaction.response.send_modal(_RoleLogReasonModal(log_id, pend["kind"])),
+                             label="open reason form")
     except Exception as e:
-        await interaction.response.send_message(embed=error_embed("Couldn't open form", str(e)[:150]), ephemeral=True)
+        if interaction.response.is_done():
+            return
+        try:
+            await interaction.response.send_message(embed=error_embed("Couldn't open form", str(e)[:150]), ephemeral=True)
+        except Exception as e2:
+            print(f"[RoleLog] could not report form error: {e2}")
 
 
 def _rolelog_groups(kind):
