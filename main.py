@@ -12157,8 +12157,9 @@ async def apply_config(feature, cfg, post_panel=False):
         edited_panel = next((p for p in panels if p["channel_id"] == edited_ch), (panels[0] if panels else {"components": []}))
         marketplace_config["panel_channel_id"] = edited_ch
         marketplace_config["panel_components"] = edited_panel.get("components", [])
-        # The ad post channel + interval are configured here (in Marketplace).
-        if "ad_post_channel_id" in cfg:
+        # The ad channel now lives in the Advertisements block; the Marketplace
+        # value only fills in while that block has none. The interval stays here.
+        if cfg.get("ad_post_channel_id") and not ads_config.get("post_channel_id"):
             ads_config["post_channel_id"] = str(cfg.get("ad_post_channel_id") or "")
         if cfg.get("ad_interval_minutes"):
             try:
@@ -12367,7 +12368,9 @@ async def apply_config(feature, cfg, post_panel=False):
         ads_config["enabled"] = bool(cfg.get("enabled", True))
         ads_config["approval_channel_id"] = str(cfg.get("approval_channel_id") or "")
         ads_config["staff_role_ids"] = [str(x) for x in (cfg.get("staff_role_ids") or []) if x]
-        # NOTE: post channel + interval are set in the Marketplace block.
+        # The ad channel is set here; the post interval stays in the Marketplace block.
+        if cfg.get("post_channel_id"):
+            ads_config["post_channel_id"] = str(cfg["post_channel_id"])
         perks = cfg.get("perks")
         if isinstance(perks, dict):
             for k in ADS_PERK_KEYS:
@@ -13832,8 +13835,11 @@ async def _ads_submit(interaction, ad):
         view.add_item(discord.ui.Button(label="Approve", style=discord.ButtonStyle.success, custom_id=f"ad_ok:{ad_id}"))
         view.add_item(discord.ui.Button(label="Deny", style=discord.ButtonStyle.danger, custom_id=f"ad_no:{ad_id}"))
         view.add_item(discord.ui.Button(label="Delay", style=discord.ButtonStyle.secondary, custom_id=f"ad_delay:{ad_id}"))
+        # Ping the ad staff roles so somebody sees it waiting.
+        staff_ping = " ".join(f"<@&{r}>" for r in (ads_config.get("staff_role_ids") or [])) or None
         try:
-            await appr.send(embed=info_embed("Ad awaiting approval", _ads_summary(ad)), view=view)
+            await appr.send(content=staff_ping, embed=info_embed("Ad awaiting approval", _ads_summary(ad)), view=view,
+                            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False))
         except Exception as e:
             print(f"[Ads] approval send failed: {e}")
     await interaction.response.send_message(
