@@ -8976,11 +8976,12 @@ _ticket_ac_hold = set()
 _ticket_ac_loaded = False
 # Staff-side reminders on CLAIMED tickets: channel_id -> {"stage": 0|1|2,
 # "since": unix ts of the customer's oldest unanswered message}. Stage 1 pings
-# the claimer after 12h with no staff reply; stage 2 pings the ticket's staff
-# roles plus the claimer at 24h. Cleared as soon as staff reply. Persisted.
+# the claimer after 48h with no staff reply; stage 2 pings the ticket's staff
+# roles plus the claimer a day later. Cleared as soon as staff reply, and never
+# sent once the order is marked completed. Persisted.
 _ticket_staff_nudge = {}
-STAFF_NUDGE_HOURS = 12
-STAFF_ESCALATE_HOURS = 24
+STAFF_NUDGE_HOURS = 48
+STAFF_ESCALATE_HOURS = 72
 # Queue position updates: channel_id -> last position we told the customer
 # (1 = next up). Only unclaimed order tickets are "in line". Persisted so a
 # redeploy doesn't re-announce positions it already reported.
@@ -9460,7 +9461,8 @@ async def ticket_staff_reply_tick():
                 continue
             wid = str(ch.id)
             live.add(wid)
-            if not info["claimed"] or wid in _ticket_ac_hold:
+            # Unclaimed, on hold, or the order is done: nothing to chase.
+            if not info["claimed"] or wid in _ticket_ac_hold or info.get("status") == "completed":
                 if wid in _ticket_staff_nudge:
                     _ticket_staff_nudge.pop(wid, None)
                     dirty = True
