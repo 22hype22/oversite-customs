@@ -13777,7 +13777,9 @@ async def _ads_post(guild, ad):
         seconds = int(ad.get("seconds") or 86400)
         length = ad.get("length") or ""
         design = _ads_render(ads_config.get("giveaway_design") or [], _ads_tokens(ad, advertiser, ping)) or None
-        if ping:
+        # With a design, the ping only appears where the design places {ping}.
+        # The separate ping message is for the default layout alone.
+        if ping and not design:
             try:
                 await ch.send(ping, allowed_mentions=discord.AllowedMentions(everyone=True, users=True, roles=True))
             except Exception:
@@ -13787,7 +13789,8 @@ async def _ads_post(guild, ad):
     design = _ads_render(ads_config.get("regular_design") or [], _ads_tokens(ad, advertiser, ping))
     if design:
         try:
-            await send_v2_message(ch, design, content=(ping or None), allowed_mentions=mentions)
+            # Same here: the design decides whether and where the ping shows.
+            await send_v2_message(ch, design, allowed_mentions=mentions)
             return True
         except Exception as e:
             print(f"[Ads] regular post failed: {e}")
