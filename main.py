@@ -2398,12 +2398,13 @@ def _ads_queue_entries(guild):
 
 def _ads_queue_line(a, lane, ts, n):
     star = "Bypass · " if lane == "bypass" else ""
-    if a.get("type") == "giveaway":
-        title = f"Giveaway: {a.get('prize') or 'Giveaway'}"
-    else:
-        name = a.get("server_name") or "Server"
-        link = a.get("server_link") or ""
-        title = f"[{name}]({link})" if link else name
+    # Every entry leads with the advertised server's name, giveaways included.
+    # The prize only stands in when the invite gave no server name.
+    name = a.get("server_name") or ""
+    if not name:
+        name = f"Giveaway: {a.get('prize') or 'Giveaway'}" if a.get("type") == "giveaway" else "Server"
+    link = a.get("server_link") or ""
+    title = f"[{name}]({link})" if link else name
     sched = " · scheduled" if int(a.get("not_before") or 0) > int(time.time()) else ""
     return f"{star}**{n}.** {title}\nUser: <@{a.get('user_id')}>\nDate: <t:{ts}:f>{sched}"
 
@@ -13542,6 +13543,26 @@ def _ads_summary(ad):
     return "\n".join(lines)
 
 
+def _ads_tokens(ad, advertiser, ping):
+    """Every token an ad design can use, filled from the ad itself. The
+    advertised server's name and link come from the invite the member gave,
+    so {server}, {server link} and their {ad server} / {ad link} twins always
+    mean the advertiser's server in these designs, never this one. Filled
+    before the general renderer runs, which is what used to swap {server}
+    for this server's name."""
+    link = ad.get("server_link") or ""
+    name = ad.get("server_name") or link or "their server"
+    t = {
+        "advertiser": advertiser, "ping": ping,
+        "server_link": link, "server link": link, "ad_link": link, "ad link": link,
+        "server": name, "server_name": name, "server name": name, "ad_server": name, "ad server": name,
+    }
+    if ad.get("type") == "giveaway":
+        t.update({"prize": ad.get("prize") or "a prize", "winners": int(ad.get("winners") or 1),
+                  "duration": ad.get("length") or ""})
+    return t
+
+
 def _ads_render(design, tokens):
     """Deep-fill {tokens} in a V2 design tree so it's ready for send_v2_message."""
     if not design:
@@ -13590,14 +13611,9 @@ async def _ad_invite_warn_dm(guild, ad, position, ts):
     advertiser = f"<@{uid}>"
     # 1) Preview of the ad (no ping in DMs).
     if ad.get("type") == "giveaway":
-        design = _ads_render(ads_config.get("giveaway_design") or [],
-                             {"advertiser": advertiser, "prize": ad.get("prize") or "",
-                              "winners": ad.get("winners") or 1, "duration": ad.get("length") or "",
-                              "ping": "", "server_link": ad.get("server_link") or "",
-                              "server_name": ad.get("server_name") or ""})
+        design = _ads_render(ads_config.get("giveaway_design") or [], _ads_tokens(ad, advertiser, ""))
     else:
-        design = _ads_render(ads_config.get("regular_design") or [],
-                             {"advertiser": advertiser, "server_link": ad.get("server_link") or "", "ping": ""})
+        design = _ads_render(ads_config.get("regular_design") or [], _ads_tokens(ad, advertiser, ""))
     if design:
         try:
             await send_v2_message(dm, design)
@@ -13757,11 +13773,7 @@ async def _ads_post(guild, ad):
         winners = int(ad.get("winners") or 1)
         seconds = int(ad.get("seconds") or 86400)
         length = ad.get("length") or ""
-        design = _ads_render(ads_config.get("giveaway_design") or [],
-                             {"advertiser": advertiser, "prize": prize, "winners": winners,
-                              "duration": length, "ping": ping,
-                              "server_link": ad.get("server_link") or "",
-                              "server_name": ad.get("server_name") or ""}) or None
+        design = _ads_render(ads_config.get("giveaway_design") or [], _ads_tokens(ad, advertiser, ping)) or None
         if ping:
             try:
                 await ch.send(ping, allowed_mentions=discord.AllowedMentions(everyone=True, users=True, roles=True))
@@ -13769,8 +13781,7 @@ async def _ads_post(guild, ad):
                 pass
         await start_giveaway(ch, prize, winners, seconds, ad.get("user_id"), guild.id, design=design, length=length)
         return True
-    design = _ads_render(ads_config.get("regular_design") or [],
-                         {"advertiser": advertiser, "server_link": ad.get("server_link") or "", "ping": ping})
+    design = _ads_render(ads_config.get("regular_design") or [], _ads_tokens(ad, advertiser, ping))
     if design:
         try:
             await send_v2_message(ch, design, content=(ping or None), allowed_mentions=mentions)
