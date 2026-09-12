@@ -17949,7 +17949,8 @@ _YTDLP_BASE = {
     "quiet": True, "no_warnings": True, "noprogress": True,
     "nocheckcertificate": True, "socket_timeout": 15,
     "skip_download": True, "ignoreerrors": True,
-    "extractor_args": {"youtube": {"player_client": ["android", "web", "tv"]}},
+    # Starting list only; the probe below replaces it with what actually works.
+    "extractor_args": {"youtube": {"player_client": ["android", "android_vr", "tv_embedded", "tv", "web"]}},
 }
 
 # Optional: YouTube cookies dodge the datacenter bot-check for good. Set
@@ -17985,6 +17986,8 @@ _YT_CLIENT_CANDIDATES = ["android", "android_vr", "tv_embedded", "tv", "ios", "m
 _YT_PROBE_VIDEO = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 _YT_PROBE_MIN_GAP = 20 * 60
 _yt_last_probe = 0.0
+_yt_probe_finished = False   # the first probe has answered at least once
+_yt_probe_inflight = None    # the running probe task, awaited by the first extraction
 
 
 def _yt_probe_client_sync(client):
@@ -18001,20 +18004,42 @@ def _yt_probe_client_sync(client):
 
 
 async def _yt_probe_clients(reason="boot"):
-    global _yt_last_probe
+    global _yt_last_probe, _yt_probe_finished, _yt_probe_inflight
     if _ytdlp is None:
         return
     _yt_last_probe = time.time()
-    results = await asyncio.gather(
-        *[asyncio.wait_for(asyncio.to_thread(_yt_probe_client_sync, c), 45) for c in _YT_CLIENT_CANDIDATES],
-        return_exceptions=True)
-    ok = [c for c, r in zip(_YT_CLIENT_CANDIDATES, results) if r is True]
-    if ok:
-        _YTDLP_BASE["extractor_args"] = {"youtube": {"player_client": ok[:3]}}
-        print(f"[Music] YouTube clients that get through ({reason}): {ok}; using {ok[:3]}")
-    else:
-        print(f"[Music] YouTube: no player client gets through from this host ({reason}). "
-              f"Cookies are the fix: set YTDLP_COOKIES_B64.")
+    _yt_probe_inflight = asyncio.current_task()
+    try:
+        results = await asyncio.gather(
+            *[asyncio.wait_for(asyncio.to_thread(_yt_probe_client_sync, c), 45) for c in _YT_CLIENT_CANDIDATES],
+            return_exceptions=True)
+        ok = [c for c, r in zip(_YT_CLIENT_CANDIDATES, results) if r is True]
+        if ok:
+            _YTDLP_BASE["extractor_args"] = {"youtube": {"player_client": ok[:3]}}
+            print(f"[Music] YouTube clients that get through ({reason}): {ok}; using {ok[:3]}")
+        else:
+            print(f"[Music] YouTube: no player client gets through from this host ({reason}). "
+                  f"Cookies are the fix: set YTDLP_COOKIES_B64.")
+    finally:
+        _yt_probe_finished = True
+        _yt_probe_inflight = None
+
+
+async def _yt_wait_for_probe():
+    """The first extraction after boot waits for the probe, so the song that
+    resumes on boot is fetched with clients that work rather than the starting
+    list. If nothing has started the probe yet, start it here."""
+    global _yt_probe_inflight
+    if _yt_probe_finished:
+        return
+    task = _yt_probe_inflight
+    if task is None:
+        task = asyncio.create_task(_yt_probe_clients("first extraction"))
+        _yt_probe_inflight = task
+    try:
+        await asyncio.wait_for(asyncio.shield(task), 60)
+    except Exception:
+        pass
 
 
 def _yt_reprobe_if_stale(reason):
@@ -18147,6 +18172,7 @@ def _ytdlp_extract_sync(target, playlist_limit=25):
 async def _ytdlp_extract(target, playlist_limit=25):
     if _ytdlp is None:
         return []
+    await _yt_wait_for_probe()
     try:
         return await asyncio.to_thread(_ytdlp_extract_sync, target, playlist_limit)
     except Exception as e:
