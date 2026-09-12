@@ -1721,7 +1721,7 @@ def _tree_fingerprint():
     payload = []
     for c in cmds:
         try:
-            payload.append(c.to_dict())
+            payload.append(c.to_dict(bot.tree))
         except Exception as e:
             print(f"[Boot] command fingerprint failed for {getattr(c, 'name', '?')}: {e}")
             return f"error:{time.time()}"
