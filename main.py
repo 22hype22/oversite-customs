@@ -4372,8 +4372,11 @@ async def _pkgback_load():
     g = (cfg or {}).get("guilds")
     if isinstance(g, dict):
         for gid, rec in g.items():
-            if isinstance(rec, dict) and rec.get("img"):
-                pkg_backgrounds[str(gid)] = {"img": rec["img"], "name": rec.get("name") or "background.png"}
+            if isinstance(rec, dict) and (rec.get("img") or rec.get("front")):
+                pkg_backgrounds[str(gid)] = {
+                    "img": rec.get("img") or "", "name": rec.get("name") or "background.png",
+                    "front": rec.get("front") or "", "front_name": rec.get("front_name") or "front.png",
+                }
     _pkgback_loaded = True
     print(f"[PackageBack] restored {len(pkg_backgrounds)} active background(s)")
 
@@ -4388,9 +4391,10 @@ async def _pkgback_save():
 
 
 def _pkgback_active(guild_id):
-    """The active background record for a guild, or None if none is set."""
+    """The guild's package art record (a background under the preview, a front
+    laid over it, or both), or None when neither is set."""
     rec = pkg_backgrounds.get(str(guild_id))
-    if rec and rec.get("img"):
+    if rec and (rec.get("img") or rec.get("front")):
         return rec
     return None
 
@@ -4417,17 +4421,19 @@ def _pkgback_prep(raw_bytes):
         return raw_bytes
 
 
-def _pkgback_compose(bg_bytes, fg_bytes):
+def _pkgback_compose(bg_bytes, fg_bytes, front_bytes=None):
     """Lay the uploaded preview (fg — the transparent uniform) centered on top of
-    the background (bg), scaled to fit inside it without distortion. Returns PNG
+    the background (bg), scaled to fit inside it without distortion, then lay
+    the front (a transparent overlay set with /packagefront) over the result,
+    scaled to the canvas the same way. Either layer may be missing. Returns PNG
     bytes, or None if it can't (the caller then falls back to the raw preview)."""
     try:
         from PIL import Image
     except ImportError:
         return None
     try:
-        bg = Image.open(io.BytesIO(bg_bytes)).convert("RGBA")
         fg = Image.open(io.BytesIO(fg_bytes)).convert("RGBA")
+        bg = Image.open(io.BytesIO(bg_bytes)).convert("RGBA") if bg_bytes else fg.copy()
         bw, bh = bg.size
         fw, fh = fg.size
         if min(bw, bh, fw, fh) <= 0:
@@ -4440,7 +4446,18 @@ def _pkgback_compose(bg_bytes, fg_bytes):
             fg = fg.resize((nw, nh), Image.LANCZOS)
             fw, fh = nw, nh
         canvas = bg.copy()
-        canvas.alpha_composite(fg, ((bw - fw) // 2, (bh - fh) // 2))
+        if bg_bytes:
+            canvas.alpha_composite(fg, ((bw - fw) // 2, (bh - fh) // 2))
+        if front_bytes:
+            fr = Image.open(io.BytesIO(front_bytes)).convert("RGBA")
+            rw, rh = fr.size
+            if min(rw, rh) > 0:
+                ratio = min(bw / rw, bh / rh)
+                nw, nh = max(1, round(rw * ratio)), max(1, round(rh * ratio))
+                if (nw, nh) != (rw, rh):
+                    fr = fr.resize((nw, nh), Image.LANCZOS)
+                    rw, rh = nw, nh
+                canvas.alpha_composite(fr, ((bw - rw) // 2, (bh - rh) // 2))
         out = io.BytesIO()
         canvas.save(out, "PNG")
         return out.getvalue()
@@ -4564,12 +4581,16 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
             fname = _san_filename(f.get("filename"), "preview.png")
             rec = _pkgback_active(interaction.guild.id) if interaction.guild else None
             if rec:
+                import base64
                 try:
-                    import base64
-                    bg = base64.b64decode(rec["img"])
+                    bg = base64.b64decode(rec["img"]) if rec.get("img") else None
                 except Exception:
                     bg = None
-                merged = _pkgback_compose(bg, blob) if bg else None
+                try:
+                    front = base64.b64decode(rec["front"]) if rec.get("front") else None
+                except Exception:
+                    front = None
+                merged = _pkgback_compose(bg, blob, front) if (bg or front) else None
                 if merged:
                     blob = merged
                     fname = os.path.splitext(fname)[0] + ".png"
@@ -4810,37 +4831,73 @@ async def packageback_cmd(interaction: discord.Interaction, background: discord.
             embed=error_embed("Couldn't read that", str(e)[:200]), ephemeral=True)
     import base64
     img_b64 = base64.b64encode(_pkgback_prep(raw)).decode()
-    pkg_backgrounds[str(interaction.guild.id)] = {
-        "img": img_b64, "name": background.filename or "background.png"}
+    rec = dict(pkg_backgrounds.get(str(interaction.guild.id)) or {})
+    rec.update({"img": img_b64, "name": background.filename or "background.png"})
+    pkg_backgrounds[str(interaction.guild.id)] = rec
     _pkgback_loaded = True
     await _pkgback_save()
     await interaction.followup.send(
         embed=success_embed(
             "Background set",
             "Package preview uploads will now be centered on top of this background. "
-            "Run `/removepackageback` to turn it off."),
+            "Run `/packageremove` to turn it off."),
         ephemeral=True)
 
 
-@bot.tree.command(name="removepackageback", description="Stops placing package previews on a background.")
-async def removepackageback_cmd(interaction: discord.Interaction):
+@bot.tree.command(name="packagefront", description="Sets a front that is laid over package previews.")
+@app_commands.describe(front="A transparent PNG. It is scaled to the preview and laid on top of it.")
+async def packagefront_cmd(interaction: discord.Interaction, front: discord.Attachment):
     global _pkgback_loaded
     if not interaction.guild:
         return await interaction.response.send_message("Use this in a server.", ephemeral=True)
     if not interaction.user.guild_permissions.manage_guild:
         return await interaction.response.send_message(
-            embed=error_embed("No permission", "You need Manage Server to change the package background."),
+            embed=error_embed("No permission", "You need Manage Server to set a package front."),
+            ephemeral=True)
+    if not (front.content_type or "").lower().startswith("image/"):
+        return await interaction.response.send_message(
+            embed=error_embed("Not an image", "Upload a PNG with transparency as the front."),
+            ephemeral=True)
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        raw = await front.read()
+    except Exception as e:
+        return await interaction.followup.send(
+            embed=error_embed("Couldn't read that", str(e)[:200]), ephemeral=True)
+    import base64
+    img_b64 = base64.b64encode(_pkgback_prep(raw)).decode()
+    rec = dict(pkg_backgrounds.get(str(interaction.guild.id)) or {})
+    rec.update({"front": img_b64, "front_name": front.filename or "front.png"})
+    pkg_backgrounds[str(interaction.guild.id)] = rec
+    _pkgback_loaded = True
+    await _pkgback_save()
+    await interaction.followup.send(
+        embed=success_embed(
+            "Front set",
+            "Package preview uploads will now have this laid over them. "
+            "Run `/packageremove` to turn it off."),
+        ephemeral=True)
+
+
+@bot.tree.command(name="packageremove", description="Removes the package background and front so previews post as they are.")
+async def packageremove_cmd(interaction: discord.Interaction):
+    global _pkgback_loaded
+    if not interaction.guild:
+        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    if not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message(
+            embed=error_embed("No permission", "You need Manage Server to change the package art."),
             ephemeral=True)
     gid = str(interaction.guild.id)
-    if gid not in pkg_backgrounds:
+    if not _pkgback_active(gid):
         return await interaction.response.send_message(
-            embed=error_embed("Nothing set", "There's no package background active right now."),
+            embed=error_embed("Nothing set", "There is no package background or front active right now."),
             ephemeral=True)
     pkg_backgrounds.pop(gid, None)
     _pkgback_loaded = True
     await _pkgback_save()
     await interaction.response.send_message(
-        embed=success_embed("Background off", "Package previews will post as-is again."),
+        embed=success_embed("Background and front off", "Package previews will post as they are again."),
         ephemeral=True)
 
 
