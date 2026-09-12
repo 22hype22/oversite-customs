@@ -4873,6 +4873,116 @@ async def packageback_cmd(interaction: discord.Interaction, background: typing.O
         ephemeral=True)
 
 
+# Roblox classic clothing template (585x559) face boxes, measured off the
+# official labelled template. Shirts and pants share the layout: the two
+# lower groups are the arms on a shirt and the legs on pants. Each box is
+# (left, top, right, bottom) and is copied as-is, never scaled.
+_TPL_FACE = {
+    "torso_front": (231, 74, 359, 202), "torso_back": (427, 74, 555, 202),
+    "right_front": (217, 355, 281, 483), "right_outer": (151, 355, 215, 483), "right_back": (85, 355, 149, 483),
+    "left_front": (308, 355, 372, 483), "left_outer": (374, 355, 438, 483), "left_back": (440, 355, 504, 483),
+}
+_TPL_SIZE = (585, 559)
+_PREVIEW_SKIN = (228, 168, 124)
+
+
+def _tpl_open(raw, skin):
+    """A template as RGBA at the template size, laid over the skin colour so
+    transparent areas (short sleeves, bare arms) read as skin like they do on
+    an avatar. Anything not already 585x559 is scaled to it, as Roblox does."""
+    from PIL import Image
+    img = Image.open(io.BytesIO(raw)).convert("RGBA")
+    if img.size != _TPL_SIZE:
+        img = img.resize(_TPL_SIZE, Image.LANCZOS)
+    base = Image.new("RGBA", _TPL_SIZE, skin + (255,))
+    base.alpha_composite(img)
+    return base
+
+
+def _uniform_preview_build(outfits, skin=_PREVIEW_SKIN, gap=20, margin=20):
+    """Render the preview sheet: one column per outfit (shirt, pants), each
+    showing the front with both arms, then the outer arm, the front of the
+    legs and the outer leg, then the back with both arms, then the back of the
+    legs beneath it. Every piece is a straight copy of its template face."""
+    from PIL import Image
+    col_w = 272
+    row_a, row_b, row_c = margin, margin + 128 + 6, margin + 128 + 6 + 128 + 18
+    row_d = row_c + 128
+    W = margin * 2 + col_w * len(outfits) + gap * (len(outfits) - 1)
+    H = row_d + 128 + margin
+    sheet = Image.new("RGBA", (W, H), (255, 255, 255, 255))
+    face = lambda img, k: img.crop(_TPL_FACE[k])
+    for i, (shirt_raw, pants_raw) in enumerate(outfits):
+        shirt = _tpl_open(shirt_raw, skin)
+        pants = _tpl_open(pants_raw, skin)
+        x0 = margin + i * (col_w + gap)
+        # Front: the avatar's right arm is on the viewer's left.
+        sheet.paste(face(shirt, "right_front"), (x0 + 8, row_a))
+        sheet.paste(face(shirt, "torso_front"), (x0 + 72, row_a))
+        sheet.paste(face(shirt, "left_front"), (x0 + 200, row_a))
+        # Sides and legs: outer right arm, both legs from the front, outer left leg.
+        sheet.paste(face(shirt, "right_outer"), (x0, row_b))
+        sheet.paste(face(pants, "right_front"), (x0 + 72, row_b))
+        sheet.paste(face(pants, "left_front"), (x0 + 136, row_b))
+        sheet.paste(face(pants, "left_outer"), (x0 + 208, row_b))
+        # Back: seen from behind, the avatar's left arm is on the viewer's left.
+        sheet.paste(face(shirt, "left_back"), (x0 + 8, row_c))
+        sheet.paste(face(shirt, "torso_back"), (x0 + 72, row_c))
+        sheet.paste(face(shirt, "right_back"), (x0 + 200, row_c))
+        sheet.paste(face(pants, "left_back"), (x0 + 72, row_d))
+        sheet.paste(face(pants, "right_back"), (x0 + 136, row_d))
+    out = io.BytesIO()
+    sheet.convert("RGB").save(out, "PNG")
+    return out.getvalue()
+
+
+def _parse_hex_colour(s):
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", (s or "").strip())
+    if not m:
+        return None
+    v = int(m.group(1), 16)
+    return ((v >> 16) & 255, (v >> 8) & 255, v & 255)
+
+
+@bot.tree.command(name="preview", description="Makes a uniform preview sheet from shirt and pants templates.")
+@app_commands.describe(
+    shirt1="First shirt template.", pants1="Pants template. Used for every outfit that has no pants of its own.",
+    shirt2="Second shirt template.", pants2="Pants for the second outfit.",
+    shirt3="Third shirt template.", pants3="Pants for the third outfit.",
+    skin="Skin colour as hex, e.g. E5A87F. Shows through transparent parts of the templates.",
+)
+async def preview_cmd(interaction: discord.Interaction, shirt1: discord.Attachment, pants1: discord.Attachment,
+                      shirt2: typing.Optional[discord.Attachment] = None, pants2: typing.Optional[discord.Attachment] = None,
+                      shirt3: typing.Optional[discord.Attachment] = None, pants3: typing.Optional[discord.Attachment] = None,
+                      skin: str = ""):
+    if not _packages_can_use(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to run /preview."), ephemeral=True)
+        return
+    tone = _parse_hex_colour(skin) if skin else _PREVIEW_SKIN
+    if tone is None:
+        await interaction.response.send_message(embed=error_embed("Bad colour", "Give the skin colour as six hex digits, like E5A87F."), ephemeral=True)
+        return
+    pairs = [(shirt1, pants1)]
+    for s, p in ((shirt2, pants2), (shirt3, pants3)):
+        if s is not None:
+            pairs.append((s, p or pants1))
+    for s, p in pairs:
+        for att in (s, p):
+            if not (att.content_type or "").lower().startswith("image/"):
+                await interaction.response.send_message(embed=error_embed("Not an image", f"{att.filename} is not an image. Upload the PNG templates."), ephemeral=True)
+                return
+    await interaction.response.defer(thinking=True)
+    try:
+        outfits = []
+        for s, p in pairs:
+            outfits.append((await s.read(), await p.read()))
+        png = await asyncio.to_thread(_uniform_preview_build, outfits, tone)
+    except Exception as e:
+        await interaction.followup.send(embed=error_embed("Couldn't build the preview", str(e)[:200]), ephemeral=True)
+        return
+    await interaction.followup.send(file=discord.File(io.BytesIO(png), filename="preview.png"))
+
+
 @bot.tree.command(name="packageremove", description="Removes the package background and front so previews post as they are.")
 async def packageremove_cmd(interaction: discord.Interaction):
     global _pkgback_loaded
