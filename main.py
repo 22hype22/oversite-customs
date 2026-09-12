@@ -10800,14 +10800,14 @@ async def _econ_send(channel, embed, view=None):
     """Send an economy embed as a sleek V2 container (no sidebar). Falls back to
     a normal embed send if V2 delivery fails so a message is never dropped."""
     if view is not None:
-        return await channel.send(view=view)
+        return await channel.send(view=view, allowed_mentions=discord.AllowedMentions.none())
     title = getattr(embed, "title", "") or ""
     body = getattr(embed, "description", "") or ""
     try:
-        return await channel.send(view=_EconLayout(title, body))
+        return await channel.send(view=_EconLayout(title, body), allowed_mentions=discord.AllowedMentions.none())
     except Exception as e:
         print(f"[Econ] V2 send failed, using embed: {e}")
-        return await channel.send(embed=embed)
+        return await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
 
 _ECON_DEFAULT_REPLIES = {
@@ -11173,7 +11173,7 @@ async def _econ_blackjack(message, args):
     if _bj_val(view.player) == 21:
         _econ_add(message.guild.id, message.author.id, int(bet * 1.5))
         return await _econ_send(message.channel, success_embed("Blackjack!", f"Natural 21! You won **{_econ_fmt(int(bet*1.5))}**."))
-    await message.channel.send(view=view)
+    await message.channel.send(view=view, allowed_mentions=discord.AllowedMentions.none())
 
 
 # ---- Property shop (buy businesses that pay passive income) ----
@@ -11443,7 +11443,7 @@ async def _econ_poker(message, args):
     if bet == "over":
         return await _econ_send(message.channel, error_embed("Not enough cash", "You don't have that much."))
     view = PokerView(message.guild.id, message.author.id, bet)
-    await message.channel.send(view=view)
+    await message.channel.send(view=view, allowed_mentions=discord.AllowedMentions.none())
 
 
 def _bacc_val(cards):
