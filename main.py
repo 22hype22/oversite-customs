@@ -7620,6 +7620,13 @@ async def _pf_platform_fallback(feature):
     return True
 
 
+def _pf_thanks(feature):
+    """The one-line acknowledgement after a prompt form is submitted."""
+    if feature == "customs-feedback":
+        return "Thank you for the feedback."
+    return "Submitted. Our team will look into it!"
+
+
 async def _pf_command(interaction, feature):
     """Slash-command entry point: open the form, or (if the design has no input
     tokens) post the designed message straight away."""
@@ -7680,7 +7687,7 @@ async def _pf_command(interaction, feature):
         if ch:
             await send_v2_message(ch, _pf_render(design, interaction.user.id, []),
                                   allowed_mentions={"parse": []})
-        text = "Submitted. Our team will look into it!"
+        text = _pf_thanks(feature)
         return await (interaction.followup.send(text, ephemeral=True) if deferred
                       else interaction.response.send_message(text, ephemeral=True))
 
@@ -7780,7 +7787,7 @@ async def _pf_submit(interaction, feature, form_num=1):
 
     if not ch:
         return await interaction.response.send_message("Couldn't find the destination channel.", ephemeral=True)
-    await interaction.response.send_message("Submitted. Our team will look into it!", ephemeral=True)
+    await interaction.response.send_message(_pf_thanks(feature), ephemeral=True)
 
     # An uploaded file goes into a THREAD off the message with no text on the
     # message itself: strip the {File:} line and drop its answer slot, so the
