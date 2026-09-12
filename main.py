@@ -4209,6 +4209,9 @@ def _flatten_pkg_fields(comps):
 
 
 PKG_FORM_KEY = "customs-package"
+# (user_id, form key) -> {label: answer}. Set by /packageedit so the form opens
+# with the card's current answers already typed in; cleared once submitted.
+_form_prefill = {}
 _pending_pkg_ctx = {}  # user_id -> {channel_id, payment, link}
 
 
@@ -4462,6 +4465,7 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
         return json.dumps(str(s))[1:-1]
 
     mapping = mapping or {}
+    ctx["answers"] = dict(mapping)  # kept on the receipt so /packageedit can refill the form
 
     def _answer_repl(m):
         kind = m.group(1).lower()
@@ -4518,6 +4522,34 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
     view.add_item(discord.ui.Button(label="Dev Product", style=discord.ButtonStyle.secondary, custom_id="pkg_buy:gamepass"))
     view.add_item(discord.ui.Button(label="Roblox Select", style=discord.ButtonStyle.secondary, custom_id="pkg_buy:select"))
     view.add_item(discord.ui.Button(label="Stripe", style=discord.ButtonStyle.secondary, custom_id="pkg_buy:stripe"))
+
+    # /packageedit: the card already exists, so rewrite it where it is and
+    # refresh its receipt record. Files left empty on the form keep the ones
+    # already stored; new ones replace them.
+    edit_id = ctx.get("edit_msg_id")
+    if edit_id:
+        try:
+            target = await ch.fetch_message(int(edit_id))
+            await target.edit(embed=embed, view=view)
+        except Exception as e:
+            await interaction.followup.send(embed=error_embed("Couldn't update", str(e)[:300]), ephemeral=True)
+            return
+        rec = dict(await _pkg_files_get(edit_id) or {})
+        rec.update({
+            "product": str(embed.title or rec.get("product") or "your package"),
+            "image": (embed.image.url if embed.image else "") or "",
+            "price_field": _pkg_price_field(embed),
+            "answers": dict(mapping),
+            "payment": ctx.get("payment") or "",
+            "link": ctx.get("link") or "",
+            "delivery_id": ctx.get("delivery_id") or rec.get("delivery_id") or "",
+        })
+        if after_files:
+            delivery_ch = await resolve_channel(rec.get("delivery_id")) if rec.get("delivery_id") else None
+            rec["files"] = await _pkg_vault_files(delivery_ch, after_files)
+        await _pkg_files_set(str(edit_id), rec)
+        await interaction.followup.send(embed=success_embed("Updated", f"Package card updated: {target.jump_url}"), ephemeral=True)
+        return
 
     async def _banner_file(f):
         """Download an {SFile} Preview so it can post as a real native image.
@@ -4605,6 +4637,14 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
         await interaction.followup.send(embed=error_embed("Couldn't post", str(e)[:300]), ephemeral=True)
 
 
+def _pkg_price_field(embed):
+    """The card's Price field, as text, or '' when the design has none."""
+    for f in (getattr(embed, "fields", None) or []):
+        if str(f.name or "").strip().lower() == "price":
+            return str(f.value or "")
+    return ""
+
+
 async def _pkg_store_receipt(posted, ch, embed, ctx, after_files):
     """Persist the receipt record for a package post (keyed by the post's message
     id): the private Finished Product files (re-hosted to the delivery channel so
@@ -4617,11 +4657,7 @@ async def _pkg_store_receipt(posted, ch, embed, ctx, after_files):
     if did:
         delivery_ch = await resolve_channel(did)
     file_refs = await _pkg_vault_files(delivery_ch, after_files)
-    price_field = ""
-    for f in (embed.fields or []):
-        if str(f.name or "").strip().lower() == "price":
-            price_field = str(f.value or "")
-            break
+    price_field = _pkg_price_field(embed)
     guild = getattr(ch, "guild", None)
     record = {
         "product": str(embed.title or "your package"),
@@ -4632,6 +4668,11 @@ async def _pkg_store_receipt(posted, ch, embed, ctx, after_files):
         "files": file_refs,
         # Who posted it — so the receipt's Leave a Review can vouch for them.
         "designer_id": str(ctx.get("designer_id") or ""),
+        # What was typed into the form, so /packageedit can open it refilled.
+        "answers": dict(ctx.get("answers") or {}),
+        "payment": ctx.get("payment") or "",
+        "link": ctx.get("link") or "",
+        "delivery_id": ctx.get("delivery_id") or "",
     }
     await _pkg_files_set(str(posted.id), record)
 
@@ -4687,9 +4728,60 @@ async def package_cmd(interaction: discord.Interaction, channel: typing.Union[di
     _pending_pkg_ctx[interaction.user.id] = {"channel_id": str(channel.id), "payment": payment or "", "link": link or "", "tag": tag or "", "delivery_id": str(delivery.id) if delivery else "", "designer_id": str(interaction.user.id)}
     _pending_form_answers.pop((interaction.user.id, PKG_FORM_KEY), None)
     _pending_form_files.pop((interaction.user.id, PKG_FORM_KEY), None)
+    _form_prefill.pop((interaction.user.id, PKG_FORM_KEY), None)
     fields = _parse_form_fields(comps, limit=FORM_MAX_QUESTIONS)
     if not fields:
         # No {Question:}/{File:} tokens — post straight away.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await _post_package_form(interaction, comps)
+        return
+    await _open_form_page(interaction, PKG_FORM_KEY, 0)
+
+
+@bot.tree.command(name="packageedit", description="Opens the package form again for a posted card and updates it in place.")
+@app_commands.describe(
+    message="Link to the package card message, or its message ID.",
+    payment="New payment name, if it changes. Leave empty to keep the current one.",
+    link="New payment link, if it changes. Leave empty to keep the current one.",
+)
+async def packageedit_cmd(interaction: discord.Interaction, message: str, payment: str = "", link: str = ""):
+    if not _packages_can_use(interaction.user):
+        await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to run /packageedit."), ephemeral=True)
+        return
+    comps = packages_config.get("panel_components") or []
+    if not comps:
+        await interaction.response.send_message(embed=error_embed("Nothing to edit", "Build the Packages card in the dashboard first."), ephemeral=True)
+        return
+    ids = re.findall(r"\d{15,22}", message or "")
+    if not ids:
+        await interaction.response.send_message(embed=error_embed("Which card", "Paste the message link of the package card, or its message ID."), ephemeral=True)
+        return
+    msg_id = ids[-1]
+    rec = await _pkg_files_get(msg_id)
+    if not rec:
+        await interaction.response.send_message(embed=error_embed("Not a package card", "That message was not posted with /package, so there is nothing to edit."), ephemeral=True)
+        return
+    # The channel comes from the link when one was pasted, else from the card's
+    # own jump link. For a forum post that is the thread itself.
+    ch_id = ids[-2] if len(ids) >= 2 else ""
+    if not ch_id:
+        m = re.search(r"/channels/\d+/(\d+)/", str(rec.get("thread_url") or ""))
+        ch_id = m.group(1) if m else ""
+    if not ch_id:
+        await interaction.response.send_message(embed=error_embed("Which channel", "Paste the full message link of the package card so I know where it is."), ephemeral=True)
+        return
+    form_msgs[PKG_FORM_KEY] = comps
+    form_titles[PKG_FORM_KEY] = "Edit package"
+    _pending_pkg_ctx[interaction.user.id] = {
+        "channel_id": str(ch_id), "payment": payment or rec.get("payment") or "", "link": link or rec.get("link") or "",
+        "tag": "", "delivery_id": rec.get("delivery_id") or "",
+        "designer_id": rec.get("designer_id") or str(interaction.user.id), "edit_msg_id": str(msg_id),
+    }
+    _pending_form_answers.pop((interaction.user.id, PKG_FORM_KEY), None)
+    _pending_form_files.pop((interaction.user.id, PKG_FORM_KEY), None)
+    _form_prefill[(interaction.user.id, PKG_FORM_KEY)] = dict(rec.get("answers") or {})
+    fields = _parse_form_fields(comps, limit=FORM_MAX_QUESTIONS)
+    if not fields:
         await interaction.response.defer(ephemeral=True, thinking=True)
         await _post_package_form(interaction, comps)
         return
@@ -6891,22 +6983,24 @@ async def _open_form_page(interaction, key, page):
     if not page_fields:
         return
     total_pages = (len(fields) + FORM_PAGE_SIZE - 1) // FORM_PAGE_SIZE
+    # Editing an existing card: text answers come pre-typed and file fields
+    # become optional, so leaving one empty keeps the file already on the card.
+    prefill = _form_prefill.get((interaction.user.id, key))
     components = []
     for j, f in enumerate(page_fields):
         idx = start + j
         label = (_clean_label(f["label"]) or f["label"])[:45]
         if f["kind"] == "file":
-            components.append({
-                "type": 18, "label": label,
-                "component": {"type": 19, "custom_id": f"f{idx}", "min_values": 1, "max_values": 10},
-            })
+            comp = {"type": 19, "custom_id": f"f{idx}", "min_values": 1, "max_values": 10}
+            if prefill is not None:
+                comp["required"] = False
+            components.append({"type": 18, "label": label, "component": comp})
         else:
             style = 2 if f.get("long") else _form_input_style(f["label"])
-            components.append({
-                "type": 18, "label": label,
-                "component": {"type": 4, "custom_id": f"q{idx}", "style": style,
-                              "required": True, "max_length": 1000},
-            })
+            comp = {"type": 4, "custom_id": f"q{idx}", "style": style, "required": True, "max_length": 1000}
+            if prefill and prefill.get(f["label"]):
+                comp["value"] = str(prefill[f["label"]])[:1000]
+            components.append({"type": 18, "label": label, "component": comp})
     # Order tickets: the Sales and Refund Policy box rides on the last page when
     # there's room (Discord caps a modal at 5 components). A full last page gets
     # the box as a follow-up step instead (see handle_ticket_form_submit).
@@ -9850,6 +9944,7 @@ async def _finish_ticket_form(interaction, key, open_comps, agreed=False):
     try:
         mapping = dict(_pending_form_answers.pop((interaction.user.id, key), {}))
         files = list(_pending_form_files.pop((interaction.user.id, key), []))
+        _form_prefill.pop((interaction.user.id, key), None)
         if key == PKG_FORM_KEY:
             # Packages fill {Question: LABEL} with just the answer (no bold label),
             # since the card's own header labels the columns.
