@@ -4809,73 +4809,53 @@ async def packageedit_cmd(interaction: discord.Interaction, message: str, paymen
     await _open_form_page(interaction, PKG_FORM_KEY, 0)
 
 
-@bot.tree.command(name="packageback", description="Sets a background that package previews are placed on.")
-@app_commands.describe(background="The background image. Your uniform preview is centered on top of it.")
-async def packageback_cmd(interaction: discord.Interaction, background: discord.Attachment):
+@bot.tree.command(name="packageback", description="Sets the art package previews are placed on: a background under them, a front over them, or both.")
+@app_commands.describe(
+    background="Image placed under the preview. The uniform is centered on top of it.",
+    front="Transparent PNG laid over the preview, scaled to fit it.",
+)
+async def packageback_cmd(interaction: discord.Interaction, background: typing.Optional[discord.Attachment] = None, front: typing.Optional[discord.Attachment] = None):
     global _pkgback_loaded
     if not interaction.guild:
         return await interaction.response.send_message("Use this in a server.", ephemeral=True)
     if not interaction.user.guild_permissions.manage_guild:
         return await interaction.response.send_message(
-            embed=error_embed("No permission", "You need Manage Server to set a package background."),
+            embed=error_embed("No permission", "You need Manage Server to set the package art."),
             ephemeral=True)
-    if not (background.content_type or "").lower().startswith("image/"):
+    if background is None and front is None:
         return await interaction.response.send_message(
-            embed=error_embed("Not an image", "Upload a PNG or JPG image as the background."),
+            embed=error_embed("Nothing to set", "Attach a background, a front, or both."),
             ephemeral=True)
+    for att in (background, front):
+        if att is not None and not (att.content_type or "").lower().startswith("image/"):
+            return await interaction.response.send_message(
+                embed=error_embed("Not an image", "Upload PNG or JPG images. The front should be a PNG with transparency."),
+                ephemeral=True)
     await interaction.response.defer(ephemeral=True, thinking=True)
+    import base64
+    rec = dict(pkg_backgrounds.get(str(interaction.guild.id)) or {})
+    set_parts = []
     try:
-        raw = await background.read()
+        if background is not None:
+            rec.update({"img": base64.b64encode(_pkgback_prep(await background.read())).decode(),
+                        "name": background.filename or "background.png"})
+            set_parts.append("background")
+        if front is not None:
+            rec.update({"front": base64.b64encode(_pkgback_prep(await front.read())).decode(),
+                        "front_name": front.filename or "front.png"})
+            set_parts.append("front")
     except Exception as e:
         return await interaction.followup.send(
             embed=error_embed("Couldn't read that", str(e)[:200]), ephemeral=True)
-    import base64
-    img_b64 = base64.b64encode(_pkgback_prep(raw)).decode()
-    rec = dict(pkg_backgrounds.get(str(interaction.guild.id)) or {})
-    rec.update({"img": img_b64, "name": background.filename or "background.png"})
     pkg_backgrounds[str(interaction.guild.id)] = rec
     _pkgback_loaded = True
     await _pkgback_save()
+    what = " and ".join(set_parts)
     await interaction.followup.send(
         embed=success_embed(
-            "Background set",
-            "Package preview uploads will now be centered on top of this background. "
-            "Run `/packageremove` to turn it off."),
-        ephemeral=True)
-
-
-@bot.tree.command(name="packagefront", description="Sets a front that is laid over package previews.")
-@app_commands.describe(front="A transparent PNG. It is scaled to the preview and laid on top of it.")
-async def packagefront_cmd(interaction: discord.Interaction, front: discord.Attachment):
-    global _pkgback_loaded
-    if not interaction.guild:
-        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
-    if not interaction.user.guild_permissions.manage_guild:
-        return await interaction.response.send_message(
-            embed=error_embed("No permission", "You need Manage Server to set a package front."),
-            ephemeral=True)
-    if not (front.content_type or "").lower().startswith("image/"):
-        return await interaction.response.send_message(
-            embed=error_embed("Not an image", "Upload a PNG with transparency as the front."),
-            ephemeral=True)
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    try:
-        raw = await front.read()
-    except Exception as e:
-        return await interaction.followup.send(
-            embed=error_embed("Couldn't read that", str(e)[:200]), ephemeral=True)
-    import base64
-    img_b64 = base64.b64encode(_pkgback_prep(raw)).decode()
-    rec = dict(pkg_backgrounds.get(str(interaction.guild.id)) or {})
-    rec.update({"front": img_b64, "front_name": front.filename or "front.png"})
-    pkg_backgrounds[str(interaction.guild.id)] = rec
-    _pkgback_loaded = True
-    await _pkgback_save()
-    await interaction.followup.send(
-        embed=success_embed(
-            "Front set",
-            "Package preview uploads will now have this laid over them. "
-            "Run `/packageremove` to turn it off."),
+            f"Package {what} set",
+            "Package preview uploads will now be composed with it. "
+            "Run `/packageremove` to turn the art off."),
         ephemeral=True)
 
 
