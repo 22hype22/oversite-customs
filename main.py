@@ -1713,11 +1713,23 @@ async def on_ready():
 def _tree_fingerprint():
     """A stable hash of every slash command (names, descriptions, options), so
     a boot can tell whether Discord already has this exact command set."""
+    # A failure here must never produce the same value twice, or a boot would
+    # skip the sync forever with the command set out of date. Each command is
+    # serialised on its own, with the count folded in, and any error forces a
+    # sync by returning a value that cannot match what was stored.
+    cmds = bot.tree.get_commands()
+    payload = []
+    for c in cmds:
+        try:
+            payload.append(c.to_dict())
+        except Exception as e:
+            print(f"[Boot] command fingerprint failed for {getattr(c, 'name', '?')}: {e}")
+            return f"error:{time.time()}"
     try:
-        payload = [c.to_dict() for c in bot.tree.get_commands()]
-        raw = json.dumps(payload, sort_keys=True, default=str)
+        raw = json.dumps({"count": len(cmds), "commands": payload}, sort_keys=True, default=str)
     except Exception as e:
-        return f"error:{e}"
+        print(f"[Boot] command fingerprint failed: {e}")
+        return f"error:{time.time()}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
