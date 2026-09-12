@@ -4910,7 +4910,7 @@ def _uniform_preview_build(outfits, skin=_PREVIEW_SKIN, gap=20, margin=20):
     row_d = row_c + 128
     W = margin * 2 + col_w * len(outfits) + gap * (len(outfits) - 1)
     H = row_d + 128 + margin
-    sheet = Image.new("RGBA", (W, H), (255, 255, 255, 255))
+    sheet = Image.new("RGBA", (W, H), (0, 0, 0, 0))  # transparent between the pieces
     face = lambda img, k: img.crop(_TPL_FACE[k])
     for i, (shirt_raw, pants_raw) in enumerate(outfits):
         shirt = _tpl_open(shirt_raw, skin)
@@ -4932,7 +4932,7 @@ def _uniform_preview_build(outfits, skin=_PREVIEW_SKIN, gap=20, margin=20):
         sheet.paste(face(pants, "left_back"), (x0 + 72, row_d))
         sheet.paste(face(pants, "right_back"), (x0 + 136, row_d))
     out = io.BytesIO()
-    sheet.convert("RGB").save(out, "PNG")
+    sheet.save(out, "PNG")
     return out.getvalue()
 
 
