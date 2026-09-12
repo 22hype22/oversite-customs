@@ -4424,7 +4424,7 @@ def _pkgback_prep(raw_bytes):
 def _pkgback_compose(bg_bytes, fg_bytes, front_bytes=None):
     """Lay the uploaded preview (fg — the transparent uniform) centered on top of
     the background (bg), scaled to fit inside it without distortion, then lay
-    the front (a transparent overlay set with /packagefront) over the result,
+    the front (the transparent overlay set with the front option of /packageback) over the result,
     scaled to the canvas the same way. Either layer may be missing. Returns PNG
     bytes, or None if it can't (the caller then falls back to the raw preview)."""
     try:
