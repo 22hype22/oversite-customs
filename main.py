@@ -3308,14 +3308,16 @@ def _giveaway_payload(g, gid, guild, ended=False, winner_ids=None, for_edit=Fals
         payload = {"components": design}
         if not for_edit:
             payload["flags"] = 1 << 15  # Components V2
-            payload["allowed_mentions"] = {"parse": ["roles", "users"]}
+            # The first post is allowed to ping everyone: an @everyone placed
+            # in the design (an ad's {ping}) is meant to notify, not sit silent.
+            payload["allowed_mentions"] = {"parse": ["everyone", "roles", "users"]}
         return payload
     # Embed fallback. When keeping the running message on end, show the LIVE embed
     # (so prize/winners/entries stay) but disable the Enter button.
     embed = build_giveaway_embed(g, ended=(ended and not keep_running), winner_ids=winner_ids)
     payload = {"embeds": [embed.to_dict()], "components": [_giveaway_action_row(g, gid, ended)]}
     if not for_edit:
-        payload["allowed_mentions"] = {"parse": ["roles", "users"]}
+        payload["allowed_mentions"] = {"parse": ["everyone", "roles", "users"]}
         ping = str(giveaway_config.get("ping") or "").strip()
         if ping:
             payload["content"] = _render_guild_text(ping, guild)
