@@ -12546,12 +12546,16 @@ async def apply_config(feature, cfg, post_panel=False):
             await post_saved_messages(only_channel_id=edited or None)
     elif feature in ("customs-suggestions", "customs-feedback", "customs-reportbug"):
         # A prompt form: the designer saves {messages:[{channel_id, components}]}.
-        # First saved message holds both the output design (with {question:} etc.
-        # tokens) and the destination channel the admin picked.
+        # One message holds both the output design (with {question:} etc.
+        # tokens) and the destination channel the admin picked. The dashboard
+        # keeps one entry per channel, so when the channel was re-picked the
+        # entry it last edited is the live one; otherwise the newest is.
         design, channel_id = [], ""
         raw = cfg.get("messages")
         if isinstance(raw, list) and raw:
-            m0 = raw[0] or {}
+            msgs = [m for m in raw if isinstance(m, dict)]
+            edited = str(cfg.get("edited_channel_id") or "")
+            m0 = next((m for m in msgs if edited and str(m.get("channel_id") or "") == edited), None) or (msgs[-1] if msgs else {})
             design = m0.get("components") if isinstance(m0.get("components"), list) else []
             channel_id = str(m0.get("channel_id") or "")
         # Allow flat overrides too.
