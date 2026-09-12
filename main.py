@@ -4560,33 +4560,66 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
     view.add_item(discord.ui.Button(label="Roblox Select", style=discord.ButtonStyle.secondary, custom_id="pkg_buy:select"))
     view.add_item(discord.ui.Button(label="Stripe", style=discord.ButtonStyle.secondary, custom_id="pkg_buy:stripe"))
 
-    # /packageedit: the card already exists, so rewrite it where it is and
-    # refresh its receipt record. Files left empty on the form keep the ones
-    # already stored; new ones replace them.
+    # /packageedit: the old post comes down and a fresh one goes up, so a new
+    # preview shows properly (a banner is its own message and cannot be edited
+    # into place). Banners and Finished Product files that were not re-uploaded
+    # carry over from the old post; everything else comes from the new form.
     edit_id = ctx.get("edit_msg_id")
+    reuse_banners = []  # (bytes, filename) from the old post, already composed on any background
     if edit_id:
+        prev = await _pkg_files_get(edit_id) or {}
         try:
-            target = await ch.fetch_message(int(edit_id))
-            await target.edit(embed=embed, view=view)
-        except Exception as e:
-            await interaction.followup.send(embed=error_embed("Couldn't update", str(e)[:300]), ephemeral=True)
-            return
-        rec = dict(await _pkg_files_get(edit_id) or {})
-        rec.update({
-            "product": str(embed.title or rec.get("product") or "your package"),
-            "image": (embed.image.url if embed.image else "") or "",
-            "price_field": _pkg_embed_price(embed),
-            "answers": dict(mapping),
-            "payment": ctx.get("payment") or "",
-            "link": ctx.get("link") or "",
-            "delivery_id": ctx.get("delivery_id") or rec.get("delivery_id") or "",
-        })
-        if after_files:
-            delivery_ch = await resolve_channel(rec.get("delivery_id")) if rec.get("delivery_id") else None
-            rec["files"] = await _pkg_vault_files(delivery_ch, after_files)
-        await _pkg_files_set(str(edit_id), rec)
-        await interaction.followup.send(embed=success_embed("Updated", f"Package card updated: {target.jump_url}"), ephemeral=True)
-        return
+            old = await ch.fetch_message(int(edit_id))
+        except Exception:
+            old = None
+        parent = getattr(ch, "parent", None)
+        if isinstance(ch, discord.Thread) and isinstance(parent, discord.ForumChannel):
+            # A forum post: the thread starter carries the banner. Take it,
+            # remember the tag, drop the thread, and post again in the forum.
+            try:
+                starter = await ch.fetch_message(ch.id)
+                for att in starter.attachments:
+                    reuse_banners.append((await att.read(), att.filename))
+            except Exception:
+                pass
+            tags = [str(t.id) for t in (getattr(ch, "applied_tags", None) or [])]
+            try:
+                await ch.delete()
+            except Exception as e:
+                await interaction.followup.send(embed=error_embed("Couldn't replace", f"The old post could not be removed: {str(e)[:150]}"), ephemeral=True)
+                return
+            ctx["tag"] = ctx.get("tag") or (tags[0] if tags else "")
+            ctx["channel_id"] = str(parent.id)
+            ch = parent
+        elif old is not None:
+            # A channel post: the bot's own image-only messages right before
+            # the card are its banners.
+            try:
+                async for m in ch.history(limit=6, before=old):
+                    if m.author.id == bot.user.id and m.attachments and not m.embeds:
+                        for att in m.attachments:
+                            reuse_banners.append((await att.read(), att.filename))
+                        try:
+                            await m.delete()
+                        except Exception:
+                            pass
+                    else:
+                        break
+            except Exception as e:
+                print(f"[Package] old banner lookup failed: {e}")
+            try:
+                await old.delete()
+            except Exception as e:
+                await interaction.followup.send(embed=error_embed("Couldn't replace", f"The old card could not be removed: {str(e)[:150]}"), ephemeral=True)
+                return
+        if sfile_files:
+            reuse_banners = []  # a new preview replaces the old one
+        if not after_files and prev.get("files"):
+            ctx["prev_files"] = prev["files"]
+        ctx["delivery_id"] = ctx.get("delivery_id") or prev.get("delivery_id") or ""
+
+    def _reused_banner_files():
+        return [discord.File(io.BytesIO(b), filename=_san_filename(n, "preview.png")) for b, n in reuse_banners]
 
     async def _banner_file(f):
         """Download an {SFile} Preview so it can post as a real native image.
@@ -4625,7 +4658,7 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
             # Forum channels take a new thread (forum post), not a plain message.
             # The banner is the thread's starter message; the embed follows inside.
             thread_name = ((embed.title or ctx.get("payment") or "Package") or "Package")[:100]
-            banners = [b for b in [await _banner_file(f) for f in sfile_files] if b]
+            banners = [b for b in [await _banner_file(f) for f in sfile_files] if b] + _reused_banner_files()
             # Apply the tag the runner picked on /package. If none was picked but
             # the forum requires one, fall back to the first available tag so the
             # post isn't silently rejected.
@@ -4668,12 +4701,14 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
             bf = await _banner_file(f)
             if bf:
                 await ch.send(file=bf, allowed_mentions=none_mentions)
+        for bf in _reused_banner_files():
+            await ch.send(file=bf, allowed_mentions=none_mentions)
         # 2) The embed — with the Media Gallery photo inside it — as its own message.
         posted = await ch.send(embed=embed, view=view, allowed_mentions=none_mentions)
         # 3) The {File} Finished Product is NEVER posted publicly — it's stashed
         #    privately and delivered to the buyer on claim.
         await _pkg_store_receipt(posted, ch, embed, ctx, after_files)
-        await interaction.followup.send(embed=success_embed("Posted", f"Package card posted in {ch.mention}."), ephemeral=True)
+        await interaction.followup.send(embed=success_embed("Reposted" if edit_id else "Posted", f"Package card {'reposted' if edit_id else 'posted'} in {ch.mention}."), ephemeral=True)
     except Exception as e:
         await interaction.followup.send(embed=error_embed("Couldn't post", str(e)[:300]), ephemeral=True)
 
@@ -4698,6 +4733,8 @@ async def _pkg_store_receipt(posted, ch, embed, ctx, after_files):
     if did:
         delivery_ch = await resolve_channel(did)
     file_refs = await _pkg_vault_files(delivery_ch, after_files)
+    if not after_files and ctx.get("prev_files"):
+        file_refs = ctx["prev_files"]  # /packageedit without new files keeps the old ones
     price_field = _pkg_embed_price(embed)
     guild = getattr(ch, "guild", None)
     record = {
