@@ -4571,7 +4571,7 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
         rec.update({
             "product": str(embed.title or rec.get("product") or "your package"),
             "image": (embed.image.url if embed.image else "") or "",
-            "price_field": _pkg_price_field(embed),
+            "price_field": _pkg_embed_price(embed),
             "answers": dict(mapping),
             "payment": ctx.get("payment") or "",
             "link": ctx.get("link") or "",
@@ -4674,7 +4674,7 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
         await interaction.followup.send(embed=error_embed("Couldn't post", str(e)[:300]), ephemeral=True)
 
 
-def _pkg_price_field(embed):
+def _pkg_embed_price(embed):
     """The card's Price field, as text, or '' when the design has none."""
     for f in (getattr(embed, "fields", None) or []):
         if str(f.name or "").strip().lower() == "price":
@@ -4694,7 +4694,7 @@ async def _pkg_store_receipt(posted, ch, embed, ctx, after_files):
     if did:
         delivery_ch = await resolve_channel(did)
     file_refs = await _pkg_vault_files(delivery_ch, after_files)
-    price_field = _pkg_price_field(embed)
+    price_field = _pkg_embed_price(embed)
     guild = getattr(ch, "guild", None)
     record = {
         "product": str(embed.title or "your package"),
@@ -15059,6 +15059,17 @@ async def _pkg_run_flow(interaction, kind, pkg_msg_id, deliver_to, title=None, p
         title = ((rec.get("product") if rec else "") or "").strip()
         price_field = (rec.get("price_field") if rec else "") or ""
         buy_url = ((rec.get("buy_url") if rec else "") or "").strip()
+        # A record saved without its price (cards posted while the receipt
+        # writer was reading the wrong helper) takes the price straight off
+        # the card the button sits on, and the record is repaired for next time.
+        if not price_field.strip():
+            price_field = _pkg_price_field(interaction)
+            if price_field.strip() and rec:
+                rec["price_field"] = price_field
+                try:
+                    await _pkg_files_set(str(pkg_msg_id), rec)
+                except Exception as e:
+                    print(f"[Package] price repair save failed: {e}")
     # Bake the ad-perk key into the Claim button itself (via the flows below).
     # The in-memory stash and the shared pkg record can both be lost or
     # clobbered before the buyer clicks Claim (a redeploy, or another buyer
