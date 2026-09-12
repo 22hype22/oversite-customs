@@ -1677,6 +1677,8 @@ async def on_ready():
         sales_monthly_tick.start()
     if not econ_autosave.is_running():
         econ_autosave.start()
+    if not yt_client_probe_tick.is_running():
+        yt_client_probe_tick.start()  # first run is immediate: finds the YouTube clients that work here
     await refresh_status()
 
     try:
@@ -17974,6 +17976,58 @@ if _ck:
     print("[Music] YouTube cookies loaded")
 
 
+# YouTube bot-checks datacenter hosts per player client, and which clients get
+# through changes from month to month. Rather than trusting a fixed list, the
+# bot probes every candidate against a known video at boot and every few hours
+# (and again after a block), keeps the ones that answer, and extracts with
+# those. When none gets through, only cookies can help, and the log says so.
+_YT_CLIENT_CANDIDATES = ["android", "android_vr", "tv_embedded", "tv", "ios", "mweb", "web_embedded", "web"]
+_YT_PROBE_VIDEO = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+_YT_PROBE_MIN_GAP = 20 * 60
+_yt_last_probe = 0.0
+
+
+def _yt_probe_client_sync(client):
+    opts = dict(_YTDLP_BASE)
+    opts["ignoreerrors"] = False
+    opts["socket_timeout"] = 12
+    opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+    try:
+        with _ytdlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(_YT_PROBE_VIDEO, download=False)
+        return bool(info and (info.get("url") or info.get("formats")))
+    except Exception:
+        return False
+
+
+async def _yt_probe_clients(reason="boot"):
+    global _yt_last_probe
+    if _ytdlp is None:
+        return
+    _yt_last_probe = time.time()
+    results = await asyncio.gather(
+        *[asyncio.wait_for(asyncio.to_thread(_yt_probe_client_sync, c), 45) for c in _YT_CLIENT_CANDIDATES],
+        return_exceptions=True)
+    ok = [c for c, r in zip(_YT_CLIENT_CANDIDATES, results) if r is True]
+    if ok:
+        _YTDLP_BASE["extractor_args"] = {"youtube": {"player_client": ok[:3]}}
+        print(f"[Music] YouTube clients that get through ({reason}): {ok}; using {ok[:3]}")
+    else:
+        print(f"[Music] YouTube: no player client gets through from this host ({reason}). "
+              f"Cookies are the fix: set YTDLP_COOKIES_B64.")
+
+
+def _yt_reprobe_if_stale(reason):
+    """After a block, re-run the probe in the background unless one ran recently."""
+    if time.time() - _yt_last_probe >= _YT_PROBE_MIN_GAP:
+        asyncio.create_task(_yt_probe_clients(reason))
+
+
+@tasks.loop(hours=4)
+async def yt_client_probe_tick():
+    await _yt_probe_clients("scheduled")
+
+
 def _clean_song_query(title, author=""):
     """'Artist - Song [Official Video] | 4K' -> 'Artist - Song' for cross-source
     lookups. Only appends the uploader when the title lacks an artist ("Song"
@@ -18032,6 +18086,7 @@ async def _resolve_stream(track):
     if not res:
         q = _clean_song_query(track.title, track.author)
         print(f"[Music] YouTube stream blocked — trying SoundCloud for {q!r}")
+        _yt_reprobe_if_stale("after a block")
         cands = await _ytdlp_extract(f"scsearch5:{q}")
         good = [c for c in (cands or []) if _sc_match_ok(track, c)]
         if good:
