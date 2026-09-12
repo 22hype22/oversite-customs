@@ -4538,6 +4538,10 @@ async def _post_package_form(interaction, comps, mapping=None, files=None):
             cid = _resolve(m.group(2) or m.group(3) or "")
             return f"<#{cid}>" if cid else m.group(0)
         raw = re.sub(r"<#(\d+)>|<#([A-Za-z0-9_\-]{2,})>|(?<!<)#([A-Za-z0-9_\-]{2,})", _chan_repl, raw)
+    # Placeholder links left over from an example card ("[Stripe](https://buy.stripe.com/XXXX)")
+    # would 404; the buttons under the card do the buying, so those read as plain
+    # bold labels instead of links.
+    raw = re.sub(r"\[([^\]]+)\]\((?:https?:)?//[^)]*XXXX[^)]*\)", r"**\1**", raw)
     try:
         final = json.loads(raw)
     except Exception:
