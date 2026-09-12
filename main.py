@@ -4914,15 +4914,21 @@ def _uniform_preview_build(outfits, skin=_PREVIEW_SKIN, gap=20, margin=20):
     from PIL import Image
     face = lambda img, k: img.crop(_TPL_FACE[k])
     opened = [(_tpl_open(sr, skin), _tpl_open(pr, skin)) for sr, pr in outfits]
+    # The sheet is always the size of the three-outfit sheet, so it sits on a
+    # background the same way however many outfits it holds.
+    col_w = 272
+    W = margin * 2 + col_w * 3 + gap * 2
+    H = margin + 128 + 6 + 128 + 18 + 128 + 128 + margin
     if len(opened) <= 2:
         small, mid, row_h, row_gap = 16, 32, 256, 24
         unit_w = 64 + small + 256 + mid + 256 + small + 64
-        W = margin * 2 + unit_w
-        H = margin * 2 + row_h * len(opened) + row_gap * (len(opened) - 1)
+        content_h = row_h * len(opened) + row_gap * (len(opened) - 1)
+        left = (W - unit_w) // 2
+        top = (H - content_h) // 2
         sheet = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         for i, (shirt, pants) in enumerate(opened):
-            y0 = margin + i * (row_h + row_gap)
-            x = margin
+            y0 = top + i * (row_h + row_gap)
+            x = left
             sheet.paste(face(shirt, "right_outer"), (x, y0))
             sheet.paste(face(pants, "right_outer"), (x, y0 + 128))
             x += 64 + small
@@ -4941,11 +4947,8 @@ def _uniform_preview_build(outfits, skin=_PREVIEW_SKIN, gap=20, margin=20):
             sheet.paste(face(shirt, "left_outer"), (x, y0))
             sheet.paste(face(pants, "left_outer"), (x, y0 + 128))
     else:
-        col_w = 272
         row_a, row_b, row_c = margin, margin + 128 + 6, margin + 128 + 6 + 128 + 18
         row_d = row_c + 128
-        W = margin * 2 + col_w * len(opened) + gap * (len(opened) - 1)
-        H = row_d + 128 + margin
         sheet = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         for i, (shirt, pants) in enumerate(opened):
             x0 = margin + i * (col_w + gap)
