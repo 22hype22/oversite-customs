@@ -4355,7 +4355,7 @@ def _pkg_build_embed(comps):
 # `/packageback` stores a background image that package-preview uploads get laid
 # onto: the uploaded {SFile} Preview (a uniform with a transparent background) is
 # scaled to fit and centered on top of this background before it posts. It stays
-# active until `/removepackageback` clears it. The image bytes are stored inline
+# active until `/packageremove` clears it. The image bytes are stored inline
 # (base64) so there's no vault channel or expiring CDN URL to depend on.
 # guild_id(str) -> {"img": "<base64 png>", "name": str}.
 pkg_backgrounds = {}
