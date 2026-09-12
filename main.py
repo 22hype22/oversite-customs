@@ -4900,37 +4900,70 @@ def _tpl_open(raw, skin):
 
 
 def _uniform_preview_build(outfits, skin=_PREVIEW_SKIN, gap=20, margin=20):
-    """Render the preview sheet: one column per outfit (shirt, pants), each
-    showing the front with both arms, then the outer arm, the front of the
-    legs and the outer leg, then the back with both arms, then the back of the
-    legs beneath it. Every piece is a straight copy of its template face."""
+    """Render the preview sheet. Every piece is a straight copy of its template
+    face; the space between pieces is transparent.
+
+    Three outfits: one column each, showing the front with both arms, then the
+    outer arm beside the legs from the front and the outer leg, then the back
+    with both arms with the back of the legs beneath it.
+
+    One or two outfits: one row each. Left to right: the outer right arm over
+    the outer right leg, the front with both arms over the front of the legs,
+    the back with both arms over the back of the legs, and the outer left arm
+    over the outer left leg."""
     from PIL import Image
-    col_w = 272
-    row_a, row_b, row_c = margin, margin + 128 + 6, margin + 128 + 6 + 128 + 18
-    row_d = row_c + 128
-    W = margin * 2 + col_w * len(outfits) + gap * (len(outfits) - 1)
-    H = row_d + 128 + margin
-    sheet = Image.new("RGBA", (W, H), (0, 0, 0, 0))  # transparent between the pieces
     face = lambda img, k: img.crop(_TPL_FACE[k])
-    for i, (shirt_raw, pants_raw) in enumerate(outfits):
-        shirt = _tpl_open(shirt_raw, skin)
-        pants = _tpl_open(pants_raw, skin)
-        x0 = margin + i * (col_w + gap)
-        # Front: the avatar's right arm is on the viewer's left.
-        sheet.paste(face(shirt, "right_front"), (x0 + 8, row_a))
-        sheet.paste(face(shirt, "torso_front"), (x0 + 72, row_a))
-        sheet.paste(face(shirt, "left_front"), (x0 + 200, row_a))
-        # Sides and legs: outer right arm, both legs from the front, outer left leg.
-        sheet.paste(face(shirt, "right_outer"), (x0, row_b))
-        sheet.paste(face(pants, "right_front"), (x0 + 72, row_b))
-        sheet.paste(face(pants, "left_front"), (x0 + 136, row_b))
-        sheet.paste(face(pants, "left_outer"), (x0 + 208, row_b))
-        # Back: seen from behind, the avatar's left arm is on the viewer's left.
-        sheet.paste(face(shirt, "left_back"), (x0 + 8, row_c))
-        sheet.paste(face(shirt, "torso_back"), (x0 + 72, row_c))
-        sheet.paste(face(shirt, "right_back"), (x0 + 200, row_c))
-        sheet.paste(face(pants, "left_back"), (x0 + 72, row_d))
-        sheet.paste(face(pants, "right_back"), (x0 + 136, row_d))
+    opened = [(_tpl_open(sr, skin), _tpl_open(pr, skin)) for sr, pr in outfits]
+    if len(opened) <= 2:
+        small, mid, row_h, row_gap = 16, 32, 256, 24
+        unit_w = 64 + small + 256 + mid + 256 + small + 64
+        W = margin * 2 + unit_w
+        H = margin * 2 + row_h * len(opened) + row_gap * (len(opened) - 1)
+        sheet = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        for i, (shirt, pants) in enumerate(opened):
+            y0 = margin + i * (row_h + row_gap)
+            x = margin
+            sheet.paste(face(shirt, "right_outer"), (x, y0))
+            sheet.paste(face(pants, "right_outer"), (x, y0 + 128))
+            x += 64 + small
+            sheet.paste(face(shirt, "right_front"), (x, y0))
+            sheet.paste(face(shirt, "torso_front"), (x + 64, y0))
+            sheet.paste(face(shirt, "left_front"), (x + 192, y0))
+            sheet.paste(face(pants, "right_front"), (x + 64, y0 + 128))
+            sheet.paste(face(pants, "left_front"), (x + 128, y0 + 128))
+            x += 256 + mid
+            sheet.paste(face(shirt, "left_back"), (x, y0))
+            sheet.paste(face(shirt, "torso_back"), (x + 64, y0))
+            sheet.paste(face(shirt, "right_back"), (x + 192, y0))
+            sheet.paste(face(pants, "left_back"), (x + 64, y0 + 128))
+            sheet.paste(face(pants, "right_back"), (x + 128, y0 + 128))
+            x += 256 + small
+            sheet.paste(face(shirt, "left_outer"), (x, y0))
+            sheet.paste(face(pants, "left_outer"), (x, y0 + 128))
+    else:
+        col_w = 272
+        row_a, row_b, row_c = margin, margin + 128 + 6, margin + 128 + 6 + 128 + 18
+        row_d = row_c + 128
+        W = margin * 2 + col_w * len(opened) + gap * (len(opened) - 1)
+        H = row_d + 128 + margin
+        sheet = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        for i, (shirt, pants) in enumerate(opened):
+            x0 = margin + i * (col_w + gap)
+            # Front: the avatar's right arm is on the viewer's left.
+            sheet.paste(face(shirt, "right_front"), (x0 + 8, row_a))
+            sheet.paste(face(shirt, "torso_front"), (x0 + 72, row_a))
+            sheet.paste(face(shirt, "left_front"), (x0 + 200, row_a))
+            # Sides and legs: outer right arm, both legs from the front, outer left leg.
+            sheet.paste(face(shirt, "right_outer"), (x0, row_b))
+            sheet.paste(face(pants, "right_front"), (x0 + 72, row_b))
+            sheet.paste(face(pants, "left_front"), (x0 + 136, row_b))
+            sheet.paste(face(pants, "left_outer"), (x0 + 208, row_b))
+            # Back: seen from behind, the avatar's left arm is on the viewer's left.
+            sheet.paste(face(shirt, "left_back"), (x0 + 8, row_c))
+            sheet.paste(face(shirt, "torso_back"), (x0 + 72, row_c))
+            sheet.paste(face(shirt, "right_back"), (x0 + 200, row_c))
+            sheet.paste(face(pants, "left_back"), (x0 + 72, row_d))
+            sheet.paste(face(pants, "right_back"), (x0 + 136, row_d))
     out = io.BytesIO()
     sheet.save(out, "PNG")
     return out.getvalue()
