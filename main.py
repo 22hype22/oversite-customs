@@ -1524,8 +1524,40 @@ async def _bot_secret(key):
     return res.strip() if isinstance(res, str) else ""
 
 
+
+def _guard_task_loops(ns, tag="[Loops]"):
+    """Every tasks.loop in the module restarts itself after an unhandled error.
+    A loop that raises is otherwise stopped for the life of the process while
+    the bot stays online and looks healthy, which is how a bot can go quiet
+    for weeks without a single crash. The error is logged in full first."""
+    import traceback as _tb
+    for name, obj in list(ns.items()):
+        if not isinstance(obj, tasks.Loop) or getattr(obj, "_os_guarded", False):
+            continue
+        obj._os_guarded = True
+
+        def _make(_loop, _name):
+            async def _on_error(*args):
+                exc = args[-1] if args else None
+                print(f"{tag} {_name} crashed: {exc!r}; restarting in 5s", flush=True)
+                if isinstance(exc, BaseException):
+                    _tb.print_exception(type(exc), exc, exc.__traceback__)
+
+                async def _restart():
+                    await asyncio.sleep(5)
+                    try:
+                        if not _loop.is_running():
+                            _loop.start()
+                            print(f"{tag} {_name} restarted", flush=True)
+                    except Exception as e:
+                        print(f"{tag} {_name} restart failed: {e!r}", flush=True)
+                asyncio.ensure_future(_restart())
+            return _on_error
+        obj.error(_make(obj, name))
+
 @bot.event
 async def on_ready():
+    _guard_task_loops(globals())
     print(f"{SERVER_NAME} bot online as {bot.user}")
     # Rejoin voice + resume playback IMMEDIATELY — before the config marathon —
     # so a redeploy's silence gap is as short as possible.
