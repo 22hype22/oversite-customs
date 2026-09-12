@@ -4945,6 +4945,7 @@ def _parse_hex_colour(s):
 
 
 @bot.tree.command(name="preview", description="Makes a uniform preview sheet from shirt and pants templates.")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     shirt1="First shirt template.", pants1="Pants template. Used for every outfit that has no pants of its own.",
     shirt2="Second shirt template.", pants2="Pants for the second outfit.",
@@ -4955,8 +4956,8 @@ async def preview_cmd(interaction: discord.Interaction, shirt1: discord.Attachme
                       shirt2: typing.Optional[discord.Attachment] = None, pants2: typing.Optional[discord.Attachment] = None,
                       shirt3: typing.Optional[discord.Attachment] = None, pants3: typing.Optional[discord.Attachment] = None,
                       skin: str = ""):
-    if not _packages_can_use(interaction.user):
-        await interaction.response.send_message(embed=error_embed("No permission", "You don't have a role allowed to run /preview."), ephemeral=True)
+    if not interaction.guild or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(embed=error_embed("No permission", "Only administrators can run /preview."), ephemeral=True)
         return
     tone = _parse_hex_colour(skin) if skin else _PREVIEW_SKIN
     if tone is None:
