@@ -2247,12 +2247,8 @@ async def on_member_remove(member):
         print(f"[Invites] mark-left failed: {e}")
     # Drop a designer's saved pricing when they leave, so /pricing never shows
     # prices for people who aren't in the server anymore.
-    try:
-        res = await _pricing_call("remove_user", user=member.id)
-        if isinstance(res, dict) and res.get("ok") and res.get("prices") is not None:
-            pricing_config["values"] = res.get("prices") or {}
-    except Exception as e:
-        print(f"[Pricing] remove on leave failed: {e}")
+    if _pricing_has_prices(member.id):
+        await _pricing_drop_user(member.id, "left the server")
 
 
 _EMOJI_SHORTCODE_RE = re.compile(r":([a-zA-Z][a-zA-Z0-9_]*)(?:~\d+)?:")
@@ -5160,12 +5156,14 @@ async def portfolio_cleanup():
             await _portfolio_posts_call("remove", thread_id=tid)
 
     # ── Pricing sweep ────────────────────────────────────────────────────────
-    # Drop any designer's saved pricing when they're no longer in the server.
-    # on_member_remove already handles live leaves, but it can't fire for anyone
-    # who left while the bot was offline (a redeploy or a gateway outage), so
-    # their prices would otherwise linger forever and render as @unknown-user.
-    # Only remove a designer confirmed absent from EVERY guild the bot is in,
-    # and never on a transient lookup error.
+    # Drop any designer's saved pricing once they are no longer in the server,
+    # or no longer hold a designer role. on_member_remove and on_member_update
+    # handle both live, but neither can fire for a change made while the bot was
+    # offline (a redeploy or a gateway outage), so the prices would otherwise
+    # linger forever and render as @unknown-user or as somebody long since off
+    # the team. Only remove a designer confirmed absent from EVERY guild the bot
+    # is in, or confirmed present and without the role, and never on a transient
+    # lookup error.
     try:
         pres = await _pricing_call("get")
         prices = (pres.get("prices") if isinstance(pres, dict) else None) or {}
@@ -5176,27 +5174,27 @@ async def portfolio_cleanup():
         for uid in uids:
             if not str(uid).isdigit():
                 continue
-            present = False       # confirmed in some guild
+            found = None          # the member object, where they were found
             uncertain = False     # a lookup errored — don't remove this cycle
             for g in list(bot.guilds):
-                if g.get_member(int(uid)) is not None:
-                    present = True
+                m = g.get_member(int(uid))
+                if m is not None:
+                    found = m
                     break
                 try:
-                    await g.fetch_member(int(uid))
-                    present = True
+                    found = await g.fetch_member(int(uid))
                     break
                 except discord.NotFound:
                     continue  # not in this guild — check the next
                 except Exception:
                     uncertain = True
                     break
-            if present or uncertain:
+            if uncertain:
                 continue
-            res = await _pricing_call("remove_user", user=uid)
-            if isinstance(res, dict) and res.get("ok") and res.get("prices") is not None:
-                pricing_config["values"] = res.get("prices") or {}
-            print(f"[Pricing] swept designer {uid} — no longer in any guild")
+            if found is None:
+                await _pricing_drop_user(uid, "no longer in any guild")
+            elif not _pricing_is_designer(found):
+                await _pricing_drop_user(uid, "no longer has a designer role")
     except Exception as e:
         print(f"[Pricing] leave-sweep failed: {e}")
 
@@ -5794,6 +5792,14 @@ async def on_member_update(before, after):
     try:
         if before.roles == after.roles:
             return
+        # Off the team, off the price list. Checked before the role-log watch
+        # list below, which returns early for any role that is not watched, and
+        # in its own try so a pricing hiccup never costs the role log.
+        try:
+            if _pricing_has_prices(after.id) and not _pricing_is_designer(after):
+                await _pricing_drop_user(after.id, "no longer has a designer role")
+        except Exception as e:
+            print(f"[Pricing] role-change check failed for {after.id}: {e}")
         # Roblox group-rank sync: any role change may change the mapped rank.
         _schedule_group_sync(after)
         bset, aset = set(before.roles), set(after.roles)
@@ -6065,6 +6071,42 @@ async def _pricing_call(action, entries=None, user=None):
         return {"error": str(e)[:200]}
 
 
+def _pricing_is_designer(member):
+    """Whether this member still belongs on /pricing.
+
+    Somebody who is no longer on the team keeps neither the role nor a place on
+    the price list, so losing the designer role takes their prices off exactly
+    the way leaving the server does. With no designer role configured there is
+    nothing to check against and nobody is removed."""
+    if member is None:
+        return False
+    if not (pricing_config.get("designer_role_ids") or []):
+        return True
+    return _pricing_can_manage(member)
+
+
+def _pricing_has_prices(uid):
+    """Whether this user has anything saved on the price list at all, so a role
+    change for everyone else never touches the pricing service."""
+    for svc_map in (pricing_config.get("values") or {}).values():
+        if isinstance(svc_map, dict) and str(uid) in svc_map:
+            return True
+    return False
+
+
+async def _pricing_drop_user(uid, why):
+    """Take a designer's saved prices off the list for good."""
+    try:
+        res = await _pricing_call("remove_user", user=uid)
+        if isinstance(res, dict) and res.get("ok") and res.get("prices") is not None:
+            pricing_config["values"] = res.get("prices") or {}
+        print(f"[Pricing] removed designer {uid} — {why}")
+        return True
+    except Exception as e:
+        print(f"[Pricing] remove failed for {uid}: {e}")
+        return False
+
+
 def _pricing_can_manage(member):
     try:
         if member.guild_permissions.manage_guild:
@@ -6131,9 +6173,15 @@ def _pricing_lines_text(si, guild=None):
 
     blocks = []
     for uid in sorted(by_user.keys(), key=_join_key):
-        # Never show pricing for a designer who has left the server, and hide
-        # designers who are away (/away) until they're back.
-        if guild and str(uid).isdigit() and guild.get_member(int(uid)) is None:
+        # Never show pricing for a designer who has left the server or lost the
+        # designer role, and hide designers who are away (/away) until they're
+        # back. The role check is here as well as on the role change itself, so
+        # the list is right the moment it is opened even if the change came
+        # through while the bot was down.
+        m = guild.get_member(int(uid)) if (guild and str(uid).isdigit()) else None
+        if guild and str(uid).isdigit() and m is None:
+            continue
+        if m is not None and not _pricing_is_designer(m):
             continue
         if guild and _away_get(guild.id, uid):
             continue
