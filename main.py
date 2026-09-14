@@ -1654,6 +1654,8 @@ async def on_ready():
         update_status.start()
     if not portfolio_cleanup.is_running():
         portfolio_cleanup.start()
+    if not verify_count_loop.is_running():
+        verify_count_loop.start()
     if not poll_group_sales.is_running():
         poll_group_sales.start()
     if not poll_stripe_sales.is_running():
@@ -13098,6 +13100,7 @@ _COUNT_TOKENS = ("{count}", "{member_count}", "{members}", "{player count}",
                  "{bot_count}", "{bot count}", "{bots}")
 COUNT_REFRESH_DELAY = float(os.environ.get("VERIFY_COUNT_DELAY", "8"))
 _verify_count_task = None
+_verify_shown_count = None   # the number the live panel is currently showing
 
 
 def _verify_panel_shows_count():
@@ -13110,8 +13113,13 @@ def _verify_panel_shows_count():
     return any(t in blob for t in _COUNT_TOKENS)
 
 
-async def refresh_verify_panel():
-    """Re-render the live verify panel so its member count is current."""
+async def refresh_verify_panel(only_if_changed=False):
+    """Re-render the live verify panel so its member count is current.
+
+    only_if_changed skips the edit when the number on the panel is already the
+    number the server is at, so the reconcile loop below costs nothing while
+    nobody is coming or going."""
+    global _verify_shown_count
     ref = roblox_config.get("panel_ref") or {}
     mid = ref.get("message_id")
     comps = roblox_config.get("components") or []
@@ -13120,7 +13128,45 @@ async def refresh_verify_panel():
     ch = await resolve_channel(ref.get("channel_id"))
     if not ch:
         return False
-    return await edit_v2_message(ch, mid, _verify_with_button(comps))
+    guild = getattr(ch, "guild", None)
+    live = int(getattr(guild, "member_count", 0) or 0) if guild else 0
+    if only_if_changed and _verify_shown_count is not None and live == _verify_shown_count:
+        return False
+    done = await edit_v2_message(ch, mid, _verify_with_button(comps))
+    if done:
+        _verify_shown_count = live
+    return done
+
+
+@tasks.loop(minutes=5)
+async def verify_count_loop():
+    """Keep the panel honest without waiting for somebody to come or go.
+
+    A join or a leave is the usual trigger, but the number can also be wrong
+    because the panel was posted before any of this existed, or because people
+    came and went while the bot was down. This reconciles what the panel shows
+    against what the server is actually at, and only edits when the two differ,
+    so a quiet server costs one comparison every five minutes."""
+    if not _verify_panel_shows_count():
+        return
+    if not (roblox_config.get("panel_ref") or {}).get("message_id"):
+        return
+    try:
+        if await refresh_verify_panel(only_if_changed=True):
+            print(f"[Verify] panel member count brought up to date: {_verify_shown_count}")
+    except Exception as e:
+        print(f"[Verify] scheduled count refresh failed: {e}")
+
+
+@verify_count_loop.before_loop
+async def before_verify_count_loop():
+    await bot.wait_until_ready()
+
+
+def verify_count_baseline(guild):
+    """The panel was just posted, so it shows whatever the server is at now."""
+    global _verify_shown_count
+    _verify_shown_count = int(getattr(guild, "member_count", 0) or 0) if guild else None
 
 
 def schedule_verify_count_refresh():
@@ -13165,6 +13211,11 @@ async def adopt_verify_panel():
                 continue   # not a Components V2 message, so not the panel
             roblox_config["panel_ref"] = {"channel_id": str(ch.id), "message_id": str(msg.id)}
             print(f"[Verify] adopted panel {msg.id}, its member count will stay current")
+            # Whatever number it was posted with is almost certainly out of date
+            # by now, so correct it once rather than waiting for the next person
+            # to come or go.
+            globals()["_verify_shown_count"] = None
+            await refresh_verify_panel()
             return
         print("[Verify] no panel found to keep current — post it once from the dashboard")
     except Exception as e:
@@ -13193,6 +13244,7 @@ async def post_verify_panel():
             if mid:
                 print("[Verify] custom panel posted")
                 await _replace_panel(ch.id, mid)
+                verify_count_baseline(getattr(ch, "guild", None))
                 return
         except Exception as e:
             print(f"[Verify] custom panel error: {e}")
