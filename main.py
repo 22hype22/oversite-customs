@@ -2202,6 +2202,7 @@ bot.tree.add_command(leaderboard_group)
 @bot.event
 async def on_member_join(member):
     await refresh_status()
+    schedule_verify_count_refresh()
     try:
         await _attribute_join(member)
     except Exception as e:
@@ -2241,6 +2242,7 @@ async def on_member_join(member):
 @bot.event
 async def on_member_remove(member):
     await refresh_status()
+    schedule_verify_count_refresh()
     try:
         _mark_left(member)
     except Exception as e:
@@ -13001,6 +13003,10 @@ async def apply_config(feature, cfg, post_panel=False):
         # _replace_panel dedupes so a re-post replaces the old panel.
         if post_panel:
             await post_verify_panel()
+        else:
+            # Boot, or a save that did not repost. Track whatever panel is
+            # already up so its member count keeps itself current.
+            await adopt_verify_panel()
 
     elif feature in ("roblox-group-sync", "customs-roblox-group-sync"):
         group_sync_config["group_id"] = str(cfg.get("group_id") or "").strip()
@@ -13061,6 +13067,110 @@ async def _log_verify(text):
         pass
 
 
+def _verify_with_button(source):
+    """The designed panel with the Verify button tucked inside it.
+
+    The button goes in the last container (with the text) so it doesn't dangle
+    at the very bottom outside the box. A design with no container gets it as a
+    top-level sibling row. Shared by the first post and every later refresh, so
+    an edit can never drop the button off the panel."""
+    btn_label = roblox_config.get("button_label") or "Verify"
+    btn_style = roblox_config.get("button_style") or "primary"
+    verify_row = {"type": "buttonRow",
+                  "buttons": [{"label": btn_label, "style": btn_style, "__verify": True}]}
+    panel = [dict(c) for c in source]
+    container_idxs = [i for i, c in enumerate(panel) if c.get("type") == "container"]
+    if container_idxs:
+        i = container_idxs[-1]
+        panel[i] = dict(panel[i])
+        panel[i]["children"] = list(panel[i].get("children") or []) + [verify_row]
+    else:
+        panel.append(verify_row)
+    return panel
+
+
+# A member count is only true at the moment it was rendered. These keep the one
+# on the verify panel true: a join or a leave schedules a single edit a few
+# seconds later, and a rush of people collapses into that one edit rather than
+# an edit each, which Discord would rate limit.
+_COUNT_TOKENS = ("{count}", "{member_count}", "{members}", "{player count}",
+                 "{player_count}", "{human_count}", "{humans}",
+                 "{bot_count}", "{bot count}", "{bots}")
+COUNT_REFRESH_DELAY = float(os.environ.get("VERIFY_COUNT_DELAY", "8"))
+_verify_count_task = None
+
+
+def _verify_panel_shows_count():
+    """Whether the designed panel actually shows a member count. Without one
+    there is nothing to keep current and the message is left alone."""
+    try:
+        blob = json.dumps(roblox_config.get("components") or [])
+    except Exception:
+        return False
+    return any(t in blob for t in _COUNT_TOKENS)
+
+
+async def refresh_verify_panel():
+    """Re-render the live verify panel so its member count is current."""
+    ref = roblox_config.get("panel_ref") or {}
+    mid = ref.get("message_id")
+    comps = roblox_config.get("components") or []
+    if not (mid and comps):
+        return False
+    ch = await resolve_channel(ref.get("channel_id"))
+    if not ch:
+        return False
+    return await edit_v2_message(ch, mid, _verify_with_button(comps))
+
+
+def schedule_verify_count_refresh():
+    """One edit once the dust settles, however many people came or went."""
+    global _verify_count_task
+    if not _verify_panel_shows_count():
+        return
+    if not (roblox_config.get("panel_ref") or {}).get("message_id"):
+        return
+    if _verify_count_task is not None and not _verify_count_task.done():
+        return   # already pending — it reads the count when it wakes, not now
+
+    async def _later():
+        await asyncio.sleep(COUNT_REFRESH_DELAY)
+        try:
+            await refresh_verify_panel()
+        except Exception as e:
+            print(f"[Verify] member count refresh failed: {e}")
+
+    _verify_count_task = asyncio.create_task(_later())
+
+
+async def adopt_verify_panel():
+    """Find the panel again after a restart.
+
+    panel_ref lives in memory, so after a redeploy the bot no longer knows
+    which message is the panel and the count would quietly stop updating until
+    somebody posted it again. The panel is the newest Components V2 message the
+    bot itself posted in the verify channel."""
+    if (roblox_config.get("panel_ref") or {}).get("message_id"):
+        return
+    if not _verify_panel_shows_count():
+        return
+    ch = await resolve_channel(roblox_config.get("channel_id"))
+    if not ch or bot.user is None:
+        return
+    try:
+        async for msg in ch.history(limit=50):
+            if msg.author.id != bot.user.id:
+                continue
+            if not (int(getattr(msg.flags, "value", 0)) & (1 << 15)):
+                continue   # not a Components V2 message, so not the panel
+            roblox_config["panel_ref"] = {"channel_id": str(ch.id), "message_id": str(msg.id)}
+            print(f"[Verify] adopted panel {msg.id}, its member count will stay current")
+            return
+        print("[Verify] no panel found to keep current — post it once from the dashboard")
+    except Exception as e:
+        print(f"[Verify] could not look for the panel: {e}")
+
+
 async def post_verify_panel():
     """(Re)post the Verify panel with the Roblox verify button.
 
@@ -13072,24 +13182,8 @@ async def post_verify_panel():
     if not ch:
         return
 
-    btn_label = roblox_config.get("button_label") or "Verify"
-    btn_style = roblox_config.get("button_style") or "primary"
-    verify_row = {"type": "buttonRow", "buttons": [{"label": btn_label, "style": btn_style, "__verify": True}]}
     comps = roblox_config.get("components") or []
-
-    def _with_button(source):
-        # Tuck the Verify button inside a container (with the text) so it doesn't
-        # dangle at the very bottom outside the box. Prefer the last container;
-        # if the design has none, add it as a top-level sibling row.
-        panel = [dict(c) for c in source]
-        container_idxs = [i for i, c in enumerate(panel) if c.get("type") == "container"]
-        if container_idxs:
-            i = container_idxs[-1]
-            panel[i] = dict(panel[i])
-            panel[i]["children"] = list(panel[i].get("children") or []) + [verify_row]
-        else:
-            panel.append(verify_row)
-        return panel
+    _with_button = _verify_with_button
 
     if comps:
         _V2_LAST_ERROR["msg"] = ""
