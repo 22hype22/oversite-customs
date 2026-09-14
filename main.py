@@ -18316,6 +18316,26 @@ _yt_probe_finished = False   # the first probe has answered at least once
 _yt_probe_inflight = None    # the running probe task, awaited by the first extraction
 
 
+# A proxy that refuses us turns every single lookup into a failure. No music
+# at all is worse than music fetched from a datacenter address, so a proxy that
+# does not work gets dropped and extraction carries on without it.
+_PROXY_FAIL = ("407", "proxy authentication", "tunnel connection failed",
+               "cannot connect to proxy", "unable to connect to proxy", "proxyerror")
+
+
+def _yt_drop_proxy(why):
+    if _YTDLP_BASE.pop("proxy", None) is not None:
+        print(f"[Music] extraction proxy dropped, going direct: {why}")
+        return True
+    return False
+
+
+def _yt_proxy_failed(exc):
+    if not _YTDLP_BASE.get("proxy"):
+        return False
+    return any(t in str(exc).lower() for t in _PROXY_FAIL)
+
+
 def _yt_probe_client_sync(client):
     opts = dict(_YTDLP_BASE)
     opts["ignoreerrors"] = False
@@ -18335,17 +18355,27 @@ async def _yt_probe_clients(reason="boot"):
         return
     _yt_last_probe = time.time()
     _yt_probe_inflight = asyncio.current_task()
-    try:
+    async def _probe_all():
         results = await asyncio.gather(
             *[asyncio.wait_for(asyncio.to_thread(_yt_probe_client_sync, c), 45) for c in _YT_CLIENT_CANDIDATES],
             return_exceptions=True)
-        ok = [c for c, r in zip(_YT_CLIENT_CANDIDATES, results) if r is True]
+        return [c for c, r in zip(_YT_CLIENT_CANDIDATES, results) if r is True]
+
+    try:
+        ok = await _probe_all()
+        if not ok and _YTDLP_BASE.get("proxy"):
+            # Not one client got through, and everything was going out via the
+            # proxy. The proxy is the likeliest reason, so try again direct
+            # before telling anyone that YouTube is blocking this host.
+            _yt_drop_proxy("no player client got through while it was in use")
+            ok = await _probe_all()
+            reason = f"{reason}, direct"
         if ok:
             _YTDLP_BASE["extractor_args"] = {"youtube": {"player_client": ok[:3]}}
             print(f"[Music] YouTube clients that get through ({reason}): {ok}; using {ok[:3]}")
         else:
             print(f"[Music] YouTube: no player client gets through from this host ({reason}). "
-                  f"Cookies are the fix: set YTDLP_COOKIES_B64.")
+                  f"Cookies are the fix: set YOUTUBE_COOKIES.")
     finally:
         _yt_probe_finished = True
         _yt_probe_inflight = None
@@ -18533,6 +18563,14 @@ async def _ytdlp_extract(target, playlist_limit=25):
     try:
         return await asyncio.to_thread(_ytdlp_extract_sync, target, playlist_limit)
     except Exception as e:
+        # The proxy can start refusing us between probes. Drop it and have one
+        # more go rather than losing the track.
+        if _yt_proxy_failed(e):
+            _yt_drop_proxy(f"{type(e).__name__} during extraction")
+            try:
+                return await asyncio.to_thread(_ytdlp_extract_sync, target, playlist_limit)
+            except Exception as again:
+                e = again
         print(f"[Music] yt-dlp failed for {str(target)[:80]!r}: {e}")
         return []
 
