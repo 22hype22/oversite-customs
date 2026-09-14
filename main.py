@@ -1654,8 +1654,8 @@ async def on_ready():
         update_status.start()
     if not portfolio_cleanup.is_running():
         portfolio_cleanup.start()
-    if not verify_count_loop.is_running():
-        verify_count_loop.start()
+    if not panel_refresh_loop.is_running():
+        panel_refresh_loop.start()
     if not poll_group_sales.is_running():
         poll_group_sales.start()
     if not poll_stripe_sales.is_running():
@@ -13100,7 +13100,6 @@ _COUNT_TOKENS = ("{count}", "{member_count}", "{members}", "{player count}",
                  "{bot_count}", "{bot count}", "{bots}")
 COUNT_REFRESH_DELAY = float(os.environ.get("VERIFY_COUNT_DELAY", "8"))
 _verify_count_task = None
-_verify_shown_count = None   # the number the live panel is currently showing
 
 
 def _verify_panel_shows_count():
@@ -13116,10 +13115,9 @@ def _verify_panel_shows_count():
 async def refresh_verify_panel(only_if_changed=False):
     """Re-render the live verify panel so its member count is current.
 
-    only_if_changed skips the edit when the number on the panel is already the
-    number the server is at, so the reconcile loop below costs nothing while
-    nobody is coming or going."""
-    global _verify_shown_count
+    The verify panel alone. refresh_live_panels below does this for every panel
+    the bot tracks and shares the same bookkeeping, so neither can undo the
+    other or edit the same message twice."""
     ref = roblox_config.get("panel_ref") or {}
     mid = ref.get("message_id")
     comps = roblox_config.get("components") or []
@@ -13128,63 +13126,155 @@ async def refresh_verify_panel(only_if_changed=False):
     ch = await resolve_channel(ref.get("channel_id"))
     if not ch:
         return False
-    guild = getattr(ch, "guild", None)
-    live = int(getattr(guild, "member_count", 0) or 0) if guild else 0
-    if only_if_changed and _verify_shown_count is not None and live == _verify_shown_count:
+    built = _verify_with_button(comps)
+    now = _panel_rendering(built, getattr(ch, "guild", None))
+    if only_if_changed and now is not None and _panel_rendered.get(str(mid)) == now:
         return False
-    done = await edit_v2_message(ch, mid, _verify_with_button(comps))
-    if done:
-        _verify_shown_count = live
+    done = await edit_v2_message(ch, mid, built)
+    if done and now is not None:
+        _panel_rendered[str(mid)] = now
     return done
 
 
-@tasks.loop(minutes=5)
-async def verify_count_loop():
-    """Keep the panel honest without waiting for somebody to come or go.
+# Every panel the bot has posted and still tracks, keyed by the message it
+# lives in, against the rendering it is currently showing. A panel only gets
+# edited when what it should say stops matching what it does say.
+_panel_rendered = {}
+PANEL_REFRESH_MINUTES = float(os.environ.get("PANEL_REFRESH_MINUTES", "5"))
 
-    A join or a leave is the usual trigger, but the number can also be wrong
-    because the panel was posted before any of this existed, or because people
-    came and went while the bot was down. This reconciles what the panel shows
-    against what the server is actually at, and only edits when the two differ,
-    so a quiet server costs one comparison every five minutes."""
-    if not _verify_panel_shows_count():
-        return
-    if not (roblox_config.get("panel_ref") or {}).get("message_id"):
-        return
+
+def live_panels():
+    """(where it came from, channel, message, the design it was built from) for
+    every message the bot posted and still tracks.
+
+    Verification is not the only block that posts a panel with variables in it.
+    A ticket panel, a marketplace panel, a saved message or the Robux locker can
+    all say {count} or {boosts} too, and they were all frozen at whatever the
+    numbers were the day they were posted."""
+    ref = roblox_config.get("panel_ref") or {}
+    if ref.get("message_id") and roblox_config.get("components"):
+        yield ("Verification", ref.get("channel_id"), ref["message_id"],
+               _verify_with_button(roblox_config["components"]))
+
+    for cfg, tag in ((ticket_config, "Tickets"), (marketplace_config, "Marketplace")):
+        refs = cfg.get("panel_refs")
+        if not isinstance(refs, dict):
+            continue
+        panels = cfg.get("panels")
+        if not isinstance(panels, list) or not panels:
+            panels = [{"channel_id": cfg.get("panel_channel_id"),
+                       "components": cfg.get("panel_components") or []}]
+        by_channel = {str(x.get("channel_id")): (x.get("components") or []) for x in panels}
+        for ch_id, mid in list(refs.items()):
+            comps = by_channel.get(str(ch_id))
+            if mid and comps:
+                yield (tag, ch_id, mid, comps)
+
+    refs = saved_messages_config.get("refs")
+    if isinstance(refs, dict):
+        by_channel = {str(m.get("channel_id")): (m.get("components") or [])
+                      for m in (saved_messages_config.get("messages") or [])}
+        for ch_id, mid in list(refs.items()):
+            comps = by_channel.get(str(ch_id))
+            if mid and comps:
+                yield ("Messages", ch_id, mid, comps)
+
+    ref = robux_locker_config.get("panel_ref") or {}
+    if ref.get("message_id"):
+        comps = _robux_render_components()
+        if comps:
+            yield ("Robux locker", ref.get("channel_id"), ref["message_id"], comps)
+
+
+# A {token} in the design, as opposed to the braces JSON is made of. Looking
+# for a bare "{" matches every panel ever written, which would mean re-rendering
+# designs that cannot possibly have changed.
+_PANEL_TOKEN_RE = re.compile(r"\{[a-z][a-z0-9_ ]{1,30}\}", re.I)
+
+
+def _panel_has_variables(comps):
+    """A design with no {token} in it can never go out of date, so it is never
+    touched."""
     try:
-        if await refresh_verify_panel(only_if_changed=True):
-            print(f"[Verify] panel member count brought up to date: {_verify_shown_count}")
+        return bool(_PANEL_TOKEN_RE.search(json.dumps(comps or [])))
+    except Exception:
+        return False
+
+
+def _panel_rendering(comps, guild):
+    """What this design says right now, as a fingerprint.
+
+    Comparing the finished rendering rather than the member count means every
+    variable is covered, not just {count}: boosts, channel and role counts, the
+    locker's stock, the invite board. If none of them moved, nothing is sent."""
+    try:
+        built = [b for b in (_build_v2(c, guild) for c in comps) if b]
+        return hashlib.sha1(json.dumps(built, sort_keys=True, default=str).encode()).hexdigest()
+    except Exception:
+        return None
+
+
+async def refresh_live_panels(only_if_changed=True):
+    """Bring every tracked panel back in line with what it should say."""
+    updated = 0
+    for tag, ch_id, mid, comps in list(live_panels()):
+        if not _panel_has_variables(comps):
+            continue
+        try:
+            ch = await resolve_channel(ch_id)
+            if not ch:
+                continue
+            now = _panel_rendering(comps, getattr(ch, "guild", None))
+            if now is None:
+                continue
+            if only_if_changed and _panel_rendered.get(str(mid)) == now:
+                continue
+            if await edit_v2_message(ch, mid, comps):
+                _panel_rendered[str(mid)] = now
+                updated += 1
+                print(f"[Panels] {tag} panel brought up to date")
+            else:
+                # Remember the failure too, so a message that cannot be edited
+                # is not retried every five minutes forever.
+                _panel_rendered[str(mid)] = now
+        except Exception as e:
+            print(f"[Panels] {tag} panel refresh failed: {e}")
+        await asyncio.sleep(0.4)   # stay well inside the edit rate limit
+    return updated
+
+
+@tasks.loop(minutes=PANEL_REFRESH_MINUTES)
+async def panel_refresh_loop():
+    """Keep every posted panel honest without waiting for something to happen.
+
+    A join or a leave is the usual trigger for a member count, but a panel can
+    also be wrong because it was posted before any of this existed, or because
+    the numbers moved while the bot was down. This reconciles what each panel
+    says against what it should say, and only edits the ones that drifted."""
+    try:
+        await refresh_live_panels(only_if_changed=True)
     except Exception as e:
-        print(f"[Verify] scheduled count refresh failed: {e}")
+        print(f"[Panels] scheduled refresh failed: {e}")
 
 
-@verify_count_loop.before_loop
-async def before_verify_count_loop():
+@panel_refresh_loop.before_loop
+async def before_panel_refresh_loop():
     await bot.wait_until_ready()
 
 
-def verify_count_baseline(guild):
-    """The panel was just posted, so it shows whatever the server is at now."""
-    global _verify_shown_count
-    _verify_shown_count = int(getattr(guild, "member_count", 0) or 0) if guild else None
-
-
 def schedule_verify_count_refresh():
-    """One edit once the dust settles, however many people came or went."""
+    """Somebody came or went. One pass over the panels once the dust settles,
+    however many people it was."""
     global _verify_count_task
-    if not _verify_panel_shows_count():
-        return
-    if not (roblox_config.get("panel_ref") or {}).get("message_id"):
-        return
     if _verify_count_task is not None and not _verify_count_task.done():
-        return   # already pending — it reads the count when it wakes, not now
+        return   # already pending — it reads the numbers when it wakes, not now
 
     async def _later():
         await asyncio.sleep(COUNT_REFRESH_DELAY)
         try:
-            await refresh_verify_panel()
+            await refresh_live_panels(only_if_changed=True)
         except Exception as e:
-            print(f"[Verify] member count refresh failed: {e}")
+            print(f"[Panels] member count refresh failed: {e}")
 
     _verify_count_task = asyncio.create_task(_later())
 
@@ -13214,7 +13304,6 @@ async def adopt_verify_panel():
             # Whatever number it was posted with is almost certainly out of date
             # by now, so correct it once rather than waiting for the next person
             # to come or go.
-            globals()["_verify_shown_count"] = None
             await refresh_verify_panel()
             return
         print("[Verify] no panel found to keep current — post it once from the dashboard")
@@ -13244,7 +13333,6 @@ async def post_verify_panel():
             if mid:
                 print("[Verify] custom panel posted")
                 await _replace_panel(ch.id, mid)
-                verify_count_baseline(getattr(ch, "guild", None))
                 return
         except Exception as e:
             print(f"[Verify] custom panel error: {e}")
