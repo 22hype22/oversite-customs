@@ -13320,13 +13320,30 @@ async def _log_verify(text):
         pass
 
 
-def _verify_with_button(source):
-    """The designed panel with the Verify button tucked inside it.
+def _design_has_button(items, marker):
+    """Whether any button anywhere in a design carries the given marker."""
+    for c in items or []:
+        if not isinstance(c, dict):
+            continue
+        if c.get("type") == "buttonRow" and any(isinstance(b, dict) and b.get(marker) for b in c.get("buttons") or []):
+            return True
+        if c.get("type") == "container" and _design_has_button(c.get("children"), marker):
+            return True
+    return False
 
-    The button goes in the last container (with the text) so it doesn't dangle
-    at the very bottom outside the box. A design with no container gets it as a
-    top-level sibling row. Shared by the first post and every later refresh, so
-    an edit can never drop the button off the panel."""
+
+def _verify_with_button(source):
+    """The designed panel with the Verify button in it.
+
+    The dashboard now keeps the Verify button inside the design, where the
+    owner can word it, colour it and put it where they like, so a design that
+    already carries one is rendered as it is. A design from before that, with
+    no button of its own, gets one tucked into the last container (with the
+    text) so it doesn't dangle at the very bottom outside the box, or as a
+    top-level row when there is no container. Shared by the first post and
+    every later refresh, so an edit can never drop the button off the panel."""
+    if _design_has_button(source, "__verify"):
+        return [dict(c) for c in source]
     btn_label = roblox_config.get("button_label") or "Verify"
     btn_style = roblox_config.get("button_style") or "primary"
     verify_row = {"type": "buttonRow",
