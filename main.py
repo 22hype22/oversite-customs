@@ -1648,6 +1648,8 @@ async def on_ready():
         _safe_load("[Startup] invite tracker", _invite_boot()),
         # Every saved giveaway (entrants + timers) so redeploys never drop them.
         _safe_load("[Startup] giveaway restore", _gw_restore_all()),
+        # Suggestions still open, with their votes and their closing times.
+        _safe_load("[Startup] suggestion votes", _sugg_restore()),
     )
 
     if not update_status.is_running():
@@ -7108,6 +7110,8 @@ async def on_interaction(interaction: discord.Interaction):
         await interaction.response.send_modal(CloseReasonModal(mode))
     elif cid == "ticket_close_confirm":
         await close_ticket(interaction)
+    elif cid.startswith("sugg:"):
+        await _sugg_click(interaction, cid.split(":", 1)[1])
     elif cid == "roblox_verify":
         await start_roblox_verify(interaction)
     elif cid.startswith("gw:"):
@@ -8043,6 +8047,243 @@ class _PFContinueView(discord.ui.View):
         await _pf_open_modal(interaction, self.feature, pend["design"], pend["title"], self.next_form)
 
 
+# ===================== Suggestion votes =====================
+# A suggestion is something the server decides on together, so every one that
+# gets posted carries the same two buttons and the same bar: yes on the left in
+# green, no on the right in red, each with its count, and a bar underneath that
+# moves with the split. Nobody designs these in and nobody can leave them out.
+SUGG_FEATURES = ("customs-suggestions",)
+SUGG_BAR_WIDTH = int(os.environ.get("SUGGESTION_BAR_WIDTH", "12"))
+SUGG_KEEP = int(os.environ.get("SUGGESTION_VOTES_KEEP", "150"))
+# message id -> {"yes": [uid], "no": [uid], "ends": ts, "closed": bool,
+#                "channel_id": str, "comps": [...]}
+suggestion_votes = {}
+_sugg_save_task = None
+_sugg_timers = {}
+
+# "{end: 24h}" in the design: voting closes that long after the suggestion is
+# posted, and the token becomes the time it closes. Leave it out and voting
+# stays open.
+_SUGG_END_RE = re.compile(r"\{\s*end\s*(?::\s*([^}]*))?\}", re.IGNORECASE)
+_SUGG_UNITS = {"s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+               "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+               "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+               "d": 86400, "day": 86400, "days": 86400,
+               "w": 604800, "week": 604800, "weeks": 604800}
+
+
+def _sugg_seconds(spec):
+    """'24h', '2 days', '90m', '1w' -> seconds. 0 when it makes no sense."""
+    text = str(spec or "").strip().lower()
+    if not text:
+        return 0
+    total = 0
+    for num, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([a-z]*)", text):
+        try:
+            value = float(num)
+        except ValueError:
+            continue
+        total += value * _SUGG_UNITS.get(unit, 3600 if not unit else 0)
+    return int(total)
+
+
+def _sugg_apply_end(comps):
+    """Swap {end: ...} for the time voting closes. Returns the design and when
+    that is, or 0 when the design never asked for one."""
+    ends = 0
+    try:
+        raw = json.dumps(comps or [])
+    except Exception:
+        return comps, 0
+    matches = _SUGG_END_RE.findall(raw)
+    if not matches:
+        return comps, 0
+    seconds = 0
+    for spec in matches:
+        seconds = _sugg_seconds(spec)
+        if seconds > 0:
+            break
+    if seconds > 0:
+        ends = int(time.time()) + seconds
+        raw = _SUGG_END_RE.sub(f"<t:{ends}:R>", raw)
+    else:
+        print(f"[Suggestion] {{end}} needs a length like 24h or 2d, got {matches[0]!r}" if matches[0]
+              else "[Suggestion] {end} needs a length like 24h or 2d")
+        raw = _SUGG_END_RE.sub("", raw)
+    try:
+        return json.loads(raw), ends
+    except Exception:
+        return comps, ends
+
+
+def _sugg_bar(yes, no, width=None):
+    """The bar under a suggestion: green for yes, red for no, grey until
+    somebody votes. A side with any votes at all always shows."""
+    width = width or SUGG_BAR_WIDTH
+    total = yes + no
+    if total <= 0:
+        return "⬜" * width
+    green = int(round(width * yes / total))
+    green = max(0, min(width, green))
+    if yes and green == 0:
+        green = 1
+    if no and green == width:
+        green = width - 1
+    return "🟩" * green + "🟥" * (width - green)
+
+
+def _sugg_line(state):
+    yes, no = len(state.get("yes") or []), len(state.get("no") or [])
+    total = yes + no
+    bar = _sugg_bar(yes, no)
+    if total == 0:
+        tail = "No votes yet."
+    else:
+        tail = f"{round(100 * yes / total)}% yes, {total} vote{'' if total == 1 else 's'}"
+    if state.get("closed"):
+        tail = f"Voting closed. {tail}" if total else "Voting closed with no votes."
+    return f"{bar}\n-# {tail}"
+
+
+def _sugg_decorate(comps, state):
+    """The suggestion as posted: the design, then the bar, then the buttons."""
+    closed = bool(state.get("closed"))
+    yes, no = len(state.get("yes") or []), len(state.get("no") or [])
+    return list(comps or []) + [
+        {"type": "text", "text": _sugg_line(state)},
+        {"type": "buttonRow", "buttons": [
+            {"label": str(yes), "style": "success", "__sugg": "yes", "disabled": closed},
+            {"label": str(no), "style": "danger", "__sugg": "no", "disabled": closed},
+        ]},
+    ]
+
+
+def _sugg_remember(mid, state):
+    suggestion_votes[str(mid)] = state
+    while len(suggestion_votes) > SUGG_KEEP:
+        suggestion_votes.pop(next(iter(suggestion_votes)), None)
+    _sugg_schedule_save()
+
+
+def _sugg_schedule_save():
+    global _sugg_save_task
+    if _sugg_save_task and not _sugg_save_task.done():
+        return
+
+    async def _run():
+        await asyncio.sleep(4)
+        try:
+            await _bot_config_upsert("suggestion-votes", {"messages": suggestion_votes})
+        except Exception as e:
+            print(f"[Suggestion] saving the votes failed: {e}")
+
+    try:
+        _sugg_save_task = asyncio.create_task(_run())
+    except RuntimeError:
+        pass
+
+
+async def _sugg_edit(mid, state):
+    ch = await resolve_channel(state.get("channel_id"))
+    if not ch:
+        return False
+    return await edit_v2_message(ch, mid, _sugg_decorate(state.get("comps") or [], state),
+                                 allowed_mentions={"parse": []})
+
+
+async def _sugg_close(mid):
+    state = suggestion_votes.get(str(mid))
+    if not state or state.get("closed"):
+        return
+    state["closed"] = True
+    _sugg_remember(mid, state)
+    await _sugg_edit(mid, state)
+    print(f"[Suggestion] voting closed on {mid}")
+
+
+def _sugg_arm(mid):
+    """Disable the buttons when the time runs out, without a poll."""
+    state = suggestion_votes.get(str(mid)) or {}
+    ends = int(state.get("ends") or 0)
+    if not ends or state.get("closed"):
+        return
+    old = _sugg_timers.pop(str(mid), None)
+    if old:
+        old.cancel()
+
+    async def _run():
+        try:
+            await asyncio.sleep(max(0, ends - time.time()))
+            await _sugg_close(mid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[Suggestion] closing {mid} failed: {e}")
+        finally:
+            _sugg_timers.pop(str(mid), None)
+
+    try:
+        _sugg_timers[str(mid)] = asyncio.create_task(_run())
+    except RuntimeError:
+        pass
+
+
+async def _sugg_click(interaction, side):
+    mid = str(getattr(interaction.message, "id", "") or "")
+    state = suggestion_votes.get(mid)
+    if not state:
+        return await interaction.response.send_message(
+            embed=info_embed("Vote", "This suggestion is too old to vote on."), ephemeral=True)
+    if state.get("closed"):
+        return await interaction.response.send_message(
+            embed=info_embed("Vote", "Voting on this suggestion has closed."), ephemeral=True)
+    if int(state.get("ends") or 0) and time.time() >= int(state["ends"]):
+        await _sugg_close(mid)
+        return await interaction.response.send_message(
+            embed=info_embed("Vote", "Voting on this suggestion has closed."), ephemeral=True)
+    uid = str(interaction.user.id)
+    yes = [u for u in (state.get("yes") or []) if u != uid]
+    no = [u for u in (state.get("no") or []) if u != uid]
+    was = "yes" if uid in (state.get("yes") or []) else "no" if uid in (state.get("no") or []) else ""
+    if was == side:
+        said = "Your vote is taken back."
+    else:
+        (yes if side == "yes" else no).append(uid)
+        said = "Counted as a yes." if side == "yes" else "Counted as a no."
+    state["yes"], state["no"] = yes, no
+    _sugg_remember(mid, state)
+    try:
+        await interaction.response.send_message(embed=success_embed("Vote", said), ephemeral=True)
+    except Exception:
+        pass
+    await _sugg_edit(mid, state)
+
+
+async def _sugg_restore():
+    """Bring back every suggestion still open, so a redeploy does not leave a
+    post nobody can vote on."""
+    cfg = await _bot_config_get("suggestion-votes")
+    saved = (cfg or {}).get("messages")
+    if not isinstance(saved, dict):
+        return
+    now = time.time()
+    due = []
+    for mid, state in list(saved.items())[-SUGG_KEEP:]:
+        if not isinstance(state, dict):
+            continue
+        suggestion_votes[str(mid)] = state
+        ends = int(state.get("ends") or 0)
+        if state.get("closed"):
+            continue
+        if ends and now >= ends:
+            due.append(mid)
+        elif ends:
+            _sugg_arm(mid)
+    print(f"[Suggestion] {len(suggestion_votes)} post(s) restored, {len(due)} closed while the bot was away")
+    for mid in due:
+        await _sugg_close(mid)
+
+
 async def _pf_submit(interaction, feature, form_num=1):
     key = (feature, interaction.user.id)
     pend = _pf_pending.get(key)
@@ -8127,7 +8368,18 @@ async def _pf_submit(interaction, feature, form_num=1):
         else:
             answers_nofile.append(pend["answers"].get(i, ""))
     out = _pf_render(_pf_strip_file_lines(design), interaction.user.id, answers_nofile)
-    mid = await send_v2_message(ch, out, allowed_mentions={"parse": []})
+    # A suggestion goes up with its two vote buttons and its bar, always.
+    if feature in SUGG_FEATURES:
+        out, ends = _sugg_apply_end(out)
+        state = {"yes": [], "no": [], "ends": ends, "closed": False,
+                 "channel_id": str(getattr(ch, "id", "") or ""), "comps": out}
+        mid = await send_v2_message(ch, _sugg_decorate(out, state), allowed_mentions={"parse": []})
+        if isinstance(mid, str):
+            _sugg_remember(mid, state)
+            if ends:
+                _sugg_arm(mid)
+    else:
+        mid = await send_v2_message(ch, out, allowed_mentions={"parse": []})
     if files:
         try:
             await _post_form_files_thread(
@@ -12607,6 +12859,14 @@ def build_button(btn, guild):
     if btn.get("adqueue"):
         # "View Queue" button — opens the paginated Live Advertisement Queue.
         return _btn({"type": 2, "label": (label[:80] or "View Queue"), "style": BUTTON_STYLE_MAP.get(style_name, 2), "custom_id": "ad_queue"})
+    if btn.get("__sugg"):
+        # The yes and no buttons on a suggestion. The bot owns these: the count
+        # is the label, and they stop being clickable when voting closes.
+        side = "yes" if str(btn.get("__sugg")).lower().startswith("y") else "no"
+        return _btn({"type": 2, "label": (label[:80] or "0"),
+                     "style": 3 if side == "yes" else 4,
+                     "emoji": {"name": "✅" if side == "yes" else "❌"},
+                     "custom_id": f"sugg:{side}", "disabled": bool(btn.get("disabled"))})
     if btn.get("__verify"):
         return _btn({"type": 2, "label": (label[:80] or "Verify"), "style": BUTTON_STYLE_MAP.get(style_name, 1), "custom_id": "roblox_verify"})
     if btn.get("__ticket_open"):
